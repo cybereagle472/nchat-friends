@@ -1,13 +1,30 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { areFriends, sortUserIds } from "./friends";
+import { areFriends, arrayContains, sortUserIds } from "./friends";
+import type { PublicUser } from "./friends";
+import type { Id } from "./_generated/dataModel";
 
 const MESSAGE_PAGE_SIZE = 60;
 
+export type ConversationListItem = {
+  _id: Id<"conversations">;
+  _creationTime: number;
+  isGroup: boolean;
+  name: string | null;
+  memberCount: number;
+  lastMessageAt: number;
+  lastMessagePreview: string | null;
+  lastMessageSenderId: Id<"users"> | null;
+  unreadCount: number;
+  other: PublicUser | null;
+  members: PublicUser[];
+};
+
 /**
  * All conversations the current user is part of, newest activity first.
- * Each entry includes the other member's profile and the unread count.
+ * Each entry includes the other member (1:1) or the group's members and
+ * the unread count.
  */
 export const list = query({
   args: {},
@@ -17,30 +34,55 @@ export const list = query({
 
     const conversations = await ctx.db
       .query("conversations")
-      .withIndex("by_memberIds", (q) => q.eq("memberIds", me))
+      .withIndex("by_memberIds", (q) => q.eq("memberIds", arrayContains(me)))
       .collect();
 
-    const items = [];
+    const items: ConversationListItem[] = [];
     for (const conversation of conversations) {
-      const otherId = conversation.memberIds.find((id) => id !== me);
-      if (!otherId) continue;
-      const other = await ctx.db.get(otherId);
-      if (!other) continue;
+      const isGroup = conversation.isGroup === true;
+      const otherId = isGroup
+        ? null
+        : conversation.memberIds.find((id) => id !== me);
+      const other = otherId ? await ctx.db.get(otherId) : null;
+      if (!isGroup && !other) continue;
+
+      const memberUsers: PublicUser[] = [];
+      if (isGroup) {
+        for (const id of conversation.memberIds.slice(0, 4)) {
+          const member = await ctx.db.get(id);
+          if (!member) continue;
+          memberUsers.push({
+            _id: member._id,
+            _creationTime: member._creationTime,
+            name: member.name,
+            image: member.image,
+            email: member.email,
+            isAnonymous: member.isAnonymous,
+          });
+        }
+      }
+
       items.push({
         _id: conversation._id,
         _creationTime: conversation._creationTime,
+        isGroup,
+        name: isGroup ? (conversation.name ?? "Group") : null,
+        memberCount: conversation.memberIds.length,
         lastMessageAt: conversation.lastMessageAt,
         lastMessagePreview: conversation.lastMessagePreview ?? null,
         lastMessageSenderId: conversation.lastMessageSenderId ?? null,
         unreadCount: conversation.unreadBy[me] ?? 0,
-        other: {
-          _id: other._id,
-          _creationTime: other._creationTime,
-          name: other.name,
-          image: other.image,
-          email: other.email,
-          isAnonymous: other.isAnonymous,
-        },
+        other: other
+          ? {
+              _id: other._id,
+              _creationTime: other._creationTime,
+              name: other.name,
+              image: other.image,
+              email: other.email,
+              isAnonymous: other.isAnonymous,
+            }
+          : null,
+        members: memberUsers,
       });
     }
 
@@ -51,7 +93,7 @@ export const list = query({
 });
 
 /**
- * Fetch one conversation plus the other member, for the chat header.
+ * Fetch one conversation plus everything needed to render the chat header.
  * Only participants may fetch it.
  */
 export const get = query({
@@ -64,22 +106,47 @@ export const get = query({
     if (!conversation) return null;
     if (!conversation.memberIds.includes(me)) return null;
 
-    const otherId = conversation.memberIds.find((id) => id !== me);
-    const other = otherId ? await ctx.db.get(otherId) : null;
-    if (!other) return null;
+    const isGroup = conversation.isGroup === true;
+    let other: PublicUser | null = null;
+    const members: PublicUser[] = [];
+    if (isGroup) {
+      for (const id of conversation.memberIds) {
+        const member = await ctx.db.get(id);
+        if (!member) continue;
+        members.push({
+          _id: member._id,
+          _creationTime: member._creationTime,
+          name: member.name,
+          image: member.image,
+          email: member.email,
+          isAnonymous: member.isAnonymous,
+        });
+      }
+    } else {
+      const otherId = conversation.memberIds.find((id) => id !== me);
+      const otherUser = otherId ? await ctx.db.get(otherId) : null;
+      if (!otherUser) return null;
+      other = {
+        _id: otherUser._id,
+        _creationTime: otherUser._creationTime,
+        name: otherUser.name,
+        image: otherUser.image,
+        email: otherUser.email,
+        isAnonymous: otherUser.isAnonymous,
+      };
+    }
 
     return {
       _id: conversation._id,
       _creationTime: conversation._creationTime,
+      isGroup,
+      name: isGroup ? (conversation.name ?? "Group") : null,
+      createdById: conversation.createdById ?? null,
+      memberCount: conversation.memberIds.length,
       lastMessageAt: conversation.lastMessageAt,
-      other: {
-        _id: other._id,
-        _creationTime: other._creationTime,
-        name: other.name,
-        image: other.image,
-        email: other.email,
-        isAnonymous: other.isAnonymous,
-      },
+      lastReadBy: conversation.lastReadBy,
+      other,
+      members,
     };
   },
 });
@@ -111,6 +178,7 @@ export const getOrCreate = mutation({
     const now = Date.now();
     const id = await ctx.db.insert("conversations", {
       memberIds: [userA, userB],
+      isGroup: false,
       createdAt: now,
       lastMessageAt: now,
       lastReadBy: {},
@@ -141,11 +209,15 @@ export const messages = query({
 
     const base = ctx.db
       .query("messages")
-      .withIndex("by_conversation", (q) => q.eq("conversationId", conversationId));
+      .withIndex("by_conversation", (q) =>
+        q.eq("conversationId", conversationId),
+      );
 
     // If a cursor is given, only messages older than it.
     const all = cursor
-      ? await base.filter((m) => m.createdAt < cursor).collect()
+      ? await base
+          .filter((q) => q.lt(q.field("createdAt"), cursor))
+          .collect()
       : await base.collect();
 
     all.sort((a, b) => a.createdAt - b.createdAt);

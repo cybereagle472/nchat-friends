@@ -46,10 +46,12 @@ export const send = mutation({
       clientMessageId,
     });
 
-    // Update the conversation summary and bump the other member's unread count.
-    const otherId = conversation.memberIds.find((id) => id !== me);
+    // Update the conversation summary and bump every other member's unread
+    // count (works for both one-to-one chats and groups).
     const unreadBy = { ...conversation.unreadBy };
-    if (otherId) unreadBy[otherId] = (unreadBy[otherId] ?? 0) + 1;
+    for (const memberId of conversation.memberIds) {
+      if (memberId !== me) unreadBy[memberId] = (unreadBy[memberId] ?? 0) + 1;
+    }
 
     await ctx.db.patch(conversationId, {
       lastMessageAt: now,

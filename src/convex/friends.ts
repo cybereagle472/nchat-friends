@@ -6,16 +6,26 @@ import {
   type MutationCtx,
   type QueryCtx,
 } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 
 /**
  * Sort two user ids so a pair is always stored in a canonical order.
  */
-export function sortUserIds(a: string, b: string): [string, string] {
+export function sortUserIds<T extends string>(a: T, b: T): [T, T] {
   return a < b ? [a, b] : [b, a];
 }
 
+/**
+ * Runtime-supported query for an index on an array field: passing a single
+ * element matches documents whose array contains it (see Convex docs,
+ * "Indexes on arrays"). The generated types only accept the full array
+ * type, so this cast makes the intent explicit in one place.
+ */
+export const arrayContains = <T extends string>(value: T): T[] =>
+  value as unknown as T[];
+
 export type PublicUser = {
-  _id: string;
+  _id: Id<"users">;
   _creationTime: number;
   name?: string;
   image?: string;
@@ -50,7 +60,7 @@ export const searchUsers = query({
     // Resolve connection status for each match in one pass.
     const connections = await ctx.db
       .query("connections")
-      .withIndex("by_userIds", (q) => q.eq("userIds", me))
+      .withIndex("by_userIds", (q) => q.eq("userIds", arrayContains(me)))
       .collect();
     const statusByOther: Record<string, ConnectionStatus> = {};
     for (const c of connections) {
@@ -157,11 +167,11 @@ export const listRequests = query({
 
     const connections = await ctx.db
       .query("connections")
-      .withIndex("by_userIds", (q) => q.eq("userIds", me))
+      .withIndex("by_userIds", (q) => q.eq("userIds", arrayContains(me)))
       .collect();
 
     const incoming: Array<{
-      _id: string;
+      _id: Id<"connections">;
       requester: PublicUser;
       createdAt: number;
     }> = [];
@@ -198,7 +208,7 @@ export const listFriends = query({
 
     const connections = await ctx.db
       .query("connections")
-      .withIndex("by_userIds", (q) => q.eq("userIds", me))
+      .withIndex("by_userIds", (q) => q.eq("userIds", arrayContains(me)))
       .collect();
 
     const friends: PublicUser[] = [];
@@ -224,7 +234,11 @@ export const listFriends = query({
 /**
  * Are two users friends? Used before opening a direct conversation.
  */
-export async function areFriends(ctx: QueryCtx, me: string, otherId: string) {
+export async function areFriends(
+  ctx: QueryCtx,
+  me: Id<"users">,
+  otherId: Id<"users">,
+) {
   const [userA, userB] = sortUserIds(me, otherId);
   const connection = await ctx.db
     .query("connections")
@@ -239,8 +253,8 @@ export async function areFriends(ctx: QueryCtx, me: string, otherId: string) {
  */
 export async function ensureConversation(
   ctx: MutationCtx,
-  userA: string,
-  userB: string,
+  userA: Id<"users">,
+  userB: Id<"users">,
   now: number,
 ) {
   const existing = await ctx.db
@@ -251,6 +265,7 @@ export async function ensureConversation(
 
   const id = await ctx.db.insert("conversations", {
     memberIds: [userA, userB],
+    isGroup: false,
     createdAt: now,
     lastMessageAt: now,
     lastReadBy: {},

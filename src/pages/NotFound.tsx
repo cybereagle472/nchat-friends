@@ -1,4 +1,9 @@
+import { AppBackdrop } from "@/components/chat/AppBackdrop";
+import { NChatLogo } from "@/components/chat/NChatLogo";
+import { Button } from "@/components/ui/button";
 import { motion } from "framer-motion";
+import { ArrowLeft } from "lucide-react";
+import { Link } from "react-router";
 
 export default function NotFound() {
   return (
@@ -6,19 +11,30 @@ export default function NotFound() {
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       transition={{ duration: 0.5 }}
-      className="min-h-screen flex flex-col"
+      className="relative flex min-h-screen flex-col"
     >
-
-      
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col items-center justify-center">
-        <div className="max-w-5xl mx-auto relative px-4">
-          <div className="flex items-center justify-center min-h-[200px]">
-            <div className="text-center">
-              <h1 className="text-4xl font-bold text-gray-900 mb-4">404</h1>
-              <p className="text-lg text-gray-600">Page Not Found</p>
-            </div>
+      <AppBackdrop />
+      <div className="flex flex-1 items-center justify-center px-4">
+        <div className="glass-strong flex w-full max-w-md flex-col items-center gap-4 rounded-3xl p-10 text-center shadow-2xl">
+          <NChatLogo className="size-16" />
+          <p className="text-6xl font-black tracking-tight text-primary/20">
+            404
+          </p>
+          <div>
+            <h1 className="text-xl font-bold tracking-tight">
+              This page wandered off
+            </h1>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">
+              The conversation you're looking for doesn't exist — but your
+              friends are still waiting back in the app.
+            </p>
           </div>
+          <Button asChild className="rounded-full bg-gradient-nchat text-white">
+            <Link to="/">
+              <ArrowLeft className="size-4" />
+              Back to NChat
+            </Link>
+          </Button>
         </div>
       </div>
     </motion.div>

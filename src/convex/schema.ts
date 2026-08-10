@@ -38,18 +38,18 @@ const schema = defineSchema(
     connections: defineTable({
       userIds: v.array(v.id("users")), // sorted [userA, userB]
       requesterId: v.id("users"), // who initiated the request
-      status: v.union(
-        v.literal("pending"),
-        v.literal("accepted"),
-      ),
+      status: v.union(v.literal("pending"), v.literal("accepted")),
       createdAt: v.number(),
     }).index("by_userIds", ["userIds"]),
 
-    // NChat: one-to-one conversation between two users. Created when a friend
-    // request is accepted. unreadBy maps a userId to the number of unread
-    // messages the other member sent since their last read.
+    // NChat: a conversation. memberIds holds every participant — exactly two
+    // for a one-to-one chat, or more for a group. unreadBy maps a userId to
+    // the number of messages they haven't seen yet.
     conversations: defineTable({
-      memberIds: v.array(v.id("users")), // exactly two, sorted
+      memberIds: v.array(v.id("users")),
+      isGroup: v.boolean(),
+      name: v.optional(v.string()), // group display name
+      createdById: v.optional(v.id("users")), // group creator
       createdAt: v.number(),
       lastMessageAt: v.number(),
       lastMessagePreview: v.optional(v.string()),
@@ -73,6 +73,35 @@ const schema = defineSchema(
         "conversationId",
         "clientMessageId",
       ]),
+
+    // NChat: audio/video calls. memberIds is a snapshot of the conversation
+    // members at call start so every invitee can discover the call.
+    calls: defineTable({
+      conversationId: v.id("conversations"),
+      type: v.union(v.literal("audio"), v.literal("video")),
+      status: v.union(
+        v.literal("ringing"),
+        v.literal("active"),
+        v.literal("ended"),
+      ),
+      initiatorId: v.id("users"),
+      participantIds: v.array(v.id("users")),
+      memberIds: v.array(v.id("users")),
+      startedAt: v.number(),
+      endedAt: v.optional(v.number()),
+    })
+      .index("by_memberIds", ["memberIds"])
+      .index("by_conversation_status", ["conversationId", "status"]),
+
+    // NChat: WebRTC signaling (offers, answers, ICE candidates).
+    callSignals: defineTable({
+      callId: v.id("calls"),
+      fromId: v.id("users"),
+      toId: v.optional(v.id("users")),
+      kind: v.string(),
+      payload: v.string(),
+      createdAt: v.number(),
+    }).index("by_call", ["callId", "createdAt"]),
   },
   {
     schemaValidation: false,
