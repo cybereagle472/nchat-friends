@@ -61,12 +61,19 @@ const schema = defineSchema(
       .index("by_lastMessageAt", ["lastMessageAt"]),
 
     // NChat: messages inside a conversation.
+    // Supports editing, soft-delete, reactions, and file attachments.
     messages: defineTable({
       conversationId: v.id("conversations"),
       senderId: v.id("users"),
       body: v.string(),
       createdAt: v.number(),
       clientMessageId: v.optional(v.string()),
+      editedAt: v.optional(v.number()),
+      isDeleted: v.optional(v.boolean()),
+      reactions: v.optional(v.record(v.string(), v.array(v.id("users")))),
+      attachmentFileId: v.optional(v.string()),
+      attachmentName: v.optional(v.string()),
+      attachmentType: v.optional(v.string()),
     })
       .index("by_conversation", ["conversationId", "createdAt"])
       .index("by_conversation_clientId", [
@@ -102,6 +109,21 @@ const schema = defineSchema(
       payload: v.string(),
       createdAt: v.number(),
     }).index("by_call", ["callId", "createdAt"]),
+
+    // NChat: typing indicators (auto-expiring, TTL-based).
+    typingIndicators: defineTable({
+      conversationId: v.id("conversations"),
+      userId: v.id("users"),
+      expiresAt: v.number(), // auto-delete after ~5 seconds
+    })
+      .index("by_conversation", ["conversationId"])
+      .index("by_userId", ["userId"]),
+
+    // NChat: online presence (last active heartbeat).
+    presence: defineTable({
+      userId: v.id("users"),
+      lastActiveAt: v.number(),
+    }).index("by_userId", ["userId"]),
   },
   {
     schemaValidation: false,

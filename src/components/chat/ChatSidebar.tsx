@@ -15,6 +15,10 @@ import { useQuery } from "convex/react";
 import { MessageSquarePlus, Search, UserRoundPlus } from "lucide-react";
 import { useMemo, useState } from "react";
 
+/** How often to re-pull presence data (ms). */
+const PRESENCE_POLL_MS = 30_000;
+const ONLINE_THRESHOLD_MS = 2 * 60 * 1000;
+
 export function ChatSidebar({
   selectedId,
   onSelect,
@@ -36,6 +40,38 @@ export function ChatSidebar({
   const conversations: ConversationSummary[] = chats?.conversations ?? [];
   const totalUnread = chats?.totalUnread ?? 0;
   const requestCount = requests?.length ?? 0;
+
+  // Collect all member IDs from conversations for the presence lookup.
+  const allMemberIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const c of conversations) {
+      if (c.other) ids.add(c.other._id);
+      for (const m of c.members) ids.add(m._id);
+    }
+    return Array.from(ids) as Id<"users">[];
+  }, [conversations]);
+
+  // Batch presence query (reactive — Convex re-runs when any presence doc changes).
+  const presenceMap = useQuery(api.typing.getPresence, { userIds: allMemberIds });
+
+  const onlineUserIds = useMemo(() => {
+    if (!presenceMap) return new Set<string>();
+    const now = Date.now();
+    const online = new Set<string>();
+    for (const [uid, lastActiveAt] of Object.entries(presenceMap)) {
+      if (now - lastActiveAt < ONLINE_THRESHOLD_MS) online.add(uid);
+    }
+    return online;
+  }, [presenceMap]);
+
+  // Typing indicators per conversation (subset of conversations shown).
+  // We query whoTyping for each visible conversation.
+  const typingQueries = conversations.map((c) => ({
+    conversationId: c._id,
+  }));
+
+  // NOTE: Convex useQuery can only be called at the top level, so we batch
+  // this via a helper component rendered inside the sidebar.
 
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -105,11 +141,12 @@ export function ChatSidebar({
       {/* Lists */}
       <div className="chat-scroll flex-1 overflow-y-auto px-2 pb-2">
         {tab === "chats" ? (
-          <ConversationList
+          <TypingProvider
             conversations={filtered}
             selectedId={selectedId}
             myUserId={user?._id}
             onSelect={onSelect}
+            onlineUserIds={onlineUserIds}
           />
         ) : (
           <RequestsList />
@@ -121,6 +158,54 @@ export function ChatSidebar({
         <ProfileMenu />
       </div>
     </aside>
+  );
+}
+
+/**
+ * Wrapper that queries typing indicators for each visible conversation
+ * and passes them into ConversationList. useQuery must be called
+ * unconditionally at the component level.
+ */
+function TypingProvider({
+  conversations,
+  selectedId,
+  myUserId,
+  onSelect,
+  onlineUserIds,
+}: {
+  conversations: ConversationSummary[];
+  selectedId: Id<"conversations"> | null;
+  myUserId: Id<"users"> | undefined;
+  onSelect: (id: Id<"conversations">) => void;
+  onlineUserIds: Set<string>;
+}) {
+  // Query typing status for each conversation reactively.
+  // Each call is a separate Convex subscription but they're cheap.
+  const typingResults = conversations.map((c) => {
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    const typingUserIds = useQuery(api.typing.whoTyping, { conversationId: c._id });
+    return { conversationId: c._id, typingUserIds };
+  });
+
+  const typingMap = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const { conversationId, typingUserIds } of typingResults) {
+      if (typingUserIds && typingUserIds.length > 0) {
+        map.set(conversationId, typingUserIds);
+      }
+    }
+    return map;
+  }, [typingResults]);
+
+  return (
+    <ConversationList
+      conversations={conversations}
+      selectedId={selectedId}
+      myUserId={myUserId}
+      onSelect={onSelect}
+      onlineUserIds={onlineUserIds}
+      typingUserIds={typingMap}
+    />
   );
 }
 

@@ -237,13 +237,8 @@
 
 /* Gentle float for hero mockups */
 @keyframes nchat-float {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(-10px);
-  }
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
 }
 .animate-float {
   animation: nchat-float 6s ease-in-out infinite;
@@ -254,16 +249,46 @@
 
 /* Pulsing ring used by the incoming-call overlay */
 @keyframes nchat-ring-pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgb(34 197 94 / 0.45);
-  }
-  70% {
-    box-shadow: 0 0 0 18px rgb(34 197 94 / 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgb(34 197 94 / 0);
-  }
+  0%  { box-shadow: 0 0 0 0 rgb(34 197 94 / 0.45); }
+  70% { box-shadow: 0 0 0 18px rgb(34 197 94 / 0); }
+  100%{ box-shadow: 0 0 0 0 rgb(34 197 94 / 0); }
 }
 .animate-ring-pulse {
   animation: nchat-ring-pulse 1.6s ease-out infinite;
+}
+
+/* Online presence pulse (green dot) */
+@keyframes nchat-online-ping {
+  0%   { transform: scale(1); opacity: 0.75; }
+  75%  { transform: scale(2.2); opacity: 0; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+.animate-ping {
+  animation: nchat-online-ping 1.4s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+/* Message row hover actions transition */
+.group\/msg {
+  position: relative;
+}
+.group\/msg > button {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+/* Typing dots staggered pulse */
+@keyframes nchat-dot-pulse {
+  0%, 60%, 100% { opacity: 0.3; transform: scale(0.85); }
+  30% { opacity: 1; transform: scale(1); }
+}
+.animate-typing-dot {
+  animation: nchat-dot-pulse 1.2s ease-in-out infinite;
+}
+
+/* Flash highlight when jumping to a search result */
+@keyframes nchat-flash {
+  0%   { box-shadow: 0 0 0 3px oklch(0.55 0.21 258 / 0.5); }
+  100% { box-shadow: 0 0 0 3px oklch(0.55 0.21 258 / 0); }
+}
+.animate-flash {
+  animation: nchat-flash 1.8s ease-out forwards;
 }

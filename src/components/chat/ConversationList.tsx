@@ -69,16 +69,29 @@ export function GroupAvatar({
   );
 }
 
+/** Small pulsing dot to indicate a user is online. */
+function OnlineDot() {
+  return (
+    <span className="absolute -bottom-0.5 -right-0.5 size-3 rounded-full border-2 border-white bg-emerald-500 shadow-sm">
+      <span className="absolute inset-0 animate-ping rounded-full bg-emerald-400 opacity-75" />
+    </span>
+  );
+}
+
 export function ConversationList({
   conversations,
   selectedId,
   myUserId,
   onSelect,
+  onlineUserIds,
+  typingUserIds,
 }: {
   conversations: ConversationSummary[];
   selectedId: Id<"conversations"> | null;
   myUserId: Id<"users"> | undefined;
   onSelect: (id: Id<"conversations">) => void;
+  onlineUserIds?: Set<string>;
+  typingUserIds?: Map<string, string[]>;
 }) {
   if (conversations.length === 0) {
     return (
@@ -108,12 +121,12 @@ export function ConversationList({
             : conversation.members.find(
                 (m) => m._id === conversation.lastMessageSenderId,
               )
-            ? displayName(
-                conversation.members.find(
-                  (m) => m._id === conversation.lastMessageSenderId,
-                ),
-              )
-            : ""
+              ? displayName(
+                  conversation.members.find(
+                    (m) => m._id === conversation.lastMessageSenderId,
+                  ),
+                )
+              : ""
           : "";
         const preview = conversation.lastMessagePreview
           ? (senderName ? `${senderName}: ` : "") +
@@ -121,6 +134,15 @@ export function ConversationList({
           : isGroup
             ? `${conversation.memberCount} members`
             : "Say hello!";
+
+        // Online status for 1:1 chats.
+        const otherOnline =
+          !isGroup &&
+          conversation.other &&
+          onlineUserIds?.has(conversation.other._id);
+
+        // Typing indicator for this conversation.
+        const conversationTyping = typingUserIds?.get(conversation._id);
 
         return (
           <li key={conversation._id}>
@@ -133,11 +155,17 @@ export function ConversationList({
                   : "hover:bg-white/50",
               )}
             >
-              {isGroup ? (
-                <GroupAvatar members={conversation.members} className="size-12" />
-              ) : (
-                <UserAvatar user={conversation.other} className="size-12 text-sm" />
-              )}
+              <div className="relative shrink-0">
+                {isGroup ? (
+                  <GroupAvatar
+                    members={conversation.members}
+                    className="size-12"
+                  />
+                ) : (
+                  <UserAvatar user={conversation.other} className="size-12 text-sm" />
+                )}
+                {otherOnline && <OnlineDot />}
+              </div>
               <div className="min-w-0 flex-1">
                 <div className="flex items-baseline justify-between gap-2">
                   <p
@@ -156,12 +184,16 @@ export function ConversationList({
                   <p
                     className={cn(
                       "truncate text-xs",
-                      conversation.unreadCount > 0
-                        ? "font-medium text-foreground/80"
-                        : "text-muted-foreground",
+                      conversationTyping
+                        ? "font-medium italic text-primary"
+                        : conversation.unreadCount > 0
+                          ? "font-medium text-foreground/80"
+                          : "text-muted-foreground",
                     )}
                   >
-                    {preview}
+                    {conversationTyping
+                      ? `${conversationTyping.length === 1 ? "typing…" : `${conversationTyping.length} typing…`}`
+                      : preview}
                   </p>
                   {conversation.unreadCount > 0 && (
                     <Badge className="size-5 shrink-0 justify-center rounded-full bg-primary px-0 text-[10px]">
