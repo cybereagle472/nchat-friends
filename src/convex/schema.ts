@@ -30,7 +30,17 @@ const schema = defineSchema(
       isAnonymous: v.optional(v.boolean()), // is the user anonymous. do not remove
 
       role: v.optional(roleValidator), // role of the user. do not remove
-    }).index("email", ["email"]), // index for the email. do not remove or modify
+
+      // NChat profile fields (zip frontend)
+      full_name: v.optional(v.string()),
+      username: v.optional(v.string()),
+      avatar_url: v.optional(v.string()),
+      bio: v.optional(v.string()),
+      is_online: v.optional(v.boolean()),
+      last_seen: v.optional(v.string()),
+    })
+      .index("email", ["email"]) // index for the email. do not remove or modify
+      .index("by_username", ["username"]),
 
     // NChat: one-to-one friendships between users.
     // userIds holds the two sorted user ids (userA < userB). status is
