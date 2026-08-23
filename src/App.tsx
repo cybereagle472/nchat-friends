@@ -17,7 +17,7 @@ import { profileService } from './services/profileService';
 import { callService } from './services/callService';
 import { GroupWithMembers } from './services/groupService';
 import { UserProfile, Contact, Call } from './types';
-import { supabase } from './supabaseClient';
+import { api, convex } from './lib/convexClient';
 import { useAppData } from './hooks/useAppData';
 
 type AppView = 'chats' | 'status' | 'groups' | 'discover' | 'history';
@@ -62,10 +62,10 @@ export default function App() {
           const id = await authService.getCurrentUserId();
           setUserId(id);
 
-          // Get email from session
-          const { data: { session } } = await supabase.auth.getSession();
-          if (session?.user?.email) {
-            setUserEmail(session.user.email);
+          // Get email from the profile or user record
+          const profile = await profileService.getProfile(id);
+          if (profile?.email) {
+            setUserEmail(profile.email);
           }
         }
       } catch (error) {
@@ -106,53 +106,28 @@ export default function App() {
     };
   }, []);
 
-  // Update online status
+  // Update online status via Convex presence
   useEffect(() => {
     if (!currentUser?.id) return;
 
-    // Set online
-    const setOnline = async () => {
-      await supabase
-        .from('profiles')
-        .update({ is_online: true, last_seen: new Date().toISOString() })
-        .eq('id', currentUser.id);
+    const heartbeat = async () => {
+      try {
+        await convex.mutation(api.typing.upsertPresence, {});
+      } catch { /* ignore */ }
     };
 
-    // Set offline
-    const setOffline = async () => {
-      await supabase
-        .from('profiles')
-        .update({ is_online: false, last_seen: new Date().toISOString() })
-        .eq('id', currentUser.id);
-    };
+    heartbeat();
 
-    setOnline();
-
-    // Update on visibility change
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        setOnline();
-      } else {
-        setOffline();
-      }
-    };
-
-    // Update on beforeunload
-    const handleBeforeUnload = () => {
-      setOffline();
+      if (document.visibilityState === 'visible') heartbeat();
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('beforeunload', handleBeforeUnload);
-
-    // Periodic heartbeat
-    const heartbeat = setInterval(setOnline, 30000);
+    const interval = setInterval(heartbeat, 30000);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-      clearInterval(heartbeat);
-      setOffline();
+      clearInterval(interval);
     };
   }, [currentUser?.id]);
 
@@ -198,10 +173,8 @@ export default function App() {
       }
       setIsAuthenticated(true);
 
-      // Get email
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session?.user?.email) {
-        setUserEmail(session.user.email);
+      if (profile?.email) {
+        setUserEmail(profile.email);
       }
     }
   }, []);

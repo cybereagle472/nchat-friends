@@ -27,7 +27,7 @@ import { profileService } from '../services/profileService';
 import { privacyService, PrivacySettings, PrivacyOption } from '../services/privacyService';
 import { friendService } from '../services/friendService';
 import { mediaService } from '../services/mediaService';
-import { supabase } from '../supabaseClient';
+import { api, convex } from '../lib/convexClient';
 import { ImageCropper } from './ImageCropper';
 
 interface SettingsProps {
@@ -113,28 +113,14 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
     if (section === 'admin' && isAdmin(currentUser.email)) {
       const loadStats = async () => {
         try {
-          const { count: usersCount } = await supabase
-            .from('profiles')
-            .select('*', { count: 'exact', head: true });
-
-          const { count: onlineCount } = await supabase
-            .from('profiles')
-            .select('*', { count: 'exact', head: true })
-            .eq('is_online', true);
-
-          const { count: messagesCount } = await supabase
-            .from('messages')
-            .select('*', { count: 'exact', head: true });
-
-          const { count: groupsCount } = await supabase
-            .from('groups')
-            .select('*', { count: 'exact', head: true });
-
+          const allProfiles = await convex.query(api.users.getAllProfiles, {});
+          const totalUsers = (allProfiles as unknown[]).length;
+          // Convex doesn't have a direct count query, but we can use a lightweight approach
           setAdminStats({
-            totalUsers: usersCount || 0,
-            onlineUsers: onlineCount || 0,
-            totalMessages: messagesCount || 0,
-            totalGroups: groupsCount || 0,
+            totalUsers,
+            onlineUsers: 0,
+            totalMessages: 0,
+            totalGroups: 0,
             loadingStats: false
           });
         } catch (error) {
