@@ -15,7 +15,7 @@ import { groupService, GroupWithMembers } from '../services/groupService';
 import { callService } from '../services/callService';
 import { profileService } from '../services/profileService';
 import { Contact, UserProfile, FriendRequest, CallHistory } from '../types';
-import { supabase } from '../supabaseClient';
+import { api, convex } from '../lib/convexClient';
 
 // ============================================
 // INSTANT CACHE UTILITIES
@@ -474,48 +474,30 @@ export function useAppData(userId: string) {
     );
     subscriptionsRef.current.push(messagesChannel);
 
-    // Friend requests subscription - combined debounced callback
-    const friendsChannel = supabase
-      .channel('app_friends_' + userId)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests' }, () => {
-        debouncedRefreshFriendsAndRequests();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'friendships' }, () => {
-        debouncedRefreshFriendsAndRequests();
-      })
-      .subscribe();
-    subscriptionsRef.current.push(friendsChannel);
+    // Friend requests + friendships polling (replaces Supabase realtime)
+    const friendsInterval = setInterval(
+      () => debouncedRefreshFriendsAndRequests(),
+      5000
+    );
+    subscriptionsRef.current.push({ unsubscribe: () => clearInterval(friendsInterval) });
 
-    // Groups subscription
-    const groupsChannel = supabase
-      .channel('app_groups_' + userId)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'group_members', filter: `user_id=eq.${userId}` }, () => {
-        debouncedRefreshGroups();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'group_messages' }, () => {
-        debouncedRefreshGroups();
-      })
-      .subscribe();
-    subscriptionsRef.current.push(groupsChannel);
+    // Groups subscription (polling; message polls also trigger this)
+    const groupsInterval = setInterval(() => debouncedRefreshGroups(), 8000);
+    subscriptionsRef.current.push({ unsubscribe: () => clearInterval(groupsInterval) });
 
-    // Profiles subscription (for online status) - debounced
-    const profilesChannel = supabase
-      .channel('app_profiles_' + userId)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles' }, () => {
-        debouncedRefreshFriends();
-        debouncedRefreshChats();
-      })
-      .subscribe();
-    subscriptionsRef.current.push(profilesChannel);
+    // Profiles / presence subscription (polling for online status)
+    const profilesInterval = setInterval(() => {
+      debouncedRefreshFriends();
+      debouncedRefreshChats();
+    }, 10000);
+    subscriptionsRef.current.push({ unsubscribe: () => clearInterval(profilesInterval) });
 
     // Call history subscription
-    const callsChannel = supabase
-      .channel('app_calls_' + userId)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'calls' }, () => {
-        debouncedRefreshCallHistory();
-      })
-      .subscribe();
-    subscriptionsRef.current.push(callsChannel);
+    const callsInterval = setInterval(() => {
+      convex.query(api.calls.current, {}).catch(() => null);
+      debouncedRefreshCallHistory();
+    }, 5000);
+    subscriptionsRef.current.push({ unsubscribe: () => clearInterval(callsInterval) });
 
     return () => {
       subscriptionsRef.current.forEach(sub => sub.unsubscribe());

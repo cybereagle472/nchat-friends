@@ -1,80 +1,79 @@
-import { createClient } from '@supabase/supabase-js';
-import { log } from './utils/logger';
-
 /**
- * Supabase Client Configuration
- * 
- * SECURITY: Environment variables are REQUIRED in production.
- * Never commit credentials to version control.
- * 
- * Required environment variables:
- * - VITE_SUPABASE_URL: Your Supabase project URL
- * - VITE_SUPABASE_ANON_KEY: Your Supabase anonymous key
+ * Safe Supabase client stub.
+ *
+ * NChat's backend is Convex — core features (auth, chat, friends, groups,
+ * calls, media) are bridged to Convex via src/services/*. The remaining
+ * optional services (statuses, privacy prefs, push notifications) still
+ * import this module, so it must never throw at import time. All calls
+ * resolve with empty results so those features degrade gracefully.
  */
 
-// Validate environment variables
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyObj = any;
 
-// In production, environment variables are REQUIRED
-if (import.meta.env.PROD) {
-  if (!supabaseUrl || !supabaseAnonKey) {
-    throw new Error(
-      'Missing required environment variables: VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY must be set in production.'
-    );
-  }
+const emptyResult = (): AnyObj => ({ data: null, error: null, count: 0 });
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function chainable(): AnyObj {
+  const promise = Promise.resolve(emptyResult());
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const obj: AnyObj = {
+    select: (_cols?: unknown, _opts?: unknown) => obj,
+    eq: (_col?: unknown, _val?: unknown) => obj,
+    neq: (_col?: unknown, _val?: unknown) => obj,
+    in: (_col?: unknown, _vals?: unknown) => obj,
+    or: (_expr?: unknown) => obj,
+    not: (_col?: unknown, _op?: unknown, _val?: unknown) => obj,
+    order: (_col?: unknown, _opts?: unknown) => obj,
+    limit: (_n?: unknown) => obj,
+    range: (_a?: unknown, _b?: unknown) => obj,
+    single: () => promise,
+    maybeSingle: () => promise,
+    upsert: (_data?: unknown, _opts?: unknown) => obj,
+    insert: (_data?: unknown, _opts?: unknown) => obj,
+    update: (_data?: unknown, _opts?: unknown) => obj,
+    delete: (_opts?: unknown) => obj,
+    then: (
+      resolve?: (v: AnyObj) => void,
+      reject?: (e: unknown) => void
+    ) => promise.then(resolve, reject),
+    catch: (reject?: (e: unknown) => void) => promise.catch(reject),
+  };
+  return obj;
 }
 
-// In development, warn if missing but allow fallback for local testing
-if (import.meta.env.DEV) {
-  if (!supabaseUrl || !supabaseAnonKey) {
-    log.warn(
-      'Missing Supabase environment variables. Create a .env file in the project root with:\n' +
-      'VITE_SUPABASE_URL=your_supabase_url\n' +
-      'VITE_SUPABASE_ANON_KEY=your_supabase_anon_key\n\n' +
-      'The app will not work without these credentials.',
-      undefined,
-      'supabaseClient'
-    );
-  }
-}
-
-// Final validation - throw error if still missing
-if (!supabaseUrl || !supabaseAnonKey) {
-  const errorMsg = 'Supabase configuration is missing. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY environment variables in your .env file.';
-  console.error('❌', errorMsg);
-  console.error('📝 Make sure your .env file exists at: f:\\NChat App\\NChat App\\.env');
-  throw new Error(errorMsg);
-}
-
-// Log successful connection (only in dev, and only once)
-if (import.meta.env.DEV && !(window as any).__supabase_logged) {
-  console.log('✅ Supabase client initialized');
-  (window as any).__supabase_logged = true;
-}
-
-export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const supabase: AnyObj = {
   auth: {
-    autoRefreshToken: true,
-    persistSession: true,
-    detectSessionInUrl: false,
-    storage: typeof window !== 'undefined' ? window.localStorage : undefined,
+    getSession: async () => ({ data: { session: null }, error: null }),
+    getUser: async () => ({ data: { user: null }, error: null }),
+    signUp: async () => ({ data: { user: null, session: null }, error: null }),
+    signInWithPassword: async () => ({
+      data: { user: null, session: null },
+      error: null,
+    }),
+    signOut: async () => ({ error: null }),
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    onAuthStateChange: (_cb?: unknown) => ({
+      data: { subscription: { unsubscribe: () => {} } },
+    }),
   },
-  realtime: {
-    // OPTIMIZED for WhatsApp-level speed
-    params: { eventsPerSecond: 100 },        // Was 10 - Allow more events per second
-    heartbeatIntervalMs: 15000,              // Was 30000 - Detect disconnection faster
-    reconnectAfterMs: (tries: number) => {
-      // Aggressive reconnect: 500ms, 1s, 2s, 3s max
-      return Math.min(500 * Math.pow(2, tries), 3000);
-    },
+  from: (_table: string) => chainable(),
+  rpc: (_fn?: string, _params?: unknown) => chainable(),
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  channel: (_name?: string) => {
+    const ch: AnyObj = {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      on: (_type?: unknown, _filter?: unknown, _cb?: unknown) => ch,
+      subscribe: (_cb?: unknown) => ({ unsubscribe: () => {}, state: 'closed' }),
+      unsubscribe: () => {},
+      send: () => {},
+      track: () => {},
+      untrack: () => {},
+      presenceState: () => ({}),
+    };
+    return ch;
   },
-  global: {
-    headers: {
-      'x-client-info': 'nchat-app',
-    },
-  },
-  db: {
-    schema: 'public',
-  },
-});
+  removeChannel: (_channel?: unknown) => {},
+  removeAllChannels: () => {},
+};

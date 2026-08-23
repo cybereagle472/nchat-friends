@@ -1,16 +1,11 @@
 /**
- * Call Service - WebRTC Signaling Implementation
- *
- * Features:
- * - Voice and video call initiation
- * - WebRTC signaling over Supabase Realtime
- * - ICE candidate exchange
- * - Call state management
- * - Call history tracking
+ * Call Service - Convex-backed WebRTC call management.
+ * Same public surface as the original Supabase service. Signaling flows
+ * through the Convex calls/callSignals tables (polling replaces realtime).
  */
 
-import { supabase } from '../supabaseClient';
-import { CallHistory, UserProfile } from '../types';
+import { api, convex } from '../lib/convexClient';
+import { CallHistory } from '../types';
 
 export interface CallSession {
   id: string;
@@ -21,6 +16,7 @@ export interface CallSession {
   startedAt: string;
   endedAt?: string;
   duration?: number;
+  offerSdp?: RTCSessionDescriptionInit;
 }
 
 export interface ServiceResult<T = void> {
@@ -29,518 +25,327 @@ export interface ServiceResult<T = void> {
   error?: string;
 }
 
-// ICE Server configuration with STUN and TURN servers
-// TURN servers are essential for calls behind NAT/firewalls
-const getIceServers = (): RTCConfiguration => {
-  const iceServers: RTCIceServer[] = [
-    // Free public STUN servers
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' },
-    // Additional free STUN servers for redundancy
-    { urls: 'stun:stun.stunprotocol.org:3478' },
-    { urls: 'stun:stun.voip.eutelia.it:3478' },
-  ];
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+];
 
-  // Add TURN server if configured via environment variables
-  // TURN servers relay media when direct P2P connection fails
-  const turnUrl = import.meta.env.VITE_TURN_SERVER_URL as string;
-  const turnUsername = import.meta.env.VITE_TURN_SERVER_USERNAME as string;
-  const turnCredential = import.meta.env.VITE_TURN_SERVER_CREDENTIAL as string;
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
-  if (turnUrl && turnUsername && turnCredential) {
-    iceServers.push({
-      urls: turnUrl,
-      username: turnUsername,
-      credential: turnCredential
+async function ensureConversation(
+  userId: string,
+  otherId: string
+): Promise<string | null> {
+  try {
+    return await convex.mutation(api.conversations.getOrCreate, {
+      otherUserId: otherId as never,
     });
-    // Also add TURNS (TURN over TLS) if available
-    if (turnUrl.includes(':443')) {
-      iceServers.push({
-        urls: turnUrl.replace('turn:', 'turns:'),
-        username: turnUsername,
-        credential: turnCredential
-      });
-    }
-  } else {
-    // Warn in development if TURN not configured
-    if (import.meta.env.DEV) {
-      console.warn('⚠️ No TURN server configured. Calls may fail behind NAT/firewalls. Set VITE_TURN_SERVER_URL, VITE_TURN_SERVER_USERNAME, and VITE_TURN_SERVER_CREDENTIAL in .env');
-    }
+  } catch {
+    return null;
   }
+}
 
-  // Free TURN servers for testing (not for production - limited bandwidth)
-  // Uncomment these for testing if you don't have your own TURN server
-  iceServers.push({
-    urls: 'turn:openrelay.metered.ca:80',
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  });
-  iceServers.push({
-    urls: 'turn:openrelay.metered.ca:443',
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  });
-  iceServers.push({
-    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-    username: 'openrelayproject',
-    credential: 'openrelayproject'
-  });
-
-  return {
-    iceServers,
-    iceCandidatePoolSize: 10, // Pre-gather candidates for faster connection
-  };
-};
-
-const ICE_SERVERS: RTCConfiguration = getIceServers();
+async function signalCall(
+  callId: string,
+  toId: string | undefined,
+  kind: string,
+  payload: unknown
+): Promise<ServiceResult> {
+  try {
+    await convex.mutation(api.calls.signal, {
+      callId: callId as never,
+      toId: (toId ?? undefined) as never,
+      kind,
+      payload: JSON.stringify(payload),
+    });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: errMsg(err) };
+  }
+}
 
 export const callService = {
-  /**
-   * Initiate a call
-   */
   async initiateCall(
     callerId: string,
     receiverId: string,
     callType: 'audio' | 'video'
   ): Promise<ServiceResult<CallSession>> {
     try {
-      const { data, error } = await supabase
-        .from('calls')
-        .insert({
-          caller_id: callerId,
-          receiver_id: receiverId,
-          call_type: callType,
-          status: 'initiated'
-        })
-        .select()
-        .single();
-
-      if (error) {
-        return { success: false, error: error.message };
+      const conversationId = await ensureConversation(callerId, receiverId);
+      if (!conversationId) {
+        return { success: false, error: 'Could not open a conversation for this call' };
       }
-
-      supabase.from('notifications').insert({
-        user_id: receiverId,
-        actor_id: callerId,
-        type: 'incoming_call',
-        payload: { call_id: data.id, call_type: callType }
-      }).then(() => {});
-
+      const callId = await convex.mutation(api.calls.start, {
+        conversationId: conversationId as never,
+        type: callType,
+      });
       return {
         success: true,
         data: {
-          id: data.id,
-          callerId: data.caller_id,
-          receiverId: data.receiver_id,
-          callType: data.call_type,
-          status: data.status,
-          startedAt: data.created_at
-        }
+          id: callId,
+          callerId,
+          receiverId,
+          callType,
+          status: 'ringing',
+          startedAt: new Date().toISOString(),
+        },
       };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
+    } catch (err) {
+      return { success: false, error: errMsg(err) };
     }
   },
 
-  /**
-   * Update call status
-   */
   async updateCallStatus(
     callId: string,
     status: CallSession['status'],
-    duration?: number
+    _duration?: number
   ): Promise<ServiceResult> {
     try {
-      const updateData: any = { status };
-
-      if (status === 'ended' || status === 'missed' || status === 'declined') {
-        updateData.ended_at = new Date().toISOString();
-        if (duration !== undefined) {
-          updateData.duration = duration;
-        }
+      if (status === 'declined') {
+        await convex.mutation(api.calls.decline, { callId: callId as never });
+      } else if (
+        status === 'ended' ||
+        status === 'missed'
+      ) {
+        // Answer first if we never joined, so `end` is allowed.
+        await convex
+          .mutation(api.calls.join, { callId: callId as never })
+          .catch(() => undefined);
+        await convex.mutation(api.calls.end, { callId: callId as never });
+      } else if (status === 'answered') {
+        await convex.mutation(api.calls.join, { callId: callId as never });
       }
-
-      const { error } = await supabase
-        .from('calls')
-        .update(updateData)
-        .eq('id', callId);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
       return { success: true };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
+    } catch (err) {
+      return { success: false, error: errMsg(err) };
     }
   },
 
-  /**
-   * Store WebRTC offer SDP
-   */
-  async storeOffer(callId: string, offerSdp: RTCSessionDescriptionInit): Promise<ServiceResult> {
-    try {
-      const { error } = await supabase
-        .from('calls')
-        .update({ offer_sdp: offerSdp, status: 'ringing' })
-        .eq('id', callId);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
-    }
+  async storeOffer(
+    callId: string,
+    offerSdp: RTCSessionDescriptionInit
+  ): Promise<ServiceResult> {
+    return signalCall(callId, undefined, 'offer', offerSdp);
   },
 
-  /**
-   * Store WebRTC answer SDP
-   */
-  async storeAnswer(callId: string, answerSdp: RTCSessionDescriptionInit): Promise<ServiceResult> {
-    try {
-      const { error } = await supabase
-        .from('calls')
-        .update({ answer_sdp: answerSdp, status: 'answered' })
-        .eq('id', callId);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
-    }
+  async storeAnswer(
+    callId: string,
+    answerSdp: RTCSessionDescriptionInit
+  ): Promise<ServiceResult> {
+    return signalCall(callId, undefined, 'answer', answerSdp);
   },
 
-  /**
-   * Store ICE candidate
-   */
   async storeIceCandidate(
     callId: string,
     fromUserId: string,
     candidate: RTCIceCandidateInit
   ): Promise<ServiceResult> {
-    try {
-      const { error } = await supabase
-        .from('call_candidates')
-        .insert({
-          call_id: callId,
-          from_user_id: fromUserId,
-          candidate: candidate
-        });
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
-    }
+    void fromUserId; // server stamps the sender
+    return signalCall(callId, undefined, 'ice', candidate);
   },
 
-  /**
-   * Get call by ID
-   */
   async getCall(callId: string): Promise<ServiceResult<CallSession>> {
     try {
-      const { data, error } = await supabase
-        .from('calls')
-        .select('*')
-        .eq('id', callId)
-        .single();
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
+      const raw = await convex.query(api.calls.get, { callId: callId as never });
+      if (!raw) return { success: false, error: 'Call not found' };
+      const r = raw as Record<string, unknown>;
+      const startedAt = r.startedAt as number;
       return {
         success: true,
         data: {
-          id: data.id,
-          callerId: data.caller_id,
-          receiverId: data.receiver_id,
-          callType: data.call_type,
-          status: data.status,
-          startedAt: data.created_at,
-          endedAt: data.ended_at,
-          duration: data.duration
-        }
+          id: r._id as string,
+          callerId: r.initiatorId as string,
+          receiverId:
+            ((r.participantIds as string[]) ?? []).find(
+              (id) => id !== r.initiatorId
+            ) ?? '',
+          callType: r.type as 'audio' | 'video',
+          status: (r.status as string) === 'active' ? 'answered' : (r.status as CallSession['status']),
+          startedAt: new Date(startedAt).toISOString(),
+        },
       };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
+    } catch (err) {
+      return { success: false, error: errMsg(err) };
     }
   },
 
-  /**
-   * Get call history for a user
-   */
   async getCallHistory(
-    userId: string,
+    _userId: string,
     limit = 50
   ): Promise<ServiceResult<CallHistory[]>> {
     try {
-      const { data: calls, error } = await supabase
-        .from('calls')
-        .select('*')
-        .or(`caller_id.eq.${userId},receiver_id.eq.${userId}`)
-        .order('created_at', { ascending: false })
-        .limit(limit);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      if (!calls || calls.length === 0) {
-        return { success: true, data: [] };
-      }
-
-      const userIds = new Set<string>();
-      calls.forEach(call => {
-        userIds.add(call.caller_id);
-        userIds.add(call.receiver_id);
-      });
-
-      const { data: profiles } = await supabase
-        .from('profiles')
-        .select('*')
-        .in('id', Array.from(userIds));
-
-      const profileMap = new Map((profiles || []).map(p => [p.id, p as UserProfile]));
-
-      const history: CallHistory[] = calls.map(call => {
-        const isCaller = call.caller_id === userId;
-
-        let status: CallHistory['status'] = 'answered';
-        if (call.status === 'missed' || (call.status === 'ended' && !call.duration)) {
-          status = isCaller ? 'missed' : 'missed';
-        } else if (call.status === 'declined') {
-          status = 'declined';
-        }
-
-        return {
-          id: call.id,
-          caller_id: call.caller_id,
-          callee_id: call.receiver_id,
-          call_type: call.call_type,
-          status,
-          duration: call.duration,
-          started_at: call.created_at,
-          ended_at: call.ended_at,
-          caller_profile: profileMap.get(call.caller_id),
-          callee_profile: profileMap.get(call.receiver_id)
-        };
-      });
-
-      return { success: true, data: history };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
+      const raw = await convex.query(api.calls.history, {});
+      return { success: true, data: (raw as CallHistory[]).slice(0, limit) };
+    } catch (err) {
+      return { success: false, error: errMsg(err) };
     }
   },
 
-  /**
-   * Create RTCPeerConnection with proper configuration
-   */
   createPeerConnection(
     onIceCandidate: (candidate: RTCIceCandidate) => void,
-    onTrack: (stream: MediaStream) => void,
-    onConnectionStateChange?: (state: RTCPeerConnectionState) => void
+    onRemoteStream?: (stream: MediaStream) => void,
+    onStateChange?: (state: RTCPeerConnectionState) => void
   ): RTCPeerConnection {
-    const pc = new RTCPeerConnection(ICE_SERVERS);
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        onIceCandidate(event.candidate);
-      }
+      if (event.candidate) onIceCandidate(event.candidate);
     };
 
     pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        onTrack(event.streams[0]);
+      if (onRemoteStream && event.streams[0]) {
+        onRemoteStream(event.streams[0]);
       }
     };
 
-    if (onConnectionStateChange) {
-      pc.onconnectionstatechange = () => {
-        onConnectionStateChange(pc.connectionState);
-      };
-    }
+    pc.onconnectionstatechange = () => {
+      onStateChange?.(pc.connectionState);
+    };
 
     return pc;
   },
 
-  /**
-   * Get user media stream
-   */
   async getUserMedia(
     callType: 'audio' | 'video'
   ): Promise<ServiceResult<MediaStream>> {
     try {
-      const constraints: MediaStreamConstraints = {
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: true,
-        video: callType === 'video'
-      };
-
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video: callType === 'video',
+      });
       return { success: true, data: stream };
-    } catch (err: any) {
-      let errorMessage = 'Failed to access media devices';
-
-      if (err.name === 'NotAllowedError') {
-        errorMessage = 'Permission denied. Please allow camera/microphone access.';
-      } else if (err.name === 'NotFoundError') {
-        errorMessage = 'No camera or microphone found.';
-      } else if (err.name === 'NotReadableError') {
-        errorMessage = 'Camera or microphone is already in use.';
-      }
-
-      return { success: false, error: errorMessage };
+    } catch (err) {
+      return { success: false, error: errMsg(err) || 'Media permission denied' };
     }
   },
 
-  /**
-   * Subscribe to incoming calls (simplified interface for App.tsx)
-   */
   subscribeToIncomingCalls(
     userId: string,
-    onIncomingCall: (call: CallSession & { offerSdp?: RTCSessionDescriptionInit }) => void
+    onIncomingCall: (
+      call: CallSession & { offerSdp?: RTCSessionDescriptionInit }
+    ) => void
   ): () => void {
-    const subscription = this.subscribeToCallEvents(userId, {
-      onIncomingCall
-    });
-    return subscription.unsubscribe;
+    const sub = this.subscribeToCallEvents(userId, { onIncomingCall });
+    return sub.unsubscribe;
   },
 
-  /**
-   * Subscribe to call signaling events
-   */
   subscribeToCallEvents(
     userId: string,
     callbacks: {
-      onIncomingCall?: (call: CallSession & { offerSdp?: RTCSessionDescriptionInit }) => void;
+      onIncomingCall?: (
+        call: CallSession & { offerSdp?: RTCSessionDescriptionInit }
+      ) => void;
       onCallAnswered?: (callId: string, answerSdp: RTCSessionDescriptionInit) => void;
       onCallEnded?: (callId: string) => void;
       onIceCandidate?: (callId: string, candidate: RTCIceCandidateInit) => void;
     }
-  ) {
-    const callChannel = supabase.channel(`calls_${userId}`);
+  ): { unsubscribe: () => void } {
+    let stopped = false;
+    let seenSignals = new Set<string>();
+    let knownCalls = new Map<
+      string,
+      { status: string; participants: string[] }
+    >();
+    let firstRun = true;
 
-    callChannel
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'calls',
-          filter: `receiver_id=eq.${userId}`
-        },
-        (payload) => {
-          const call = payload.new;
-          callbacks.onIncomingCall?.({
-            id: call.id,
-            callerId: call.caller_id,
-            receiverId: call.receiver_id,
-            callType: call.call_type,
-            status: call.status,
-            startedAt: call.created_at,
-            offerSdp: call.offer_sdp
-          });
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'calls',
-          filter: `caller_id=eq.${userId}`
-        },
-        (payload) => {
-          const call = payload.new;
+    const poll = async () => {
+      if (stopped) return;
+      try {
+        // 1. Incoming / ongoing calls involving me
+        const current = await convex.query(api.calls.current, {});
+        if (current) {
+          const c = current as unknown as {
+            call: {
+              _id: string;
+              type: 'audio' | 'video';
+              status: string;
+              initiatorId: string;
+              participantIds: string[];
+              startedAt: number;
+            };
+            hasJoined: boolean;
+          };
+          const call = c.call;
 
-          if (call.status === 'answered' && call.answer_sdp) {
-            callbacks.onCallAnswered?.(call.id, call.answer_sdp);
-          } else if (call.status === 'ended' || call.status === 'declined' || call.status === 'missed') {
-            callbacks.onCallEnded?.(call.id);
-          }
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'calls',
-          filter: `receiver_id=eq.${userId}`
-        },
-        (payload) => {
-          const call = payload.new;
-
-          if (call.offer_sdp && call.status === 'ringing') {
-            callbacks.onIncomingCall?.({
-              id: call.id,
-              callerId: call.caller_id,
-              receiverId: call.receiver_id,
-              callType: call.call_type,
-              status: call.status,
-              startedAt: call.created_at,
-              offerSdp: call.offer_sdp
-            });
-          } else if (call.status === 'ended' || call.status === 'declined') {
-            callbacks.onCallEnded?.(call.id);
-          }
-        }
-      )
-      .subscribe();
-
-    const candidateChannel = supabase.channel(`call_candidates_${userId}`);
-
-    candidateChannel
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'call_candidates'
-        },
-        async (payload) => {
-          const candidate = payload.new;
-
-          if (candidate.from_user_id !== userId) {
-            const { data: call } = await supabase
-              .from('calls')
-              .select('caller_id, receiver_id')
-              .eq('id', candidate.call_id)
-              .single();
-
-            if (call && (call.caller_id === userId || call.receiver_id === userId)) {
-              callbacks.onIceCandidate?.(candidate.call_id, candidate.candidate);
+          if (!firstRun && !knownCalls.has(call._id)) {
+            // New call appeared — ring if I'm not the initiator and haven't joined.
+            if (call.initiatorId !== userId && !c.hasJoined) {
+              callbacks.onIncomingCall?.({
+                id: call._id,
+                callerId: call.initiatorId,
+                receiverId: userId,
+                callType: call.type,
+                status: 'ringing',
+                startedAt: new Date(call.startedAt).toISOString(),
+              });
             }
           }
-        }
-      )
-      .subscribe();
 
-    return {
-      callChannel,
-      candidateChannel,
-      unsubscribe: () => {
-        supabase.removeChannel(callChannel);
-        supabase.removeChannel(candidateChannel);
+          // 2. Fetch signaling payloads for this call
+          if (
+            c.hasJoined ||
+            knownCalls.has(call._id)
+          ) {
+            const signals = (await convex.query(api.calls.signals, {
+              callId: call._id as never,
+              since: Date.now() - 60_000,
+            })) as unknown as Array<{
+              _id: string;
+              fromId: string;
+              kind: string;
+              payload: string;
+            }>;
+            for (const s of signals) {
+              if (s.fromId === userId) continue;
+              const key = s._id;
+              if (seenSignals.has(key)) continue;
+              seenSignals.add(key);
+              let parsed: unknown;
+              try {
+                parsed = JSON.parse(s.payload);
+              } catch {
+                continue;
+              }
+              if (s.kind === 'answer') {
+                callbacks.onCallAnswered?.(call._id, parsed as RTCSessionDescriptionInit);
+              } else if (s.kind === 'ice') {
+                callbacks.onIceCandidate?.(call._id, parsed as RTCIceCandidateInit);
+              }
+            }
+          }
+
+          // Detect ended state transitions
+          const prev = knownCalls.get(call._id);
+          if (prev && prev.status !== 'ended' && call.status === 'ended') {
+            callbacks.onCallEnded?.(call._id);
+          }
+          knownCalls.set(call._id, {
+            status: call.status,
+            participants: call.participantIds,
+          });
+        }
+
+        // Detect ended calls we knew about that no longer show up in current()
+        if (!firstRun && current === null) {
+          for (const [callId] of knownCalls) {
+            callbacks.onCallEnded?.(callId);
+          }
+          knownCalls.clear();
+        }
+        firstRun = false;
+      } catch {
+        /* ignore polling errors */
       }
     };
-  }
+
+    poll();
+    const interval = setInterval(poll, 1200);
+    return {
+      unsubscribe: () => {
+        stopped = true;
+        clearInterval(interval);
+      },
+    };
+  },
 };

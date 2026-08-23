@@ -268,6 +268,61 @@ export const signals = query({
 });
 
 /**
+ * Ended calls involving the signed-in user, newest first — for the
+ * call history tab. Includes both participants' profiles.
+ */
+export const history = query({
+  args: {},
+  handler: async (ctx) => {
+    const me = await getAuthUserId(ctx);
+    if (me === null) return [];
+
+    const calls = await ctx.db
+      .query("calls")
+      .withIndex("by_memberIds", (q) => q.eq("memberIds", arrayContains(me)))
+      .collect();
+    const ended = calls
+      .filter((c) => c.status === "ended")
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .slice(0, 50);
+
+    const out: Array<{
+      id: string;
+      caller_id: string;
+      callee_id: string;
+      call_type: "voice" | "video";
+      status: "missed" | "answered" | "declined";
+      duration?: number;
+      started_at: string;
+      ended_at?: string;
+    }> = [];
+    for (const c of ended) {
+      const isCaller = c.initiatorId === me;
+      const otherId = c.memberIds.find((id) => id !== me) ?? me;
+      const duration = c.endedAt ? Math.round((c.endedAt - c.startedAt) / 1000) : 0;
+      out.push({
+        id: c._id,
+        caller_id: c.initiatorId,
+        callee_id: otherId,
+        call_type: c.type === "video" ? "video" : "voice",
+        // If nobody besides the caller ever joined, treat as missed for them
+        // and declined for the callee side when applicable.
+        status:
+          duration > 0
+            ? "answered"
+            : isCaller
+              ? "missed"
+              : "declined",
+        duration: duration > 0 ? duration : undefined,
+        started_at: new Date(c.startedAt).toISOString(),
+        ended_at: c.endedAt ? new Date(c.endedAt).toISOString() : undefined,
+      });
+    }
+    return out;
+  },
+});
+
+/**
  * A specific call, for polling participant state inside the call UI.
  */
 export const get = query({
