@@ -146,25 +146,26 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
     e.target.value = '';
   };
 
-  // Handle cropped image upload
+  // Handle cropped image upload — compress, upload, save, then refresh
   const handleCroppedImage = async (blob: Blob) => {
     setShowCropper(false);
     setCropImageUrl(null);
     setSaving(true);
 
     try {
-      const file = new File([blob], `avatar_${Date.now()}.jpg`, { type: 'image/jpeg' });
+      const { compressImage } = await import('../services/mediaService');
+      const compressed = await compressImage(blob, 320, 0.85);
+      const file = new File([compressed], `avatar_${Date.now()}.jpg`, { type: 'image/jpeg' });
       const result = await mediaService.uploadMedia(file, currentUser.id);
 
       if (result.success && result.url) {
-        const updateResult = await profileService.updateProfile(currentUser.id, {
+        await profileService.updateProfile(currentUser.id, {
           avatar_url: result.url
         });
-        if (updateResult.success) {
-          const updatedProfile = await profileService.getProfile(currentUser.id);
-          if (updatedProfile) {
-            onProfileUpdate(updatedProfile);
-          }
+        // Re-fetch to get the canonical server URL
+        const updatedProfile = await profileService.getProfile(currentUser.id);
+        if (updatedProfile) {
+          onProfileUpdate(updatedProfile);
         }
       }
     } catch (error) {
@@ -182,11 +183,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
         full_name: name.trim()
       });
       if (result.success) {
-        const updatedProfile = await profileService.getProfile(currentUser.id);
-        if (updatedProfile) {
-          onProfileUpdate(updatedProfile);
-        }
+        // Optimistically update immediately
+        onProfileUpdate({ ...currentUser, full_name: name.trim() });
         setEditingName(false);
+        // Then re-fetch from server for canonical data
+        const updatedProfile = await profileService.getProfile(currentUser.id);
+        if (updatedProfile) onProfileUpdate(updatedProfile);
       }
     } catch (error) {
       console.error('Error updating name:', error);
@@ -202,11 +204,10 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
         bio: bio.trim()
       });
       if (result.success) {
-        const updatedProfile = await profileService.getProfile(currentUser.id);
-        if (updatedProfile) {
-          onProfileUpdate(updatedProfile);
-        }
+        onProfileUpdate({ ...currentUser, bio: bio.trim() });
         setEditingBio(false);
+        const updatedProfile = await profileService.getProfile(currentUser.id);
+        if (updatedProfile) onProfileUpdate(updatedProfile);
       }
     } catch (error) {
       console.error('Error updating bio:', error);
@@ -307,10 +308,9 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           <button onClick={() => setSection('profile')} className="settings-profile-card">
             <div className="settings-avatar">
               {currentUser.avatar_url ? (
-                <img src={currentUser.avatar_url} alt="" />
-              ) : (
-                <span>{currentUser.full_name?.charAt(0)}</span>
-              )}
+                <img src={currentUser.avatar_url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+              ) : null}
+              <span style={{ display: currentUser.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{currentUser.full_name?.charAt(0)}</span>
             </div>
             <div className="settings-profile-info">
               <h2>{currentUser.full_name}</h2>
@@ -473,10 +473,9 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
             <div className="profile-avatar-wrapper">
               <div className="profile-avatar-large">
                 {currentUser.avatar_url ? (
-                  <img src={currentUser.avatar_url} alt="" />
-                ) : (
-                  <span>{currentUser.full_name?.charAt(0)}</span>
-                )}
+                  <img src={currentUser.avatar_url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+                ) : null}
+                <span style={{ display: currentUser.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{currentUser.full_name?.charAt(0)}</span>
               </div>
               <label className="profile-camera-btn">
                 <Camera className={`w-5 h-5 ${saving ? 'opacity-50' : ''}`} />
@@ -729,10 +728,9 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
                 <div key={user.id} className="blocked-user-item">
                   <div className="blocked-user-avatar">
                     {user.avatar_url ? (
-                      <img src={user.avatar_url} alt={user.full_name} />
-                    ) : (
-                      <span>{user.full_name?.charAt(0).toUpperCase()}</span>
-                    )}
+                      <img src={user.avatar_url} alt={user.full_name} onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+                    ) : null}
+                    <span style={{ display: user.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{user.full_name?.charAt(0).toUpperCase()}</span>
                   </div>
                   <div className="blocked-user-info">
                     <span className="blocked-user-name">{user.full_name}</span>
@@ -773,10 +771,9 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           <div className="admin-badge">
             <div className="admin-badge-avatar">
               {currentUser.avatar_url ? (
-                <img src={currentUser.avatar_url} alt="" />
-              ) : (
-                <span>{currentUser.full_name?.charAt(0)}</span>
-              )}
+                <img src={currentUser.avatar_url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+              ) : null}
+              <span style={{ display: currentUser.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{currentUser.full_name?.charAt(0)}</span>
             </div>
             <div className="admin-badge-info">
               <div className="admin-badge-name">

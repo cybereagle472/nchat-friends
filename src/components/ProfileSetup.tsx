@@ -112,10 +112,16 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
     }
   }, []);
 
+  // If user picked a custom photo, require upload to finish before submit
+  const customPhotoSelected = customAvatarPreview !== null;
+  const uploadDone = !customPhotoSelected || uploadedAvatarUrl !== null;
+
   const isFormValid =
     fullName.trim().length > 0 &&
     username.length >= 3 &&
-    usernameAvailable !== false;
+    usernameAvailable !== false &&
+    !avatarUploading &&
+    uploadDone;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -137,7 +143,8 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
     setError('');
 
     try {
-      const finalAvatarUrl = uploadedAvatarUrl || customAvatarPreview || avatarUrl;
+      // Always use the server URL — never a blob URL
+      const finalAvatarUrl = uploadedAvatarUrl || avatarUrl;
 
       const result = await profileService.createProfile({
         id: userId,
@@ -324,6 +331,11 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
                 <>
                   <Loader2 className="w-5 h-5 animate-spin" />
                   <span>Setting up…</span>
+                </>
+              ) : avatarUploading ? (
+                <>
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  <span>Uploading photo…</span>
                 </>
               ) : (
                 <>

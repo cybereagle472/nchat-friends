@@ -2,22 +2,25 @@ import { api, convex } from '../lib/convexClient';
 import type { UserProfile } from '../types';
 
 function mapProfile(u: {
-  id: string;
+  _id?: string;
+  id?: string;
   full_name?: string;
   username?: string;
   email?: string;
   avatar_url?: string;
   bio?: string;
+  is_online?: boolean;
 } | null): UserProfile | null {
   if (!u) return null;
+  const userId = (u._id ?? u.id) as string;
   return {
-    id: u.id,
+    id: userId,
     full_name: u.full_name || 'User',
     username: u.username,
     email: u.email ?? '',
     avatar_url: u.avatar_url,
     bio: u.bio,
-    is_online: false,
+    is_online: u.is_online ?? false,
   };
 }
 
@@ -51,12 +54,25 @@ export const profileService = {
     bio?: string;
   }): Promise<{ success: boolean; profile?: UserProfile; error?: string }> {
     try {
+      // Save to server
       await convex.mutation(api.users.updateProfile, {
         full_name: profile.full_name,
         username: profile.username.toLowerCase(),
         avatar_url: profile.avatar_url,
         bio: profile.bio || 'Hey there! I am using NChat.',
       });
+
+      // Re-fetch from server to get the authoritative saved data
+      // (avoids returning stale blob URLs or incomplete data)
+      const freshProfile = await convex.query(api.users.getUserById, {
+        userId: profile.id as never,
+      });
+
+      if (freshProfile) {
+        return { success: true, profile: mapProfile(freshProfile as never)! };
+      }
+
+      // Fallback: if re-fetch fails, return input (still better than error)
       return { success: true, profile: profile as UserProfile };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -70,7 +86,7 @@ export const profileService = {
   async updateProfile(
     userId: string,
     updates: Partial<UserProfile>
-  ): Promise<{ success: boolean; error?: string }> {
+  ): Promise<{ success: boolean; profile?: UserProfile; error?: string }> {
     try {
       const patch: Record<string, string> = {};
       if (updates.full_name !== undefined) patch.full_name = updates.full_name;

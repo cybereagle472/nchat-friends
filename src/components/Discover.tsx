@@ -347,12 +347,11 @@ export function Discover({
                     className="flex items-center gap-3 p-3 rounded-2xl backdrop-blur-xl bg-white/70 border border-white/70 hover:bg-white/90 hover:shadow-lg hover:shadow-purple-500/15 transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] animate-slide-up group"
                   >
                     <div className="relative">
-                      <div className="w-14 h-14 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
+                      <div className="relative w-14 h-14 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
                         {friend.profile.avatar_url ? (
-                          <img src={friend.profile.avatar_url} alt={friend.profile.full_name} className="w-full h-full object-cover" />
-                        ) : (
-                          <span className="text-white font-semibold">{friend.profile.full_name.charAt(0).toUpperCase()}</span>
-                        )}
+                          <img src={friend.profile.avatar_url} alt={friend.profile.full_name} className="w-full h-full object-cover" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+                        ) : null}
+                        <span className="text-white font-semibold absolute inset-0 flex items-center justify-center" style={{ display: friend.profile.avatar_url ? 'none' : 'flex' }}>{friend.profile.full_name.charAt(0).toUpperCase()}</span>
                       </div>
                       {friend.profile.is_online && (
                         <div className="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-green-500 rounded-full border-2 border-white shadow-md"></div>
@@ -513,18 +512,18 @@ export function Discover({
                     >
                       <div className="flex items-center gap-3">
                         <div className="relative">
-                          <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
+                          <div className="relative w-12 h-12 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
                             {user.profile.avatar_url ? (
                               <img
                                 src={user.profile.avatar_url}
                                 alt={user.profile.full_name}
                                 className="w-full h-full object-cover"
+                                onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
                               />
-                            ) : (
-                              <span className="text-white font-semibold">
-                                {user.profile.full_name.charAt(0).toUpperCase()}
-                              </span>
-                            )}
+                            ) : null}
+                            <span className="text-white font-semibold absolute inset-0 flex items-center justify-center" style={{ display: user.profile.avatar_url ? 'none' : 'flex' }}>
+                              {user.profile.full_name.charAt(0).toUpperCase()}
+                            </span>
                           </div>
                           {user.profile.is_online && (
                             <div className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 bg-green-500 rounded-full border-2 border-white shadow-sm"></div>
