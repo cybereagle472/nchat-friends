@@ -152,6 +152,26 @@ export const get = query({
 });
 
 /**
+ * Look up the one-to-one conversation between two users without creating
+ * it. Returns the conversation id or null. Used by the chat service.
+ */
+export const getByMembers = query({
+  args: { userA: v.id("users"), userB: v.id("users") },
+  handler: async (ctx, { userA, userB }) => {
+    const me = await getAuthUserId(ctx);
+    if (me === null) return null;
+    if (me !== userA && me !== userB) return null;
+
+    const [a, b] = sortUserIds(userA, userB);
+    const existing = await ctx.db
+      .query("conversations")
+      .withIndex("by_memberIds", (q) => q.eq("memberIds", [a, b]))
+      .first();
+    return existing?._id ?? null;
+  },
+});
+
+/**
  * Get the conversation between the current user and another user,
  * creating it on first use — but only if they're friends.
  */

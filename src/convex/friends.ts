@@ -231,6 +231,172 @@ export const listFriends = query({
   },
 });
 
+// ── Extra friend operations for the zip frontend bridge ───────────────
+
+/**
+ * All pending requests involving me: received (others → me) and sent
+ * (me → others), with the other user's public profile.
+ */
+export const listAllRequests = query({
+  args: {},
+  handler: async (ctx) => {
+    const me = await getAuthUserId(ctx);
+    if (me === null) return { received: [], sent: [] };
+
+    const connections = await ctx.db
+      .query("connections")
+      .withIndex("by_userIds", (q) => q.eq("userIds", arrayContains(me)))
+      .collect();
+
+    const toProfile = async (id: Id<"users">) => {
+      const u = await ctx.db.get(id);
+      if (!u) return null;
+      return {
+        id: u._id,
+        full_name: u.full_name ?? u.name ?? "",
+        username: u.username,
+        email: u.email ?? "",
+        avatar_url: u.avatar_url ?? u.image,
+        bio: u.bio,
+      };
+    };
+
+    type Req = { id: Id<"connections">; created_at: string; sender_id?: string; receiver_id?: string; sender_profile?: unknown; receiver_profile?: unknown };
+    const received: Req[] = [];
+    const sent: Req[] = [];
+    for (const c of connections) {
+      if (c.status !== "pending") continue;
+      const createdAt = new Date(c.createdAt).toISOString();
+      if (c.requesterId === me) {
+        const otherId = c.userIds.find((id) => id !== me);
+        if (!otherId) continue;
+        sent.push({
+          id: c._id,
+          created_at: createdAt,
+          receiver_id: otherId,
+          receiver_profile: await toProfile(otherId),
+        });
+      } else {
+        received.push({
+          id: c._id,
+          created_at: createdAt,
+          sender_id: c.requesterId,
+          sender_profile: await toProfile(c.requesterId),
+        });
+      }
+    }
+    return { received, sent };
+  },
+});
+
+/** Cancel a pending request I previously sent. */
+export const cancelRequest = mutation({
+  args: { addresseeId: v.id("users") },
+  handler: async (ctx, { addresseeId }) => {
+    const me = await getAuthUserId(ctx);
+    if (me === null) throw new Error("Not signed in");
+    const [a, b] = sortUserIds(me, addresseeId);
+    const conn = await ctx.db
+      .query("connections")
+      .withIndex("by_userIds", (q) => q.eq("userIds", [a, b]))
+      .first();
+    if (!conn) return;
+    if (conn.status === "accepted") throw new Error("Already friends — unfriend instead");
+    if (conn.requesterId !== me) throw new Error("Not your request");
+    await ctx.db.delete(conn._id);
+  },
+});
+
+/** Remove an accepted friendship. */
+export const removeFriend = mutation({
+  args: { friendId: v.id("users") },
+  handler: async (ctx, { friendId }) => {
+    const me = await getAuthUserId(ctx);
+    if (me === null) throw new Error("Not signed in");
+    const [a, b] = sortUserIds(me, friendId);
+    const conn = await ctx.db
+      .query("connections")
+      .withIndex("by_userIds", (q) => q.eq("userIds", [a, b]))
+      .first();
+    if (conn && conn.status === "accepted") {
+      await ctx.db.delete(conn._id);
+    }
+  },
+});
+
+/** Block a user. Also removes any friendship/connection between you. */
+export const blockUser = mutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, { userId }) => {
+    const me = await getAuthUserId(ctx);
+    if (me === null) throw new Error("Not signed in");
+    if (userId === me) throw new Error("You can't block yourself");
+
+    // Remove connection entirely.
+    const [a, b] = sortUserIds(me, userId);
+    const conn = await ctx.db
+      .query("connections")
+      .withIndex("by_userIds", (q) => q.eq("userIds", [a, b]))
+      .first();
+    if (conn) await ctx.db.delete(conn._id);
+
+    const existing = await ctx.db
+      .query("blocks")
+      .withIndex("by_blocker", (q) => q.eq("blockerId", me))
+      .collect()
+      .then((rows) => rows.find((r) => r.blockedId === userId));
+    if (!existing) {
+      await ctx.db.insert("blocks", {
+        blockerId: me,
+        blockedId: userId,
+        createdAt: Date.now(),
+      });
+    }
+  },
+});
+
+/** Unblock a user. */
+export const unblockUser = mutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, { userId }) => {
+    const me = await getAuthUserId(ctx);
+    if (me === null) throw new Error("Not signed in");
+    const rows = await ctx.db
+      .query("blocks")
+      .withIndex("by_blocker", (q) => q.eq("blockerId", me))
+      .collect();
+    for (const row of rows) {
+      if (row.blockedId === userId) await ctx.db.delete(row._id);
+    }
+  },
+});
+
+/** Users I have blocked, with profiles. */
+export const listBlocked = query({
+  args: {},
+  handler: async (ctx) => {
+    const me = await getAuthUserId(ctx);
+    if (me === null) return [];
+    const rows = await ctx.db
+      .query("blocks")
+      .withIndex("by_blocker", (q) => q.eq("blockerId", me))
+      .collect();
+    const out: Array<{ id: string; full_name: string; username?: string; email: string; avatar_url?: string }> = [];
+    for (const row of rows) {
+      const u = await ctx.db.get(row.blockedId);
+      if (!u) continue;
+      out.push({
+        id: u._id,
+        full_name: u.full_name ?? u.name ?? "",
+        username: u.username,
+        email: u.email ?? "",
+        avatar_url: u.avatar_url ?? u.image,
+      });
+    }
+    return out;
+  },
+});
+
 /**
  * Are two users friends? Used before opening a direct conversation.
  */

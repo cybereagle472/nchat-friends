@@ -134,6 +134,13 @@ const schema = defineSchema(
       userId: v.id("users"),
       lastActiveAt: v.number(),
     }).index("by_userId", ["userId"]),
+
+    // NChat: user blocks. blockerId can't see or be contacted by blockedId.
+    blocks: defineTable({
+      blockerId: v.id("users"),
+      blockedId: v.id("users"),
+      createdAt: v.number(),
+    }).index("by_blocker", ["blockerId"]),
   },
   {
     schemaValidation: false,

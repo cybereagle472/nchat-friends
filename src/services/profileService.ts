@@ -1,36 +1,47 @@
-import { supabase } from '../supabaseClient';
-import { UserProfile } from '../types';
+import { api, convex } from '../lib/convexClient';
+import type { UserProfile } from '../types';
+
+function mapProfile(u: {
+  id: string;
+  full_name?: string;
+  username?: string;
+  email?: string;
+  avatar_url?: string;
+  bio?: string;
+} | null): UserProfile | null {
+  if (!u) return null;
+  return {
+    id: u.id,
+    full_name: u.full_name || 'User',
+    username: u.username,
+    email: u.email ?? '',
+    avatar_url: u.avatar_url,
+    bio: u.bio,
+    is_online: false,
+  };
+}
 
 export const profileService = {
-  // Get profile by ID
   async getProfile(userId: string): Promise<UserProfile | null> {
-    const { data } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', userId)
-      .maybeSingle();
-
-    return data as UserProfile | null;
+    try {
+      const profile = await convex.query(api.users.getUserById, {
+        userId: userId as never,
+      });
+      return mapProfile(profile as never);
+    } catch {
+      return null;
+    }
   },
 
-  // Get all profiles (for discover/find friends)
   async getAllProfiles(): Promise<UserProfile[]> {
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('*')
-      .not('full_name', 'is', null)
-      .not('username', 'is', null)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      console.error('Error fetching all profiles:', error);
+    try {
+      const profiles = await convex.query(api.users.getAllProfiles, {});
+      return (profiles as never as Array<Record<string, unknown>>).map((p) => mapProfile(p as never)!);
+    } catch {
       return [];
     }
-
-    return (data || []) as UserProfile[];
   },
 
-  // Create new profile (uses upsert to handle existing profiles)
   async createProfile(profile: {
     id: string;
     email: string;
@@ -39,68 +50,56 @@ export const profileService = {
     avatar_url: string;
     bio?: string;
   }): Promise<{ success: boolean; profile?: UserProfile; error?: string }> {
-    // Use upsert to create or update the profile
-    const { data, error } = await supabase
-      .from('profiles')
-      .upsert({
-        id: profile.id,
-        email: profile.email,
+    try {
+      await convex.mutation(api.users.updateProfile, {
         full_name: profile.full_name,
-        username: profile.username,
+        username: profile.username.toLowerCase(),
         avatar_url: profile.avatar_url,
-        bio: profile.bio || 'Hey there! I am using NChat.'
-      }, { onConflict: 'id' })
-      .select()
-      .single();
-
-    if (error) {
-      console.error('Profile creation error:', error);
-      if (error.code === '23505') {
-        if (error.message?.includes('username')) {
-          return { success: false, error: 'Username already taken' };
-        }
-        return { success: false, error: 'Profile already exists' };
+        bio: profile.bio || 'Hey there! I am using NChat.',
+      });
+      return { success: true, profile: profile as UserProfile };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('Username already taken')) {
+        return { success: false, error: 'Username already taken' };
       }
-      return { success: false, error: error.message };
+      return { success: false, error: msg };
     }
-
-    return { success: true, profile: data as UserProfile };
   },
 
-  // Update profile
-  async updateProfile(userId: string, updates: Partial<UserProfile>): Promise<{ success: boolean; error?: string }> {
-    const { error } = await supabase
-      .from('profiles')
-      .update(updates)
-      .eq('id', userId);
-
-    if (error) {
-      return { success: false, error: error.message };
+  async updateProfile(
+    userId: string,
+    updates: Partial<UserProfile>
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const patch: Record<string, string> = {};
+      if (updates.full_name !== undefined) patch.full_name = updates.full_name;
+      if (updates.username !== undefined) patch.username = updates.username.toLowerCase();
+      if (updates.avatar_url !== undefined) patch.avatar_url = updates.avatar_url;
+      if (updates.bio !== undefined) patch.bio = updates.bio;
+      await convex.mutation(api.users.updateProfile, patch);
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
-
-    return { success: true };
   },
 
-  // Check if username is available
   async isUsernameAvailable(username: string, excludeUserId?: string): Promise<boolean> {
-    let query = supabase
-      .from('profiles')
-      .select('id')
-      .eq('username', username.toLowerCase());
-
-    if (excludeUserId) {
-      query = query.neq('id', excludeUserId);
+    try {
+      return await convex.query(api.users.isUsernameAvailable, {
+        username: username.toLowerCase(),
+        excludeUserId: excludeUserId as never,
+      });
+    } catch {
+      return false;
     }
-
-    const { data } = await query.maybeSingle();
-    return !data;
   },
 
-  // Update last seen
-  async updateLastSeen(userId: string): Promise<void> {
-    await supabase
-      .from('profiles')
-      .update({ last_seen: new Date().toISOString() })
-      .eq('id', userId);
-  }
+  async updateLastSeen(_userId: string): Promise<void> {
+    try {
+      await convex.mutation(api.typing.upsertPresence, {});
+    } catch {
+      /* ignore */
+    }
+  },
 };

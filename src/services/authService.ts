@@ -1,6 +1,6 @@
-import { supabase } from '../supabaseClient';
-import { UserProfile } from '../types';
-import { log } from '../utils/logger';
+import { api } from '../lib/convexClient';
+import { convex } from '../lib/convexClient';
+import type { UserProfile } from '../types';
 
 export interface AuthState {
   isAuthenticated: boolean;
@@ -8,190 +8,154 @@ export interface AuthState {
   needsProfileSetup: boolean;
 }
 
+function mapUser(u: {
+  _id: string;
+  name?: string;
+  image?: string;
+  email?: string;
+  full_name?: string;
+  username?: string;
+  avatar_url?: string;
+  bio?: string;
+} | null): UserProfile | null {
+  if (!u) return null;
+  return {
+    id: u._id,
+    full_name: u.full_name ?? u.name ?? u.email?.split('@')[0] ?? 'User',
+    username: u.username,
+    email: u.email ?? '',
+    avatar_url: u.avatar_url ?? u.image,
+    bio: u.bio,
+    is_online: false,
+  };
+}
+
+async function fetchMyProfile(): Promise<UserProfile | null> {
+  try {
+    const user = await convex.query(api.users.currentUser);
+    if (!user) return null;
+    const mapped = mapUser(user as never);
+    // Profile is "complete" when full_name + username + avatar exist
+    if (mapped && mapped.full_name) return mapped;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export const authService = {
-  // Check current session and return auth state
   async checkSession(): Promise<AuthState> {
     try {
-      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
-
-      if (sessionError) {
-        log.error('Session check failed', sessionError, 'authService');
-        return { isAuthenticated: false, user: null, needsProfileSetup: false };
+      const profile = await fetchMyProfile();
+      if (profile) {
+        const complete =
+          !!profile.full_name &&
+          !!profile.username &&
+          !!profile.avatar_url;
+        return { isAuthenticated: true, user: profile, needsProfileSetup: !complete };
       }
-
-      if (!session?.user?.id) {
-        return { isAuthenticated: false, user: null, needsProfileSetup: false };
+      // Distinguish signed-in-but-no-profile vs signed-out
+      try {
+        const user = await convex.query(api.users.currentUser);
+        if (user) {
+          return { isAuthenticated: true, user: null, needsProfileSetup: true };
+        }
+      } catch {
+        /* not signed in */
       }
-
-      // Get profile from database
-      const { data: profile, error: profileError } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', session.user.id)
-        .maybeSingle();
-
-      if (profileError) {
-        log.warn('Profile fetch failed, user may need setup', profileError, 'authService');
-        return { isAuthenticated: true, user: null, needsProfileSetup: true };
-      }
-
-      if (profile && profile.full_name && profile.username && profile.avatar_url) {
-        return { isAuthenticated: true, user: profile as UserProfile, needsProfileSetup: false };
-      }
-
-      return { isAuthenticated: true, user: null, needsProfileSetup: true };
-    } catch (err) {
-      log.error('Unexpected error in checkSession', err, 'authService');
+      return { isAuthenticated: false, user: null, needsProfileSetup: false };
+    } catch {
       return { isAuthenticated: false, user: null, needsProfileSetup: false };
     }
   },
 
-  // Sign up new user
-  async signUp(email: string, password: string): Promise<{ success: boolean; error?: string; needsEmailConfirmation?: boolean }> {
+  async signUp(
+    email: string,
+    password: string
+  ): Promise<{ success: boolean; error?: string; needsEmailConfirmation?: boolean }> {
     try {
-      const { data, error } = await supabase.auth.signUp({
-        email,
-        password,
-        options: {
-          // This ensures the user gets a session immediately if email confirmation is disabled
-          emailRedirectTo: window.location.origin,
-          data: {
-            email: email
-          }
-        }
+      await convex.action(api.auth.signIn, {
+        provider: 'password',
+        params: { email, password, flow: 'signUp' },
       });
-
-      if (error) {
-        log.error('Signup error', error, 'authService');
-
-        // Handle "Database error saving new user" - this means the trigger failed
-        if (error.message.includes('Database error') || error.message.includes('database error')) {
-          // Try to check if user was actually created despite the error
-          const { data: existingSession } = await supabase.auth.getSession();
-          if (existingSession?.session?.user) {
-            // User was created, just the profile trigger failed - that's OK, profile setup will handle it
-            return { success: true, needsEmailConfirmation: false };
-          }
-          return { success: false, error: 'Sign up failed. Please try again.' };
-        }
-
-        if (error.message.includes('already registered') || error.message.includes('User already registered')) {
-          return { success: false, error: 'Email already registered. Please login.' };
-        }
-        if (error.message.includes('rate limit') || error.message.includes('too many')) {
-          return { success: false, error: 'Too many signup attempts. Please wait a few minutes.' };
-        }
-        return { success: false, error: error.message || 'Sign up failed' };
-      }
-
-      if (!data.user) {
-        return { success: false, error: 'Sign up failed - no user returned' };
-      }
-
-      // Check if email confirmation is required
-      // If session is null but user exists, email confirmation is needed
-      if (!data.session && data.user.identities?.length === 0) {
-        // User already exists but trying to sign up again
+      return { success: true, needsEmailConfirmation: false };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('already') || msg.includes('exists')) {
         return { success: false, error: 'Email already registered. Please login.' };
       }
-
-      if (!data.session) {
-        // Email confirmation is required
-        return { success: true, needsEmailConfirmation: true };
+      if (msg.includes('rate limit') || msg.includes('too many')) {
+        return { success: false, error: 'Too many signup attempts. Please wait a few minutes.' };
       }
-
-      // User is signed up and logged in (email confirmation disabled)
-      // Ensure a basic profile entry exists (the profile setup screen will complete it)
-      try {
-        const { error: profileError } = await supabase
-          .from('profiles')
-          .upsert({
-            id: data.user.id,
-            email: email,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          }, { onConflict: 'id', ignoreDuplicates: true });
-
-        if (profileError) {
-          log.warn('Profile creation warning (non-fatal)', profileError, 'authService');
-        }
-      } catch (profileErr) {
-        // Non-fatal - profile setup will handle this
-        log.warn('Profile upsert failed (non-fatal)', profileErr, 'authService');
-      }
-
-      return { success: true, needsEmailConfirmation: false };
-    } catch (err: any) {
-      log.error('Unexpected signup error', err, 'authService');
-      return { success: false, error: err.message || 'An unexpected error occurred' };
+      return { success: false, error: msg || 'Sign up failed' };
     }
   },
 
-  // Login existing user
-  async login(email: string, password: string): Promise<{ success: boolean; user?: UserProfile; needsSetup?: boolean; error?: string }> {
+  async login(
+    email: string,
+    password: string
+  ): Promise<{ success: boolean; user?: UserProfile; needsSetup?: boolean; error?: string }> {
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-
-      if (error) {
-        log.error('Login error', error, 'authService');
-        if (error.message.includes('Invalid login') || error.message.includes('Invalid credentials')) {
-          return { success: false, error: 'Invalid email or password' };
-        }
-        if (error.message.includes('Email not confirmed')) {
-          return { success: false, error: 'Please check your email and confirm your account first' };
-        }
-        if (error.message.includes('rate limit') || error.message.includes('too many')) {
-          return { success: false, error: 'Too many login attempts. Please wait a few minutes.' };
-        }
-        return { success: false, error: error.message || 'Login failed' };
+      await convex.action(api.auth.signIn, {
+        provider: 'password',
+        params: { email, password, flow: 'signIn' },
+      });
+      const profile = await fetchMyProfile();
+      if (profile) {
+        const complete = !!profile.username && !!profile.avatar_url;
+        return { success: true, user: profile, needsSetup: !complete };
       }
-
-      if (!data.user) {
-        return { success: false, error: 'Login failed - no user returned' };
-      }
-
-      if (!data.session) {
-        return { success: false, error: 'Login failed - no session created' };
-      }
-
-      // Check if profile exists and is complete
-      const { data: profile, error: profileError } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', data.user.id)
-        .maybeSingle();
-
-      if (profileError) {
-        log.warn('Profile fetch failed after login', profileError, 'authService');
-        // Profile might not exist yet - user needs setup
-        return { success: true, needsSetup: true };
-      }
-
-      if (profile && profile.full_name && profile.username && profile.avatar_url) {
-        return { success: true, user: profile as UserProfile, needsSetup: false };
-      }
-
-      // Profile exists but is incomplete
       return { success: true, needsSetup: true };
-    } catch (err: any) {
-      log.error('Unexpected login error', err, 'authService');
-      return { success: false, error: err.message || 'An unexpected error occurred' };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('Invalid') || msg.includes('invalid')) {
+        return { success: false, error: 'Invalid email or password' };
+      }
+      return { success: false, error: msg || 'Login failed' };
     }
   },
 
-  // Logout
   async logout(): Promise<void> {
-    await supabase.auth.signOut();
+    try {
+      await convex.action(api.auth.signOut, {});
+    } catch {
+      /* ignore */
+    }
   },
 
-  // Get current user ID
   async getCurrentUserId(): Promise<string | null> {
-    const { data: { session } } = await supabase.auth.getSession();
-    return session?.user?.id || null;
+    try {
+      const user = await convex.query(api.users.currentUser);
+      return (user as { _id?: string } | null)?._id ?? null;
+    } catch {
+      return null;
+    }
   },
 
-  // Subscribe to auth changes
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onAuthChange(callback: (event: string, session: any) => void) {
-    return supabase.auth.onAuthStateChange(callback);
-  }
+    // Poll Convex auth state; call back on changes.
+    let lastSignedIn: boolean | null = null;
+    const interval = setInterval(async () => {
+      try {
+        const user = await convex.query(api.users.currentUser);
+        const signedIn = !!user;
+        if (lastSignedIn === null) {
+          lastSignedIn = signedIn;
+          return;
+        }
+        if (signedIn !== lastSignedIn) {
+          lastSignedIn = signedIn;
+          callback(
+            signedIn ? 'SIGNED_IN' : 'SIGNED_OUT',
+            signedIn ? { user: { id: (user as { _id: string })._id, email: (user as { email?: string }).email } } : null
+          );
+        }
+      } catch {
+        /* ignore */
+      }
+    }, 3000);
+    const subscription = { unsubscribe: () => clearInterval(interval) };
+    return { data: { subscription } };
+  },
 };
