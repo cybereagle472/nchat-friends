@@ -132,7 +132,6 @@ export const chatService = {
         type,
         created_at: new Date(now).toISOString(),
         is_read: false,
-        syncStatus: 'sent',
       };
       this.updateCache(senderId, receiverId, message);
       return { success: true, message, clientMessageId };
@@ -148,7 +147,7 @@ export const chatService = {
   async getMessages(
     userId: string,
     otherId: string,
-    _opts?: { limit?: number; forceServerSync?: boolean }
+    _opts?: { limit?: number; forceServerSync?: boolean; beforeTimestamp?: string | number }
   ): Promise<Message[]> {
     try {
       const conversationId = await findOrCreateConversation(userId, otherId);
@@ -219,7 +218,7 @@ export const chatService = {
   async getMessagesInstant(
     userId: string,
     otherId: string,
-    opts?: { limit?: number }
+    opts?: { limit?: number; beforeTimestamp?: string | number }
   ): Promise<Message[]> {
     return this.getMessages(userId, otherId, opts);
   },
@@ -287,8 +286,22 @@ export const chatService = {
     await Promise.allSettled(chatIds.map((id) => this.getMessages(userId, id)));
   },
 
-  async processPendingQueue(): Promise<void> {
-    /* No offline queue in the Convex path — sends are direct */
+  async processPendingQueue(
+    onStatusUpdate?: (clientMessageId: string, status: 'sent' | 'failed') => void,
+    ..._rest: unknown[]
+  ): Promise<{ processed: number; failed: number }> {
+    /* No offline queue in the Convex path — sends are direct.
+       Report any locally-pending messages as failed so the UI clears them. */
+    let failed = 0;
+    for (const entry of messageCache.values()) {
+      for (const m of entry.messages) {
+        if ((m as AnyMsg).syncStatus === 'pending') {
+          failed++;
+          onStatusUpdate?.(m.client_message_id ?? m.id, 'failed');
+        }
+      }
+    }
+    return { processed: 0, failed };
   },
 
   async addReaction(messageId: string, _userId: string, emoji: string): Promise<void> {
@@ -353,7 +366,7 @@ export const chatService = {
     userId: string,
     targetUserIds: string[],
     message: Message
-  ): Promise<{ success: boolean; count?: number; error?: string }> {
+  ): Promise<{ success: boolean; count?: number; sentCount?: number; error?: string }> {
     try {
       let count = 0;
       for (const target of targetUserIds) {
@@ -365,7 +378,7 @@ export const chatService = {
         });
         if (res.success) count++;
       }
-      return { success: true, count };
+      return { success: true, count, sentCount: count };
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
@@ -375,11 +388,11 @@ export const chatService = {
     _userId: string,
     groupIds: string[],
     message: Message
-  ): Promise<{ success: boolean; count?: number; error?: string }> {
+  ): Promise<{ success: boolean; count?: number; sentCount?: number; error?: string }> {
     // Group forwarding handled by groupService in the zip UI flow
     void groupIds;
     void message;
-    return { success: true, count: 0 };
+    return { success: true, count: 0, sentCount: 0 };
   },
 
   /**
