@@ -120,6 +120,14 @@ export const getUserById = query({
   handler: async (ctx, { userId }) => {
     const u = await ctx.db.get(userId);
     if (!u) return null;
+
+    // Check online status from presence table
+    const presence = await ctx.db
+      .query("presence")
+      .withIndex("by_userId", (q) => q.eq("userId", userId))
+      .first();
+    const isOnline = presence ? (Date.now() - presence.lastActiveAt < 120_000) : false;
+
     return {
       id: u._id,
       full_name: u.full_name ?? u.name ?? "",
@@ -127,6 +135,8 @@ export const getUserById = query({
       email: u.email ?? "",
       avatar_url: u.avatar_url ?? u.image,
       bio: u.bio,
+      is_online: isOnline,
+      last_seen: presence ? new Date(presence.lastActiveAt).toISOString() : undefined,
     };
   },
 });
@@ -141,15 +151,28 @@ export const getAllProfiles = query({
     if (me === null) return [];
 
     const users = await ctx.db.query("users").collect();
+    
+    // Batch-fetch presence for all users
+    const presenceEntries = await ctx.db.query("presence").collect();
+    const presenceMap = new Map(
+      presenceEntries.map((p) => [p.userId, p.lastActiveAt])
+    );
+    
     return users
       .filter((u) => u._id !== me && (u.full_name || u.name))
-      .map((u) => ({
-        id: u._id,
-        full_name: u.full_name ?? u.name ?? "",
-        username: u.username,
-        email: u.email ?? "",
-        avatar_url: u.avatar_url ?? u.image,
-        bio: u.bio,
-      }));
+      .map((u) => {
+        const lastActiveAt = presenceMap.get(u._id);
+        const isOnline = lastActiveAt ? (Date.now() - lastActiveAt < 120_000) : false;
+        return {
+          id: u._id,
+          full_name: u.full_name ?? u.name ?? "",
+          username: u.username,
+          email: u.email ?? "",
+          avatar_url: u.avatar_url ?? u.image,
+          bio: u.bio,
+          is_online: isOnline,
+          last_seen: lastActiveAt ? new Date(lastActiveAt).toISOString() : undefined,
+        };
+      });
   },
 });

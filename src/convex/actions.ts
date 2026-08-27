@@ -18,11 +18,22 @@ export const uploadFile = action({
     if (!base64) throw new Error("Invalid data URL");
 
     const buffer = Buffer.from(base64, "base64");
+
+    // Validate file size (max 10MB)
+    if (buffer.length > 10 * 1024 * 1024) {
+      throw new Error("File too large. Maximum size is 10MB");
+    }
+
     const blob = new Blob([buffer], { type: mimeType });
     const file = new File([blob], filename, { type: mimeType });
 
     const storageId = await ctx.storage.store(file);
     const url = await ctx.storage.getUrl(storageId);
+    
+    if (!url) {
+      throw new Error("Failed to get storage URL");
+    }
+    
     return { storageId: storageId as string, url };
   },
 });
