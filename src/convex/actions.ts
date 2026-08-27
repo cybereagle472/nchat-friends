@@ -13,27 +13,27 @@ export const uploadFile = action({
     mimeType: v.string(),
   },
   handler: async (ctx, { dataUrl, filename, mimeType }) => {
-    // Extract the base64 portion from the data URL.
-    const base64 = dataUrl.split(",")[1];
-    if (!base64) throw new Error("Invalid data URL");
+    // Convert data URL to Blob using fetch (works in Node.js action runtime)
+    const response = await fetch(dataUrl);
+    if (!response.ok) {
+      throw new Error("Failed to read image data");
+    }
+    const blob = await response.blob();
 
-    const buffer = Buffer.from(base64, "base64");
-
-    // Validate file size (max 10MB)
-    if (buffer.length > 10 * 1024 * 1024) {
-      throw new Error("File too large. Maximum size is 10MB");
+    // Validate file size (max 5MB)
+    if (blob.size > 5 * 1024 * 1024) {
+      throw new Error("File too large. Maximum size is 5MB");
     }
 
-    const blob = new Blob([buffer], { type: mimeType });
     const file = new File([blob], filename, { type: mimeType });
 
     const storageId = await ctx.storage.store(file);
     const url = await ctx.storage.getUrl(storageId);
-    
+
     if (!url) {
       throw new Error("Failed to get storage URL");
     }
-    
+
     return { storageId: storageId as string, url };
   },
 });
