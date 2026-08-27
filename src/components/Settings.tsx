@@ -1176,8 +1176,8 @@ const settingsStyles = `
   }
 
   .profile-avatar-large {
-    width: 120px;
-    height: 120px;
+    width: 88px;
+    height: 88px;
     border-radius: 50%;
     background: linear-gradient(135deg, #a855f7 0%, #7c3aed 100%);
     display: flex;
@@ -1678,12 +1678,12 @@ const settingsStyles = `
     }
 
     .profile-avatar-large {
-      width: 100px;
-      height: 100px;
+      width: 72px;
+      height: 72px;
     }
 
     .profile-avatar-large span {
-      font-size: 36px;
+      font-size: 28px;
     }
   }
 `;
