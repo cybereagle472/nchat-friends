@@ -13,6 +13,7 @@ import {
   X,
   UserX,
   Shield,
+  Loader2,
   Users,
   Database,
   Activity,
@@ -147,10 +148,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
   };
 
   // Handle cropped image upload — compress, upload, save, then refresh
+  const [avatarError, setAvatarError] = useState('');
   const handleCroppedImage = async (blob: Blob) => {
     setShowCropper(false);
     setCropImageUrl(null);
     setSaving(true);
+    setAvatarError('');
 
     try {
       const { compressImage } = await import('../services/mediaService');
@@ -162,14 +165,19 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
         await profileService.updateProfile(currentUser.id, {
           avatar_url: result.url
         });
-        // Re-fetch to get the canonical server URL
+        // Optimistically update the UI immediately
+        onProfileUpdate({ ...currentUser, avatar_url: result.url });
+        // Then re-fetch to get the canonical server URL
         const updatedProfile = await profileService.getProfile(currentUser.id);
         if (updatedProfile) {
           onProfileUpdate(updatedProfile);
         }
+      } else {
+        setAvatarError(result.error || 'Photo upload failed. Please try again.');
       }
     } catch (error) {
       console.error('Error updating avatar:', error);
+      setAvatarError('Photo update failed. Please try again.');
     } finally {
       setSaving(false);
     }
@@ -487,6 +495,15 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
                 />
               </label>
             </div>
+            {avatarError && !saving && (
+              <p className="text-xs text-red-500 font-medium mt-2 text-center">{avatarError}</p>
+            )}
+            {saving && (
+              <p className="text-xs text-violet-600 font-medium mt-2 text-center flex items-center justify-center gap-1">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Updating photo…
+              </p>
+            )}
           </div>
 
           {/* Profile Info */}

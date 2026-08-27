@@ -37,6 +37,7 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
   const [customAvatarPreview, setCustomAvatarPreview] = useState<string | null>(null);
   const [uploadedAvatarUrl, setUploadedAvatarUrl] = useState<string | null>(null);
   const [avatarUploading, setAvatarUploading] = useState(false);
+  const [avatarError, setAvatarError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [usernameAvailable, setUsernameAvailable] = useState<boolean | null>(null);
@@ -66,8 +67,7 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
           const available = await profileService.isUsernameAvailable(sanitized);
           setUsernameAvailable(available);
         } catch {
-          // If the check fails, don't block the user — allow submission
-          // The server-side mutation will enforce uniqueness anyway
+          // If the check fails, don't block the user — server enforces uniqueness
           setUsernameAvailable(null);
         } finally {
           setCheckingUsername(false);
@@ -92,13 +92,14 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
     }
 
     setError('');
+    setAvatarError('');
 
     // Step 1: Show instant local preview (zero delay)
     if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
     const previewUrl = URL.createObjectURL(file);
     objectUrlRef.current = previewUrl;
     setCustomAvatarPreview(previewUrl);
-    setAvatarUrl(previewUrl);
+    // Don't set avatarUrl to blob URL — it gets revoked. Keep showing the preview via customAvatarPreview.
 
     // Step 2: Compress + upload in background
     setAvatarUploading(true);
@@ -113,16 +114,34 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
       const serverUrl = (result as { url: string }).url;
       setUploadedAvatarUrl(serverUrl);
       setAvatarUrl(serverUrl);
+      // Clean up the blob URL since we now have the server URL
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
+      setCustomAvatarPreview(null);
     } catch (err) {
-      // Preview still shows — upload failed but user sees their image
       console.error('Avatar upload failed:', err);
+      setAvatarError('Photo upload failed. You can try again or pick an avatar below.');
+      // Keep customAvatarPreview so the user still sees their photo locally
+      // But uploadedAvatarUrl stays null so we know the server doesn't have it
     } finally {
       setAvatarUploading(false);
     }
   }, []);
 
+  // Determine the final avatar URL to save
+  const getFinalAvatarUrl = (): string => {
+    // If upload succeeded, use the server URL
+    if (uploadedAvatarUrl) return uploadedAvatarUrl;
+    // If custom photo was picked but upload failed, use the preview (blob URL)
+    // This won't persist across sessions but is better than a random default
+    if (customAvatarPreview) return customAvatarPreview;
+    // Default: use the selected avatar option or current avatarUrl
+    return avatarUrl;
+  };
+
   // Form is valid when name and username meet minimum requirements
-  // Username uniqueness is enforced server-side, so we don't block on the client check
   const isFormValid =
     fullName.trim().length > 0 &&
     username.length >= 3 &&
@@ -143,13 +162,16 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
       setError('This username is already taken. Please choose another.');
       return;
     }
+    if (avatarUploading) {
+      setError('Please wait for your photo to finish uploading.');
+      return;
+    }
 
     setSubmitting(true);
     setError('');
 
     try {
-      // Use server URL if upload succeeded, otherwise use the default avatar
-      const finalAvatarUrl = uploadedAvatarUrl || (customAvatarPreview ? AVATAR_OPTIONS[0] : avatarUrl);
+      const finalAvatarUrl = getFinalAvatarUrl();
 
       const result = await profileService.createProfile({
         id: userId,
@@ -200,18 +222,14 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
           {/* Avatar Section */}
           <div className="flex flex-col items-center mb-6 sm:mb-8">
             <div className="relative mb-4">
-              {/* Avatar circle — bounded to 96px always */}
+              {/* Avatar circle */}
               <div className="w-24 h-24 rounded-2xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 p-1 shadow-lg shadow-purple-500/30 overflow-hidden">
                 {currentAvatar ? (
                   <img
                     src={currentAvatar}
                     alt="Avatar"
                     className="w-full h-full rounded-xl object-cover bg-white"
-                    onError={(e) => {
-                      // Fallback to a solid color avatar on image load error
-                      const target = e.target as HTMLImageElement;
-                      target.style.display = 'none';
-                    }}
+                    crossOrigin="anonymous"
                   />
                 ) : (
                   <div className="w-full h-full rounded-xl bg-white flex items-center justify-center">
@@ -241,6 +259,26 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
               />
             </div>
 
+            {/* Upload status */}
+            {avatarUploading && (
+              <p className="text-xs text-violet-600 font-medium mb-2 flex items-center gap-1.5">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Uploading photo…
+              </p>
+            )}
+            {avatarError && !avatarUploading && (
+              <p className="text-xs text-red-500 font-medium mb-2 flex items-center gap-1.5">
+                <AlertCircle className="w-3 h-3" />
+                {avatarError}
+              </p>
+            )}
+            {!avatarUploading && !avatarError && uploadedAvatarUrl && (
+              <p className="text-xs text-green-600 font-medium mb-2 flex items-center gap-1.5">
+                <Check className="w-3 h-3" />
+                Photo uploaded
+              </p>
+            )}
+
             {/* Avatar Options */}
             <div className="flex gap-2 flex-wrap justify-center max-w-[280px]">
               {AVATAR_OPTIONS.map((avatar, index) => (
@@ -251,6 +289,11 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
                     setAvatarUrl(avatar);
                     setCustomAvatarPreview(null);
                     setUploadedAvatarUrl(null);
+                    setAvatarError('');
+                    if (objectUrlRef.current) {
+                      URL.revokeObjectURL(objectUrlRef.current);
+                      objectUrlRef.current = null;
+                    }
                   }}
                   className={`w-10 h-10 rounded-lg overflow-hidden border-2 transition-all duration-300 hover:scale-110 flex-shrink-0 ${
                     avatarUrl === avatar && !customAvatarPreview
