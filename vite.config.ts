@@ -20,6 +20,7 @@ export default defineConfig({
     port: 3000,
     open: true,
     host: true,
+    hmr: false,
   },
   preview: {
     port: 3000,
