@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { User, Camera, Check, AtSign, Loader2 } from 'lucide-react';
+import { User, Camera, Check, AtSign, Loader2, AlertCircle } from 'lucide-react';
 import { profileService } from '../services/profileService';
 import { compressImage } from '../services/mediaService';
 import { api, convex } from '../lib/convexClient';
@@ -62,10 +62,19 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
     if (sanitized.length >= 3) {
       setCheckingUsername(true);
       usernameTimeoutRef.current = setTimeout(async () => {
-        const available = await profileService.isUsernameAvailable(sanitized);
-        setUsernameAvailable(available);
-        setCheckingUsername(false);
+        try {
+          const available = await profileService.isUsernameAvailable(sanitized);
+          setUsernameAvailable(available);
+        } catch {
+          // If the check fails, don't block the user — allow submission
+          // The server-side mutation will enforce uniqueness anyway
+          setUsernameAvailable(null);
+        } finally {
+          setCheckingUsername(false);
+        }
       }, 500);
+    } else {
+      setCheckingUsername(false);
     }
   }, []);
 
@@ -112,16 +121,12 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
     }
   }, []);
 
-  // If user picked a custom photo, require upload to finish before submit
-  const customPhotoSelected = customAvatarPreview !== null;
-  const uploadDone = !customPhotoSelected || uploadedAvatarUrl !== null;
-
+  // Form is valid when name and username meet minimum requirements
+  // Username uniqueness is enforced server-side, so we don't block on the client check
   const isFormValid =
     fullName.trim().length > 0 &&
     username.length >= 3 &&
-    usernameAvailable !== false &&
-    !avatarUploading &&
-    uploadDone;
+    !submitting;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -135,7 +140,7 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
       return;
     }
     if (usernameAvailable === false) {
-      setError('Username is already taken');
+      setError('This username is already taken. Please choose another.');
       return;
     }
 
@@ -143,8 +148,8 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
     setError('');
 
     try {
-      // Always use the server URL — never a blob URL
-      const finalAvatarUrl = uploadedAvatarUrl || avatarUrl;
+      // Use server URL if upload succeeded, otherwise use the default avatar
+      const finalAvatarUrl = uploadedAvatarUrl || (customAvatarPreview ? AVATAR_OPTIONS[0] : avatarUrl);
 
       const result = await profileService.createProfile({
         id: userId,
@@ -158,10 +163,11 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
       if (result.success && result.profile) {
         onComplete(result.profile);
       } else {
-        setError(result.error || 'Failed to create profile');
+        setError(result.error || 'Failed to create profile. Please try again.');
       }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
+      console.error('Profile creation error:', err);
+      setError(err instanceof Error ? err.message : 'An error occurred. Please try again.');
     } finally {
       setSubmitting(false);
     }
@@ -187,7 +193,7 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
               Complete Your Profile
             </h1>
             <p className="text-sm text-slate-600">
-              Let's set up your profile to get started
+              Let's set up your profile to get started with NChat
             </p>
           </div>
 
@@ -201,12 +207,10 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
                     src={currentAvatar}
                     alt="Avatar"
                     className="w-full h-full rounded-xl object-cover bg-white"
-                    onLoad={() => {
-                      // Revoke the object URL once the real image is loaded
-                      if (uploadedAvatarUrl && objectUrlRef.current) {
-                        URL.revokeObjectURL(objectUrlRef.current);
-                        objectUrlRef.current = null;
-                      }
+                    onError={(e) => {
+                      // Fallback to a solid color avatar on image load error
+                      const target = e.target as HTMLImageElement;
+                      target.style.display = 'none';
                     }}
                   />
                 ) : (
@@ -262,8 +266,9 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
 
           {/* Error Message */}
           {error && (
-            <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-red-600 text-sm animate-slide-up">
-              {error}
+            <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-red-600 text-sm animate-slide-up flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+              <span>{error}</span>
             </div>
           )}
 
@@ -276,7 +281,7 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
                 type="text"
                 placeholder="Full Name *"
                 value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
+                onChange={(e) => { setFullName(e.target.value); setError(''); }}
                 required
                 className="w-full pl-12 pr-4 py-3.5 text-sm rounded-xl bg-white/80 border border-slate-200 focus:border-violet-400 focus:ring-2 focus:ring-violet-400/20 text-slate-800 placeholder-slate-400 transition-all duration-300 outline-none"
               />
@@ -289,7 +294,7 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
                 type="text"
                 placeholder="Username *"
                 value={username}
-                onChange={(e) => handleUsernameChange(e.target.value)}
+                onChange={(e) => { handleUsernameChange(e.target.value); setError(''); }}
                 required
                 minLength={3}
                 maxLength={20}
@@ -324,7 +329,7 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
             {/* Submit Button */}
             <button
               type="submit"
-              disabled={submitting || !isFormValid}
+              disabled={!isFormValid}
               className="w-full py-3.5 px-6 bg-gradient-to-r from-violet-500 via-purple-500 to-fuchsia-500 text-white font-semibold rounded-xl shadow-lg shadow-violet-500/40 hover:shadow-xl hover:shadow-violet-500/50 hover:scale-[1.02] active:scale-[0.98] transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 flex items-center justify-center gap-2"
             >
               {submitting ? (
@@ -344,6 +349,17 @@ export function ProfileSetup({ userId, email, onComplete }: ProfileSetupProps) {
                 </>
               )}
             </button>
+
+            {/* Hint text when button is disabled */}
+            {!isFormValid && !submitting && (
+              <p className="text-center text-xs text-slate-500 mt-1">
+                {fullName.trim().length === 0
+                  ? 'Enter your full name to continue'
+                  : username.length < 3
+                  ? 'Choose a username (at least 3 characters)'
+                  : ''}
+              </p>
+            )}
           </form>
         </div>
       </div>
