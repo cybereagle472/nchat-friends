@@ -15,6 +15,23 @@ export interface AuthState {
   isAuthenticated: boolean;
   user: UserProfile | null;
   needsProfileSetup: boolean;
+  /**
+   * The session itself is fine, but we couldn't confirm the profile after
+   * retrying (server/network hiccup). Callers should show a "try again"
+   * state instead of guessing — in particular, NEVER treat this the same as
+   * needsProfileSetup, since that would send a fully set-up returning user
+   * back through onboarding just because of a dropped request.
+   */
+  sessionError?: boolean;
+}
+
+export interface ProfileResolution {
+  user: UserProfile | null;
+  needsProfileSetup: boolean;
+  /** Tokens are gone/invalid/revoked — treat as fully signed out. */
+  sessionInvalid?: boolean;
+  /** Couldn't reach the server after retrying; session itself is still good. */
+  sessionError?: boolean;
 }
 
 interface AuthResponse {
@@ -28,23 +45,77 @@ function isProfileComplete(profile: UserProfile | null): profile is UserProfile 
   return !!(profile && profile.full_name && profile.username && profile.avatar_url);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// How many times (beyond the first try) to retry a profile fetch before
+// giving up and surfacing sessionError. Short backoff — this only needs to
+// smooth over a dropped request or a cold Worker/DB connection, not a real
+// outage.
+const PROFILE_FETCH_RETRIES = 2;
+
 export const authService = {
+  // Resolves what a logged-in user's profile state should be, distinguishing
+  // "no profile yet" from "couldn't tell right now" from "session is dead" —
+  // shared by checkSession, login, and the app's onAuthChange handler so all
+  // three bootstrap paths treat errors the same, safe way.
+  async resolveProfileState(userId: string): Promise<ProfileResolution> {
+    for (let attempt = 0; attempt <= PROFILE_FETCH_RETRIES; attempt++) {
+      try {
+        const profile = await profileService.getProfileOrThrow(userId);
+        if (isProfileComplete(profile)) {
+          return { user: profile, needsProfileSetup: false };
+        }
+        return { user: null, needsProfileSetup: true };
+      } catch (err) {
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+          return { user: null, needsProfileSetup: false, sessionInvalid: true };
+        }
+        if (attempt < PROFILE_FETCH_RETRIES) {
+          await sleep(350 * (attempt + 1));
+          continue;
+        }
+        log.error('Could not load profile after retries — keeping session alive', err, 'authService');
+        return { user: null, needsProfileSetup: false, sessionError: true };
+      }
+    }
+    /* istanbul ignore next — unreachable, loop always returns */
+    return { user: null, needsProfileSetup: false, sessionError: true };
+  },
+
   // Check current session and return auth state
   async checkSession(): Promise<AuthState> {
-    try {
-      const userId = getStoredUserId();
-      if (!userId) {
-        return { isAuthenticated: false, user: null, needsProfileSetup: false };
-      }
-
-      const profile = await profileService.getProfile(userId);
-      if (isProfileComplete(profile)) {
-        return { isAuthenticated: true, user: profile, needsProfileSetup: false };
-      }
-      return { isAuthenticated: true, user: null, needsProfileSetup: true };
-    } catch (err) {
-      log.error('Unexpected error in checkSession', err, 'authService');
+    const userId = getStoredUserId();
+    if (!userId) {
       return { isAuthenticated: false, user: null, needsProfileSetup: false };
+    }
+
+    const resolution = await this.resolveProfileState(userId);
+    if (resolution.sessionInvalid) {
+      clearAuthSession();
+      return { isAuthenticated: false, user: null, needsProfileSetup: false };
+    }
+    return {
+      isAuthenticated: true,
+      user: resolution.user,
+      needsProfileSetup: resolution.needsProfileSetup,
+      sessionError: resolution.sessionError,
+    };
+  },
+
+  // Real-time "is this email already registered" check for the Sign Up form
+  // — lets the user find out before submitting the whole form. Fails open
+  // (never reports a false "taken") so a network blip can't block signup.
+  async checkEmailExists(email: string): Promise<{ exists: boolean; valid: boolean }> {
+    try {
+      return await apiFetch<{ exists: boolean; valid: boolean }>(
+        `/auth/check-email?email=${encodeURIComponent(email.trim().toLowerCase())}`,
+        { skipAuth: true }
+      );
+    } catch (err) {
+      log.error('checkEmailExists error', err, 'authService');
+      return { exists: false, valid: true };
     }
   },
 
@@ -81,11 +152,12 @@ export const authService = {
       });
       setAuthSession({ access_token: data.access_token, refresh_token: data.refresh_token, user: data.user });
 
-      const profile = await profileService.getProfile(data.user.id);
-      if (isProfileComplete(profile)) {
-        return { success: true, user: profile, needsSetup: false };
-      }
-      return { success: true, needsSetup: true };
+      const resolution = await this.resolveProfileState(data.user.id);
+      // A fresh login/token pair is already known-good at this point — if the
+      // immediate profile lookup hiccups, don't fail the login over it; the
+      // app-level onAuthChange listener will resolve it (with its own
+      // retries) a moment later.
+      return { success: true, user: resolution.user ?? undefined, needsSetup: resolution.needsProfileSetup };
     } catch (err) {
       log.error('Login error', err, 'authService');
       const message = err instanceof ApiError ? err.message : 'Login failed';

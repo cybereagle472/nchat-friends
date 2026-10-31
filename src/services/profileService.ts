@@ -16,6 +16,22 @@ export const profileService = {
     }
   },
 
+  // Same as getProfile, but used anywhere a caller needs to tell "this user
+  // genuinely has no profile" apart from "the request failed" (expired/invalid
+  // session, network blip, server hiccup, ...). Session bootstrapping
+  // (checkSession/login) relies on this distinction — silently swallowing a
+  // transient error there would wrongly look like a brand-new user and send
+  // a fully set-up, returning user back through onboarding.
+  async getProfileOrThrow(userId: string): Promise<UserProfile | null> {
+    try {
+      const { profile } = await apiFetch<ProfileResponse>(`/users/${userId}`);
+      return profile;
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }
+  },
+
   // Get all profiles (for discover/find friends)
   async getAllProfiles(): Promise<UserProfile[]> {
     try {

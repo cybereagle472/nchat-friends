@@ -36,8 +36,13 @@ export function onAuthStateChange(cb: AuthListener): { unsubscribe: () => void }
 }
 
 function writeAuth(auth: StoredAuth | null, event: AuthEvent) {
-  if (auth) localStorage.setItem(STORAGE_KEY, JSON.stringify(auth));
-  else localStorage.removeItem(STORAGE_KEY);
+  if (auth) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(auth));
+    scheduleProactiveRefresh(auth.access_token);
+  } else {
+    localStorage.removeItem(STORAGE_KEY);
+    clearProactiveRefresh();
+  }
   listeners.forEach((l) => l(event, auth ? { user: auth.user } : null));
 }
 
@@ -47,6 +52,103 @@ export function setAuthSession(auth: StoredAuth) {
 
 export function clearAuthSession() {
   writeAuth(null, 'SIGNED_OUT');
+}
+
+// --- Token lifetime management ---------------------------------------
+//
+// Access tokens are short-lived (15 min server-side). Rather than relying
+// purely on "retry once we hit a 401", proactively refresh a little before
+// expiry so: (a) REST calls essentially never hit a 401 in normal use, and
+// (b) the realtime WebSocket — which authenticates once at connect time via
+// a query param, not a header — always has a fresh token available the
+// instant it needs to (re)connect, including after the tab was backgrounded
+// long enough for the access token to lapse.
+
+function decodeJwtPayload(token: string): { exp?: number } | null {
+  try {
+    const part = token.split('.')[1];
+    if (!part) return null;
+    let base64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4) base64 += '=';
+    return JSON.parse(atob(base64));
+  } catch {
+    return null;
+  }
+}
+
+function msUntilExpiry(token: string): number | null {
+  const payload = decodeJwtPayload(token);
+  if (!payload?.exp) return null;
+  return payload.exp * 1000 - Date.now();
+}
+
+let proactiveRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearProactiveRefresh() {
+  if (proactiveRefreshTimer) {
+    clearTimeout(proactiveRefreshTimer);
+    proactiveRefreshTimer = null;
+  }
+}
+
+function scheduleProactiveRefresh(accessToken: string) {
+  clearProactiveRefresh();
+  const remaining = msUntilExpiry(accessToken);
+  if (remaining === null) return;
+  // Refresh a minute before it actually expires; never schedule tighter
+  // than 2s so a clock-skewed/garbage exp can't cause a tight refresh loop.
+  const delay = Math.max(remaining - 60_000, 2_000);
+  proactiveRefreshTimer = setTimeout(() => {
+    refreshAccessToken();
+  }, delay);
+}
+
+// Pick up an existing session on page load/refresh (writeAuth only runs for
+// sign-in/out/refresh events happening *after* this module is loaded).
+if (typeof localStorage !== 'undefined') {
+  const existing = readAuth();
+  if (existing?.access_token) scheduleProactiveRefresh(existing.access_token);
+}
+
+// Mobile browsers routinely suspend timers while a tab/app is backgrounded
+// (screen locked, app switched away from), so the scheduled refresh above
+// may simply never fire while that's happening. Catch up the instant the
+// app becomes visible again instead of waiting for something else to 401.
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    const auth = readAuth();
+    if (!auth?.access_token) return;
+    const remaining = msUntilExpiry(auth.access_token);
+    if (remaining !== null && remaining <= 60_000) {
+      refreshAccessToken();
+    } else {
+      scheduleProactiveRefresh(auth.access_token);
+    }
+  });
+}
+
+// Keep every open tab in sync: if one tab signs out, the rest should drop
+// to the login screen immediately rather than silently keep acting on a
+// dead session until their next request happens to 401. Likewise, if one
+// tab signs in or rotates tokens, the others should pick up the fresh
+// tokens/timer right away instead of overwriting them with a stale refresh.
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key !== STORAGE_KEY) return;
+    if (!e.newValue) {
+      clearProactiveRefresh();
+      listeners.forEach((l) => l('SIGNED_OUT', null));
+      return;
+    }
+    try {
+      const updated = JSON.parse(e.newValue) as StoredAuth;
+      scheduleProactiveRefresh(updated.access_token);
+      listeners.forEach((l) => l('TOKEN_REFRESHED', { user: updated.user }));
+    } catch {
+      /* ignore malformed payloads from another tab */
+    }
+  });
 }
 
 export function getStoredAuth(): StoredAuth | null {
@@ -82,6 +184,7 @@ async function refreshAccessToken(): Promise<string | null> {
       const data = (await res.json()) as { access_token: string; refresh_token: string };
       const updated: StoredAuth = { ...auth, access_token: data.access_token, refresh_token: data.refresh_token };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+      scheduleProactiveRefresh(updated.access_token);
       listeners.forEach((l) => l('TOKEN_REFRESHED', { user: updated.user }));
       return data.access_token;
     } catch {

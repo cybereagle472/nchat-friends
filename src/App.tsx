@@ -38,6 +38,10 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [userId, setUserId] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState<string>('');
+  // Session is valid but we couldn't confirm the profile after retrying
+  // (server/network hiccup) — show a "try again" screen instead of guessing
+  // (never assume a dropped request means "new user, needs onboarding").
+  const [sessionError, setSessionError] = useState(false);
 
   // App state
   const [activeTab, setActiveTab] = useState<AppView>('chats');
@@ -50,60 +54,78 @@ function App() {
     callType: 'audio'
   });
 
-  // Check auth on mount
-  useEffect(() => {
-    const checkAuth = async () => {
-      try {
-        const authState = await authService.checkSession();
-        setIsAuthenticated(authState.isAuthenticated);
-        setNeedsProfileSetup(authState.needsProfileSetup);
-        setCurrentUser(authState.user);
+  // Check auth on mount (and whenever the user retries from the session-error screen)
+  const checkAuth = useCallback(async () => {
+    setLoading(true);
+    try {
+      const authState = await authService.checkSession();
+      setSessionError(!!authState.sessionError);
+      setIsAuthenticated(authState.isAuthenticated);
+      setNeedsProfileSetup(authState.needsProfileSetup);
+      setCurrentUser(authState.user);
 
-        if (authState.isAuthenticated) {
-          const id = await authService.getCurrentUserId();
-          setUserId(id);
+      if (authState.isAuthenticated) {
+        const id = await authService.getCurrentUserId();
+        setUserId(id);
 
-          if (authState.user?.email) {
-            setUserEmail(authState.user.email);
-          }
+        if (authState.user?.email) {
+          setUserEmail(authState.user.email);
         }
-      } catch (error) {
-        console.error('Auth check error:', error);
-      } finally {
-        setLoading(false);
       }
-    };
+    } catch (error) {
+      console.error('Auth check error:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
+  useEffect(() => {
     checkAuth();
 
     // Listen for auth changes
     const { data: { subscription } } = authService.onAuthChange(async (event, session) => {
       if (event === 'SIGNED_IN' && session) {
+        setSessionError(false);
         setIsAuthenticated(true);
         setUserId(session.user.id);
         setUserEmail(session.user.email || '');
 
-        // Check profile
-        const profile = await profileService.getProfile(session.user.id);
-        if (profile && profile.full_name && profile.username && profile.avatar_url) {
-          setCurrentUser(profile);
+        // Resolve the profile the same safe way checkSession does: a
+        // dropped request here must never be confused with "brand new
+        // user" and silently drop them into onboarding again.
+        const resolution = await authService.resolveProfileState(session.user.id);
+        if (resolution.sessionInvalid) {
+          setIsAuthenticated(false);
+          return;
+        }
+        if (resolution.sessionError) {
+          setSessionError(true);
+          return;
+        }
+        if (resolution.user) {
+          setCurrentUser(resolution.user);
           setNeedsProfileSetup(false);
         } else {
           setNeedsProfileSetup(true);
         }
       } else if (event === 'SIGNED_OUT') {
+        // Also covers another tab signing out (see the cross-tab 'storage'
+        // sync in lib/apiClient.ts) — make sure the realtime socket this
+        // tab opened doesn't linger on a now-dead session.
+        realtimeClient.disconnect();
         setIsAuthenticated(false);
         setCurrentUser(null);
         setNeedsProfileSetup(false);
         setUserId(null);
         setUserEmail('');
+        setSessionError(false);
       }
     });
 
     return () => {
       subscription.unsubscribe();
     };
-  }, []);
+  }, [checkAuth]);
 
   // Update online status.
   // The Worker derives is_online server-side from a presence heartbeat
@@ -169,17 +191,22 @@ function App() {
     const id = await authService.getCurrentUserId();
     if (id) {
       setUserId(id);
-      const profile = await profileService.getProfile(id);
-      if (profile && profile.full_name && profile.username && profile.avatar_url) {
-        setCurrentUser(profile);
+      const resolution = await authService.resolveProfileState(id);
+      if (resolution.sessionInvalid) {
+        setIsAuthenticated(false);
+        return;
+      }
+      setSessionError(!!resolution.sessionError);
+      if (resolution.user) {
+        setCurrentUser(resolution.user);
         setNeedsProfileSetup(false);
-      } else {
+      } else if (!resolution.sessionError) {
         setNeedsProfileSetup(true);
       }
       setIsAuthenticated(true);
 
-      if (profile?.email) {
-        setUserEmail(profile.email);
+      if (resolution.user?.email) {
+        setUserEmail(resolution.user.email);
       }
     }
   }, []);
@@ -278,6 +305,29 @@ function App() {
   // Auth screen
   if (!isAuthenticated) {
     return <Auth onAuthSuccess={handleAuthSuccess} />;
+  }
+
+  // Your session is fine, but we couldn't confirm your profile after
+  // retrying (server/network hiccup) — never guess "needs onboarding" here,
+  // just let the user retry.
+  if (sessionError) {
+    return (
+      <div className="h-screen flex flex-col items-center justify-center gap-4 bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 px-6 text-center">
+        <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-violet-500 via-purple-500 to-fuchsia-500 flex items-center justify-center shadow-xl shadow-purple-500/40">
+          <MessageCircle className="w-8 h-8 text-white" />
+        </div>
+        <h1 className="text-lg font-bold text-slate-800">Couldn't reach NChat</h1>
+        <p className="text-sm text-slate-500 max-w-xs">
+          You're still signed in — we just couldn't load your profile. Check your connection and try again.
+        </p>
+        <button
+          onClick={() => checkAuth()}
+          className="mt-2 px-6 py-2.5 rounded-xl bg-gradient-to-r from-violet-500 via-purple-500 to-fuchsia-500 text-white text-sm font-semibold shadow-lg shadow-violet-500/30 hover:scale-105 active:scale-95 transition-transform"
+        >
+          Try Again
+        </button>
+      </div>
+    );
   }
 
   // Profile setup screen
