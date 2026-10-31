@@ -1281,28 +1281,16 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
     return (
       <div className={`voice-message-bubble ${isOwn ? 'own' : 'received'}`}>
-        {/* Avatar for received messages */}
-        {!isOwn && (
-          <div className="voice-message-avatar">
-            {contact.profile.avatar_url ? (
-              <img src={contact.profile.avatar_url} alt="" className="w-full h-full object-cover" />
-            ) : (
-              <span className="text-xs font-semibold text-white">
-                {contact.profile.full_name.charAt(0).toUpperCase()}
-              </span>
-            )}
-          </div>
-        )}
-
         {/* Play/Pause Button */}
         <button
           onClick={() => toggleAudioPlayback(message.id, audioUrl)}
-          className={`voice-message-play-btn ${isOwn ? 'own' : 'received'}`}
+          className={`voice-message-play-btn ${isOwn ? 'own' : 'received'} ${isPlaying ? 'is-playing' : ''}`}
+          aria-label={isPlaying ? 'Pause voice message' : 'Play voice message'}
         >
           {isPlaying ? (
-            <Pause className="w-5 h-5" fill="currentColor" />
+            <Pause className="w-[18px] h-[18px]" fill="currentColor" />
           ) : (
-            <Play className="w-5 h-5 ml-0.5" fill="currentColor" />
+            <Play className="w-[18px] h-[18px] ml-0.5" fill="currentColor" />
           )}
         </button>
 
@@ -1310,15 +1298,20 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         <div className="voice-message-content">
           {/* Waveform */}
           <div className="voice-message-waveform">
-            {waveformData.map((value, i) => (
-              <div
-                key={i}
-                className={`voice-waveform-bar ${isOwn ? 'own' : 'received'} ${i < playedBars ? 'played' : ''}`}
-                style={{
-                  height: `${value * 100}%`,
-                }}
-              />
-            ))}
+            {waveformData.map((value, i) => {
+              const isPlayed = i < playedBars;
+              const isPlayhead = isPlaying && i === playedBars;
+              return (
+                <div
+                  key={i}
+                  className={`voice-waveform-bar ${isOwn ? 'own' : 'received'} ${isPlayed ? 'played' : ''} ${isPlayhead ? 'playhead' : ''}`}
+                  // Floor the height so a quiet/near-silent recording still
+                  // reads as a real waveform instead of looking like a flat
+                  // dotted line — always show at least ~22% of the track.
+                  style={{ height: `${Math.max(0.22, value) * 100}%` }}
+                />
+              );
+            })}
           </div>
 
           {/* Duration */}
@@ -1326,19 +1319,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
             <span>{displayTime}</span>
           </div>
         </div>
-
-        {/* Avatar for own messages */}
-        {isOwn && (
-          <div className="voice-message-avatar own">
-            {currentUser.avatar_url ? (
-              <img src={currentUser.avatar_url} alt="" className="w-full h-full object-cover" />
-            ) : (
-              <span className="text-xs font-semibold text-white">
-                {currentUser.full_name.charAt(0).toUpperCase()}
-              </span>
-            )}
-          </div>
-        )}
       </div>
     );
   };
@@ -1713,33 +1693,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
             <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
             <span className="text-sm font-medium">Sending...</span>
           </div>
-        </div>
-      )}
-
-      {/* TEMP DEBUG — remove once the slide-to-cancel/lock gesture is
-          confirmed fixed. Shows live numbers so we can tell from a
-          screenshot whether touchmove is even reaching our handlers (the
-          numbers should change the instant you start dragging), instead of
-          guessing from how the overlay looks. */}
-      {voiceState.isRecording && (
-        <div
-          style={{
-            position: 'fixed',
-            top: 'max(6px, env(safe-area-inset-top))',
-            left: '50%',
-            transform: 'translateX(-50%)',
-            zIndex: 9999,
-            background: 'rgba(0,0,0,0.85)',
-            color: '#0f0',
-            fontFamily: 'monospace',
-            fontSize: '11px',
-            padding: '4px 8px',
-            borderRadius: '6px',
-            whiteSpace: 'nowrap',
-            pointerEvents: 'none'
-          }}
-        >
-          dx:{Math.round(voiceState.startX - voiceState.currentX)} lockProg:{voiceState.lockProgress.toFixed(2)} locked:{String(voiceState.isLocked)} cancel:{String(voiceState.isCancelling)} dur:{voiceState.duration}
         </div>
       )}
 
@@ -2444,10 +2397,16 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           display: flex;
           align-items: center;
           gap: 10px;
-          padding: 10px 14px;
-          border-radius: 20px;
-          min-width: 240px;
-          max-width: 320px;
+          padding: 8px 12px 8px 8px;
+          /* Match the corner treatment of every other bubble type
+             (rounded-2xl = 16px with a 6px "tail" corner) instead of the
+             bespoke 20px radius this used to have — voice bubbles used to
+             be the only message type with its own unique shape *and* a
+             per-message avatar, which made them look out of place next to
+             text/image bubbles in a 1:1 chat. */
+          border-radius: 16px;
+          min-width: 196px;
+          max-width: 300px;
         }
 
         .voice-message-bubble.own {
@@ -2461,44 +2420,35 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           border-bottom-left-radius: 6px;
         }
 
-        .voice-message-avatar {
-          width: 36px;
-          height: 36px;
-          min-width: 36px;
-          border-radius: 50%;
-          background: linear-gradient(135deg, #a855f7 0%, #7c3aed 100%);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          overflow: hidden;
-          flex-shrink: 0;
-        }
-
-        .voice-message-avatar.own {
-          background: linear-gradient(135deg, #c084fc 0%, #a855f7 100%);
-        }
-
         .voice-message-play-btn {
-          width: 42px;
-          height: 42px;
-          min-width: 42px;
+          width: 40px;
+          height: 40px;
+          min-width: 40px;
           border-radius: 50%;
           display: flex;
           align-items: center;
           justify-content: center;
           border: none;
           cursor: pointer;
-          transition: all 0.2s ease;
-          flex-shrink: 0;
+          transition: transform 0.15s ease, background 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .voice-message-play-btn:active {
+          transform: scale(0.9);
         }
 
         .voice-message-play-btn.own {
-          background: rgba(255, 255, 255, 0.25);
+          background: rgba(255, 255, 255, 0.22);
           color: white;
         }
 
         .voice-message-play-btn.own:hover {
-          background: rgba(255, 255, 255, 0.35);
+          background: rgba(255, 255, 255, 0.32);
+        }
+
+        .voice-message-play-btn.own.is-playing {
+          background: rgba(255, 255, 255, 0.95);
+          color: #7c3aed;
         }
 
         .voice-message-play-btn.received {
@@ -2508,8 +2458,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         }
 
         .voice-message-play-btn.received:hover {
-          transform: scale(1.05);
           box-shadow: 0 4px 12px rgba(139, 92, 246, 0.4);
+        }
+
+        .voice-message-play-btn.received.is-playing {
+          box-shadow: 0 2px 10px rgba(139, 92, 246, 0.45);
         }
 
         .voice-message-content {
@@ -2517,20 +2470,23 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           min-width: 0;
           display: flex;
           flex-direction: column;
-          gap: 6px;
+          gap: 5px;
+          padding-right: 2px;
         }
 
         .voice-message-waveform {
           display: flex;
           align-items: center;
+          justify-content: space-between;
           gap: 2px;
-          height: 28px;
+          height: 26px;
         }
 
         .voice-waveform-bar {
           width: 3px;
+          flex-shrink: 0;
           border-radius: 3px;
-          transition: all 0.1s ease;
+          transition: height 0.1s ease, background 0.15s ease, transform 0.15s ease;
           min-height: 4px;
         }
 
@@ -2539,7 +2495,12 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         }
 
         .voice-waveform-bar.own.played {
-          background: rgba(255, 255, 255, 0.9);
+          background: rgba(255, 255, 255, 0.95);
+        }
+
+        .voice-waveform-bar.own.playhead {
+          background: #ffffff;
+          transform: scaleY(1.25);
         }
 
         .voice-waveform-bar.received {
@@ -2550,10 +2511,16 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           background: #8b5cf6;
         }
 
+        .voice-waveform-bar.received.playhead {
+          background: #7c3aed;
+          transform: scaleY(1.25);
+        }
+
         .voice-message-duration {
-          font-size: 12px;
+          font-size: 11.5px;
           font-weight: 500;
           font-variant-numeric: tabular-nums;
+          letter-spacing: 0.01em;
         }
 
         .voice-message-duration.own {

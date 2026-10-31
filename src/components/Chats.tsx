@@ -28,12 +28,35 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
     onOpenChat(contact);
   }, [onOpenChat]);
 
-  // Subscribe to typing indicators
-  useEffect(() => {
-    const friendIds = chats.map(chat => chat.user_id);
+  // Subscribe to typing indicators.
+  // IMPORTANT: this used to depend on the whole `chats` array, which gets a
+  // brand new reference from useAppData on essentially every live update
+  // (a new message, a read receipt, an online-status change, etc. — not
+  // just when a friend is added/removed). Every one of those re-renders
+  // was tearing down *every* friend's typing subscription and immediately
+  // re-creating all of them from scratch, over and over, all day. Depending
+  // on just the sorted list of friend ids instead means this effect only
+  // actually re-runs when someone is added to or removed from the chat
+  // list, and reconciling instead of blindly clearing+rebuilding means an
+  // existing, perfectly fine subscription is never needlessly recreated.
+  const friendIdsKey = chats.map(chat => chat.user_id).sort().join(',');
 
+  useEffect(() => {
+    const friendIds = friendIdsKey ? friendIdsKey.split(',') : [];
+    const friendIdSet = new Set(friendIds);
+    const subscriptions = typingSubscriptionsRef.current;
+
+    // Drop subscriptions for friends no longer in the list.
+    subscriptions.forEach((sub, friendId) => {
+      if (!friendIdSet.has(friendId)) {
+        sub.unsubscribe();
+        subscriptions.delete(friendId);
+      }
+    });
+
+    // Add subscriptions for any new friends.
     friendIds.forEach(friendId => {
-      if (!typingSubscriptionsRef.current.has(friendId)) {
+      if (!subscriptions.has(friendId)) {
         const subscription = typingService.subscribeToTyping(
           currentUser.id,
           friendId,
@@ -49,15 +72,23 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
             });
           }
         );
-        typingSubscriptionsRef.current.set(friendId, subscription);
+        subscriptions.set(friendId, subscription);
       }
     });
+    // No cleanup here on purpose — subscriptions are reconciled in place
+    // above, and the unmount-only effect below handles final teardown.
+  }, [currentUser.id, friendIdsKey]);
 
+  // Unmount-only cleanup — intentionally NOT tied to `chats`/currentUser.id,
+  // otherwise this would tear down every subscription on every list
+  // refresh, which is exactly the churn the effect above was just fixed
+  // to avoid.
+  useEffect(() => {
     return () => {
       typingSubscriptionsRef.current.forEach(sub => sub.unsubscribe());
       typingSubscriptionsRef.current.clear();
     };
-  }, [currentUser.id, chats]);
+  }, []);
 
   // Pre-fetch messages for top chats (WhatsApp-style instant loading)
   useEffect(() => {
