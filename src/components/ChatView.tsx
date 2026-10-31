@@ -737,6 +737,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   // Real-time waveform sampling loop — pulled out to component scope (not
   // just a local closure inside startRecording) so pauseRecording/
   // resumeRecording can stop and restart the exact same loop.
+  const lastWaveformRenderRef = useRef(0);
   const updateWaveform = useCallback(() => {
     if (!analyserRef.current) return;
 
@@ -746,15 +747,26 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     // Get average amplitude from frequency data
     const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
     const normalizedValue = average / 255;
+    // Every frame (cheap: just appending to a plain array, no re-render).
     fullWaveformRef.current.push(normalizedValue);
 
-    setVoiceState(prev => ({
-      ...prev,
-      waveformData: [...prev.waveformData.slice(-49), normalizedValue]
-    }));
+    // But only push a React state update ~15 times/sec instead of on every
+    // single animation frame (~60/sec). The live waveform bars don't need
+    // to redraw faster than that to look smooth, and cutting the update
+    // rate by 4x is what actually keeps the rest of the recording UI (and
+    // the drag gesture driving it) feeling instant instead of janky.
+    const now = performance.now();
+    if (now - lastWaveformRenderRef.current >= 65) {
+      lastWaveformRenderRef.current = now;
+      setVoiceState(prev => ({
+        ...prev,
+        waveformData: [...prev.waveformData.slice(-49), normalizedValue]
+      }));
+    }
 
     animationFrameRef.current = requestAnimationFrame(updateWaveform);
   }, []);
+
 
   const startDurationTimer = useCallback(() => {
     if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current);
@@ -1156,12 +1168,15 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     setMediaViewer({ isOpen: false, type: null, url: '' });
   };
 
-  const formatTime = (timestamp: string) => {
+  // Pure/stable — wrapped so the identity passed down to memoized
+  // MessageBubble never changes, see the renderMessageContent ref-trick
+  // below for why that matters.
+  const formatTime = useCallback((timestamp: string) => {
     return new Date(timestamp).toLocaleTimeString('en-US', {
       hour: 'numeric',
       minute: '2-digit'
     });
-  };
+  }, []);
 
   const formatDuration = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
@@ -1491,6 +1506,24 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     }
   };
 
+  // renderMessageContent is recreated every render (it closes over a lot:
+  // openMediaViewer, VoiceMessageBubble, DocumentBubble, etc.) which used to
+  // break MessageBubble's React.memo — a brand new function prop every
+  // render makes memo always see "changed props" and re-render every single
+  // message bubble on every render of ChatView, including the ~60-times-
+  // a-second setVoiceState calls that drive the recording waveform. On a
+  // chat with any real history that alone was enough to make the whole
+  // recording interaction (and the drag gesture driving it) feel stuck.
+  // Keeping a ref to the latest version and handing MessageBubble a
+  // permanently-stable wrapper fixes that without having to hand-audit a
+  // large dependency array (and risk stale closures) for useCallback.
+  const renderMessageContentRef = useRef(renderMessageContent);
+  renderMessageContentRef.current = renderMessageContent;
+  const stableRenderMessageContent = useCallback(
+    (message: Message, isOwn: boolean) => renderMessageContentRef.current(message, isOwn),
+    []
+  );
+
   return (
     <div className="h-full flex flex-col relative bg-slate-100">
       {/* Chat Background Pattern */}
@@ -1653,7 +1686,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
               message={message}
               isOwn={message.sender_id === currentUser.id}
               currentUserId={currentUser.id}
-              renderMessageContent={renderMessageContent}
+              renderMessageContent={stableRenderMessageContent}
               formatTime={formatTime}
               onLongPress={handleMessageLongPress}
               onReactionClick={handleReactionClick}
