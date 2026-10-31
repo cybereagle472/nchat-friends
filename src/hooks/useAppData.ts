@@ -505,11 +505,18 @@ export function useAppData(userId: string) {
     const groupsInterval = setInterval(() => debouncedRefreshGroups(), 20000);
     const callsInterval = setInterval(() => debouncedRefreshCallHistory(), 30000);
 
+    // Online/offline status has no realtime push of its own (it's a simple
+    // heartbeat timestamp in D1, see profileService.updateLastSeen) — poll
+    // friends/chats/suggestions periodically so "Online"/"Last seen" stays
+    // reasonably fresh everywhere it's shown.
+    const presenceInterval = setInterval(() => debouncedRefreshFriendsAndRequests(), 25000);
+
     return () => {
       subscriptionsRef.current.forEach(sub => sub.unsubscribe());
       subscriptionsRef.current = [];
       clearInterval(groupsInterval);
       clearInterval(callsInterval);
+      clearInterval(presenceInterval);
     };
   }, [userId, debouncedRefreshChats, debouncedRefreshGroups, debouncedRefreshFriendsAndRequests, debouncedRefreshCallHistory]);
 

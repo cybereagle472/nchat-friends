@@ -1,15 +1,13 @@
 import { Hono } from 'hono';
 import type { Env, Variables } from '../types';
 import { requireAuth } from '../middleware/auth';
+import { computeIsOnline, getPresence, getPresenceMap } from '../lib/presence';
 
 const users = new Hono<{ Bindings: Env; Variables: Variables }>();
 users.use('*', requireAuth);
 
-const ONLINE_THRESHOLD_MS = 120_000;
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function profilePublic(row: any, lastActiveAt?: number | null) {
-  const isOnline = !!lastActiveAt && Date.now() - lastActiveAt < ONLINE_THRESHOLD_MS;
   return {
     id: row.id,
     email: row.email,
@@ -20,16 +18,9 @@ function profilePublic(row: any, lastActiveAt?: number | null) {
     bio: row.bio ?? undefined,
     is_admin: !!row.is_admin,
     created_at: row.created_at,
-    is_online: isOnline,
+    is_online: computeIsOnline(lastActiveAt),
     last_seen: lastActiveAt ? new Date(lastActiveAt).toISOString() : undefined,
   };
-}
-
-async function getPresence(env: Env, userId: string): Promise<number | null> {
-  const row = await env.DB.prepare('SELECT last_active_at FROM presence WHERE user_id = ?')
-    .bind(userId)
-    .first<{ last_active_at: number }>();
-  return row?.last_active_at ?? null;
 }
 
 users.get('/me', async (c) => {
@@ -108,7 +99,10 @@ users.get('/', async (c) => {
   )
     .bind(userId, userId, userId)
     .all();
-  return c.json({ profiles: results?.map((r) => profilePublic(r)) ?? [] });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rows = (results ?? []) as any[];
+  const presenceMap = await getPresenceMap(c.env, rows.map((r) => r.id));
+  return c.json({ profiles: rows.map((r) => profilePublic(r, presenceMap.get(r.id))) });
 });
 
 users.post('/presence', async (c) => {

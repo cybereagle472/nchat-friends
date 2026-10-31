@@ -3,21 +3,26 @@ import type { Env, Variables } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { newId } from '../lib/id';
 import { broadcastToUser } from '../lib/realtime';
+import { getPresence, getPresenceMap, withPresence } from '../lib/presence';
 
 const friends = new Hono<{ Bindings: Env; Variables: Variables }>();
 friends.use('*', requireAuth);
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function profilePublic(row: any) {
-  return {
-    id: row.id,
-    email: row.email,
-    full_name: row.full_name,
-    username: row.username ?? undefined,
-    avatar_url: row.avatar_url ?? undefined,
-    bio: row.bio ?? undefined,
-  };
+function profilePublic(row: any, lastActiveAt?: number | null) {
+  return withPresence(
+    {
+      id: row.id,
+      email: row.email,
+      full_name: row.full_name,
+      username: row.username ?? undefined,
+      avatar_url: row.avatar_url ?? undefined,
+      bio: row.bio ?? undefined,
+    },
+    lastActiveAt
+  );
 }
+
 
 friends.post('/request', async (c) => {
   const userId = c.get('userId');
@@ -50,9 +55,16 @@ friends.post('/request', async (c) => {
     .run();
 
   const sender = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+  const senderLastActiveAt = await getPresence(c.env, userId);
   await broadcastToUser(c.env, receiver_id, {
     type: 'friend:request',
-    request: { id, sender_id: userId, receiver_id, status: 'pending', sender_profile: sender ? profilePublic(sender) : undefined },
+    request: {
+      id,
+      sender_id: userId,
+      receiver_id,
+      status: 'pending',
+      sender_profile: sender ? profilePublic(sender, senderLastActiveAt) : undefined,
+    },
   });
 
   return c.json({ success: true, id }, 201);
@@ -81,9 +93,10 @@ friends.post('/:id/respond', async (c) => {
     ]);
 
     const accepter = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+    const accepterLastActiveAt = await getPresence(c.env, userId);
     await broadcastToUser(c.env, req.sender_id, {
       type: 'friend:accepted',
-      friend: accepter ? profilePublic(accepter) : { id: userId },
+      friend: accepter ? profilePublic(accepter, accepterLastActiveAt) : { id: userId },
     });
   } else {
     await c.env.DB.prepare("UPDATE friend_requests SET status = 'rejected', updated_at = datetime('now') WHERE id = ?")
@@ -113,21 +126,26 @@ friends.get('/requests', async (c) => {
     .all();
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const requests = (results ?? []).map((r: any) => ({
+  const rows = (results ?? []) as any[];
+  const presenceMap = await getPresenceMap(c.env, rows.map((r) => r.u_id));
+  const requests = rows.map((r) => ({
     id: r.id,
     sender_id: r.sender_id,
     receiver_id: r.receiver_id,
     status: r.status,
     created_at: r.created_at,
     updated_at: r.updated_at,
-    sender_profile: profilePublic({
-      id: r.u_id,
-      full_name: r.full_name,
-      username: r.username,
-      avatar_url: r.avatar_url,
-      email: r.email,
-      bio: r.bio,
-    }),
+    sender_profile: profilePublic(
+      {
+        id: r.u_id,
+        full_name: r.full_name,
+        username: r.username,
+        avatar_url: r.avatar_url,
+        email: r.email,
+        bio: r.bio,
+      },
+      presenceMap.get(r.u_id)
+    ),
   }));
   return c.json({ requests });
 });
@@ -157,7 +175,9 @@ friends.get('/', async (c) => {
     .bind(userId, userId, userId)
     .all();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const friendsList = (results ?? []).map((r: any) => ({ id: r.id, profile: profilePublic(r) }));
+  const rows = (results ?? []) as any[];
+  const presenceMap = await getPresenceMap(c.env, rows.map((r) => r.id));
+  const friendsList = rows.map((r) => ({ id: r.id, profile: profilePublic(r, presenceMap.get(r.id)) }));
   return c.json({ friends: friendsList });
 });
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Toaster } from 'sonner';
 import { MessageCircle, Circle, UsersRound, Compass, Clock } from 'lucide-react';
 import { Auth } from './components/Auth';
@@ -370,6 +370,22 @@ function MainApp({
   // Preload ALL data on mount - this is the key to instant tabs
   const appData = useAppData(currentUser.id);
 
+  // `selectedChat` is a snapshot taken at the moment a chat was opened (from
+  // the Chats list, Discover, or history), so its `profile` (online status,
+  // avatar, etc.) would otherwise stay frozen for as long as the chat stays
+  // open. Re-derive it from the live chats/friends lists (refreshed by
+  // realtime events + the presence poll in useAppData) so things like the
+  // "Online"/"Offline" header and typing indicator reflect reality while
+  // you're actively looking at the conversation.
+  const liveSelectedChat = useMemo(() => {
+    if (!selectedChat) return null;
+    const liveChat = appData.chats.find(c => c.user_id === selectedChat.user_id);
+    if (liveChat) return liveChat;
+    const liveFriend = appData.friends.find(f => f.id === selectedChat.user_id);
+    if (liveFriend) return { ...selectedChat, profile: liveFriend.profile };
+    return selectedChat;
+  }, [selectedChat, appData.chats, appData.friends]);
+
   return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 relative overflow-hidden">
       {/* Animated Background Blobs */}
@@ -388,12 +404,12 @@ function MainApp({
             onLogout={handleLogout}
             onProfileUpdate={handleProfileUpdate}
           />
-        ) : selectedChat ? (
+        ) : liveSelectedChat ? (
           <ChatView
             currentUser={currentUser}
-            contact={selectedChat}
+            contact={liveSelectedChat}
             onBack={handleBackToChats}
-            onCall={(type) => handleCall(selectedChat.user_id, type)}
+            onCall={(type) => handleCall(liveSelectedChat.user_id, type)}
           />
         ) : selectedGroup ? (
           <GroupChatView

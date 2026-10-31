@@ -3,6 +3,7 @@ import type { Env, Variables } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { newId, nowIso } from '../lib/id';
 import { broadcastToUser } from '../lib/realtime';
+import { getPresenceMap, withPresence } from '../lib/presence';
 
 const messages = new Hono<{ Bindings: Env; Variables: Variables }>();
 messages.use('*', requireAuth);
@@ -83,7 +84,9 @@ messages.get('/chats', async (c) => {
 
   const chats = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  for (const u of (friendRows ?? []) as any[]) {
+  const rows = (friendRows ?? []) as any[];
+  const presenceMap = await getPresenceMap(c.env, rows.map((u) => u.id));
+  for (const u of rows) {
     const last = await c.env.DB.prepare(
       `SELECT * FROM messages WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
        ORDER BY created_at DESC LIMIT 1`
@@ -98,7 +101,10 @@ messages.get('/chats', async (c) => {
     chats.push({
       user_id: u.id,
       status: 'accepted',
-      profile: { id: u.id, full_name: u.full_name, username: u.username, avatar_url: u.avatar_url, email: u.email },
+      profile: withPresence(
+        { id: u.id, full_name: u.full_name, username: u.username, avatar_url: u.avatar_url, email: u.email },
+        presenceMap.get(u.id)
+      ),
       lastMessage: last ? messageJson(last) : undefined,
       unreadCount: unread?.n ?? 0,
     });
@@ -268,6 +274,23 @@ messages.post('/mark-read', async (c) => {
     // Let the sender's open chat / device know their messages were read.
     await broadcastToUser(c.env, sender_id, { type: 'message:read', reader_id: userId, message_ids: messageIds });
   }
+
+  return c.json({ success: true });
+});
+
+// POST /messages/typing — ephemeral typing indicator, no DB write at all.
+// Just fans out "I am/am not typing" straight into the receiver's personal
+// realtime room so an open chat window updates instantly.
+messages.post('/typing', async (c) => {
+  const userId = c.get('userId');
+  const { receiver_id, is_typing } = await c.req.json().catch(() => ({}));
+  if (!receiver_id) return c.json({ error: 'receiver_id is required' }, 400);
+
+  await broadcastToUser(c.env, receiver_id, {
+    type: 'typing',
+    sender_id: userId,
+    is_typing: !!is_typing,
+  });
 
   return c.json({ success: true });
 });
