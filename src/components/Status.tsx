@@ -11,6 +11,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { toast } from 'sonner';
 import {
   Plus,
@@ -610,9 +611,14 @@ export function Status({ currentUser, friends }: StatusProps) {
 
   // Render status viewer
   if (viewingStatus && currentViewingStatus) {
-    return (
+    // Rendered via a portal straight into <body> so it truly covers the
+    // whole viewport — ancestor containers in the normal tree use
+    // overflow-hidden for their own layout/animations, which would
+    // otherwise clip this fixed overlay and let the bottom tab bar show
+    // through above it.
+    return createPortal(
       <div
-        className="fixed inset-0 z-50 h-screen w-screen flex flex-col bg-black"
+        className="fixed inset-0 z-[100] h-screen w-screen flex flex-col bg-black"
         onClick={(e) => {
           // Click left/right to navigate
           const rect = (e.target as HTMLElement).getBoundingClientRect();
@@ -856,7 +862,8 @@ export function Status({ currentUser, friends }: StatusProps) {
             </div>
           </div>
         )}
-      </div>
+      </div>,
+      document.body
     );
   }
 
