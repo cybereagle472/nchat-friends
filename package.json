@@ -3,7 +3,7 @@
   "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Production-ready messaging app with beautiful UI - Competing with WhatsApp, Messenger, WeChat, and IMO",
+  "description": "Real-time messaging app (React + Cloudflare Workers/D1/R2) - competing with WhatsApp, Messenger, WeChat, and IMO",
   "author": "NChat Team",
   "license": "MIT",
   "scripts": {
