@@ -1,4 +1,15 @@
-.env.local
 node_modules
 dist
-src/convex/_generated
+dist-ssr
+*.local
+.env
+.env.local
+.DS_Store
+*.log
+npm-debug.log*
+.vite
+coverage
+.wrangler
+.dev.vars
+worker/.wrangler
+worker/.dev.vars

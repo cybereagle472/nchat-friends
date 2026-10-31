@@ -274,8 +274,8 @@ class EncryptionService {
       );
 
       return {
-        ciphertext: this.arrayBufferToBase64(ciphertext as unknown as ArrayBuffer),
-        iv: this.arrayBufferToBase64(iv as unknown as ArrayBuffer)
+        ciphertext: this.arrayBufferToBase64(ciphertext),
+        iv: this.arrayBufferToBase64(iv)
       };
     } catch (error) {
       console.error('Encryption failed:', error);

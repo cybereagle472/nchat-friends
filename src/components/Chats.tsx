@@ -241,10 +241,10 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
                         <img
                           src={chat.profile.avatar_url}
                           alt={chat.profile.full_name}
-                          onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
                         />
-                      ) : null}
-                      <span style={{ display: chat.profile.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{chat.profile.full_name.charAt(0).toUpperCase()}</span>
+                      ) : (
+                        <span>{chat.profile.full_name.charAt(0).toUpperCase()}</span>
+                      )}
                     </div>
                     {chat.profile.is_online && <div className="chat-list-online-dot" />}
                   </div>

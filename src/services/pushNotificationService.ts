@@ -126,7 +126,7 @@ class PushNotificationService {
         // Create new subscription
         subscription = await this.registration.pushManager.subscribe({
           userVisibleOnly: true,
-          applicationServerKey: this.urlBase64ToUint8Array(VAPID_PUBLIC_KEY) as unknown as BufferSource
+          applicationServerKey: this.urlBase64ToUint8Array(VAPID_PUBLIC_KEY)
         });
       }
 

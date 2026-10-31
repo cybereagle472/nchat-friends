@@ -13,7 +13,6 @@ import {
   X,
   UserX,
   Shield,
-  Loader2,
   Users,
   Database,
   Activity,
@@ -28,7 +27,7 @@ import { profileService } from '../services/profileService';
 import { privacyService, PrivacySettings, PrivacyOption } from '../services/privacyService';
 import { friendService } from '../services/friendService';
 import { mediaService } from '../services/mediaService';
-import { api, convex } from '../lib/convexClient';
+import { supabase } from '../supabaseClient';
 import { ImageCropper } from './ImageCropper';
 
 interface SettingsProps {
@@ -114,14 +113,28 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
     if (section === 'admin' && isAdmin(currentUser.email)) {
       const loadStats = async () => {
         try {
-          const allProfiles = await convex.query(api.users.getAllProfiles, {});
-          const totalUsers = (allProfiles as unknown[]).length;
-          // Convex doesn't have a direct count query, but we can use a lightweight approach
+          const { count: usersCount } = await supabase
+            .from('profiles')
+            .select('*', { count: 'exact', head: true });
+
+          const { count: onlineCount } = await supabase
+            .from('profiles')
+            .select('*', { count: 'exact', head: true })
+            .eq('is_online', true);
+
+          const { count: messagesCount } = await supabase
+            .from('messages')
+            .select('*', { count: 'exact', head: true });
+
+          const { count: groupsCount } = await supabase
+            .from('groups')
+            .select('*', { count: 'exact', head: true });
+
           setAdminStats({
-            totalUsers,
-            onlineUsers: 0,
-            totalMessages: 0,
-            totalGroups: 0,
+            totalUsers: usersCount || 0,
+            onlineUsers: onlineCount || 0,
+            totalMessages: messagesCount || 0,
+            totalGroups: groupsCount || 0,
             loadingStats: false
           });
         } catch (error) {
@@ -147,37 +160,29 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
     e.target.value = '';
   };
 
-  // Handle cropped image upload — compress, upload, save, then refresh
-  const [avatarError, setAvatarError] = useState('');
+  // Handle cropped image upload
   const handleCroppedImage = async (blob: Blob) => {
     setShowCropper(false);
     setCropImageUrl(null);
     setSaving(true);
-    setAvatarError('');
 
     try {
-      const { compressImage } = await import('../services/mediaService');
-      const compressed = await compressImage(blob, 320, 0.85);
-      const file = new File([compressed], `avatar_${Date.now()}.jpg`, { type: 'image/jpeg' });
+      const file = new File([blob], `avatar_${Date.now()}.jpg`, { type: 'image/jpeg' });
       const result = await mediaService.uploadMedia(file, currentUser.id);
 
       if (result.success && result.url) {
-        await profileService.updateProfile(currentUser.id, {
+        const updateResult = await profileService.updateProfile(currentUser.id, {
           avatar_url: result.url
         });
-        // Optimistically update the UI immediately
-        onProfileUpdate({ ...currentUser, avatar_url: result.url });
-        // Then re-fetch to get the canonical server URL
-        const updatedProfile = await profileService.getProfile(currentUser.id);
-        if (updatedProfile) {
-          onProfileUpdate(updatedProfile);
+        if (updateResult.success) {
+          const updatedProfile = await profileService.getProfile(currentUser.id);
+          if (updatedProfile) {
+            onProfileUpdate(updatedProfile);
+          }
         }
-      } else {
-        setAvatarError(result.error || 'Photo upload failed. Please try again.');
       }
     } catch (error) {
       console.error('Error updating avatar:', error);
-      setAvatarError('Photo update failed. Please try again.');
     } finally {
       setSaving(false);
     }
@@ -191,12 +196,11 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
         full_name: name.trim()
       });
       if (result.success) {
-        // Optimistically update immediately
-        onProfileUpdate({ ...currentUser, full_name: name.trim() });
-        setEditingName(false);
-        // Then re-fetch from server for canonical data
         const updatedProfile = await profileService.getProfile(currentUser.id);
-        if (updatedProfile) onProfileUpdate(updatedProfile);
+        if (updatedProfile) {
+          onProfileUpdate(updatedProfile);
+        }
+        setEditingName(false);
       }
     } catch (error) {
       console.error('Error updating name:', error);
@@ -212,10 +216,11 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
         bio: bio.trim()
       });
       if (result.success) {
-        onProfileUpdate({ ...currentUser, bio: bio.trim() });
-        setEditingBio(false);
         const updatedProfile = await profileService.getProfile(currentUser.id);
-        if (updatedProfile) onProfileUpdate(updatedProfile);
+        if (updatedProfile) {
+          onProfileUpdate(updatedProfile);
+        }
+        setEditingBio(false);
       }
     } catch (error) {
       console.error('Error updating bio:', error);
@@ -316,9 +321,10 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           <button onClick={() => setSection('profile')} className="settings-profile-card">
             <div className="settings-avatar">
               {currentUser.avatar_url ? (
-                <img src={currentUser.avatar_url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-              ) : null}
-              <span style={{ display: currentUser.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{currentUser.full_name?.charAt(0)}</span>
+                <img src={currentUser.avatar_url} alt="" />
+              ) : (
+                <span>{currentUser.full_name?.charAt(0)}</span>
+              )}
             </div>
             <div className="settings-profile-info">
               <h2>{currentUser.full_name}</h2>
@@ -481,9 +487,10 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
             <div className="profile-avatar-wrapper">
               <div className="profile-avatar-large">
                 {currentUser.avatar_url ? (
-                  <img src={currentUser.avatar_url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-                ) : null}
-                <span style={{ display: currentUser.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{currentUser.full_name?.charAt(0)}</span>
+                  <img src={currentUser.avatar_url} alt="" />
+                ) : (
+                  <span>{currentUser.full_name?.charAt(0)}</span>
+                )}
               </div>
               <label className="profile-camera-btn">
                 <Camera className={`w-5 h-5 ${saving ? 'opacity-50' : ''}`} />
@@ -495,15 +502,6 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
                 />
               </label>
             </div>
-            {avatarError && !saving && (
-              <p className="text-xs text-red-500 font-medium mt-2 text-center">{avatarError}</p>
-            )}
-            {saving && (
-              <p className="text-xs text-violet-600 font-medium mt-2 text-center flex items-center justify-center gap-1">
-                <Loader2 className="w-3 h-3 animate-spin" />
-                Updating photo…
-              </p>
-            )}
           </div>
 
           {/* Profile Info */}
@@ -745,9 +743,10 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
                 <div key={user.id} className="blocked-user-item">
                   <div className="blocked-user-avatar">
                     {user.avatar_url ? (
-                      <img src={user.avatar_url} alt={user.full_name} onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-                    ) : null}
-                    <span style={{ display: user.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{user.full_name?.charAt(0).toUpperCase()}</span>
+                      <img src={user.avatar_url} alt={user.full_name} />
+                    ) : (
+                      <span>{user.full_name?.charAt(0).toUpperCase()}</span>
+                    )}
                   </div>
                   <div className="blocked-user-info">
                     <span className="blocked-user-name">{user.full_name}</span>
@@ -788,9 +787,10 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           <div className="admin-badge">
             <div className="admin-badge-avatar">
               {currentUser.avatar_url ? (
-                <img src={currentUser.avatar_url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-              ) : null}
-              <span style={{ display: currentUser.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{currentUser.full_name?.charAt(0)}</span>
+                <img src={currentUser.avatar_url} alt="" />
+              ) : (
+                <span>{currentUser.full_name?.charAt(0)}</span>
+              )}
             </div>
             <div className="admin-badge-info">
               <div className="admin-badge-name">
@@ -1176,8 +1176,8 @@ const settingsStyles = `
   }
 
   .profile-avatar-large {
-    width: 88px;
-    height: 88px;
+    width: 120px;
+    height: 120px;
     border-radius: 50%;
     background: linear-gradient(135deg, #a855f7 0%, #7c3aed 100%);
     display: flex;
@@ -1678,12 +1678,12 @@ const settingsStyles = `
     }
 
     .profile-avatar-large {
-      width: 72px;
-      height: 72px;
+      width: 100px;
+      height: 100px;
     }
 
     .profile-avatar-large span {
-      font-size: 28px;
+      font-size: 36px;
     }
   }
 `;
