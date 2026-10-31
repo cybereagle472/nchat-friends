@@ -11,6 +11,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { toast } from 'sonner';
 import {
   Plus,
   Camera,
@@ -66,6 +67,7 @@ export function Status({ currentUser, friends }: StatusProps) {
 
   // Refs
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const replyInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [progress, setProgress] = useState(0);
@@ -432,7 +434,11 @@ export function Status({ currentUser, friends }: StatusProps) {
       replyText
     );
     setReplyText('');
-    alert('Reply sent!');
+    // Close the reply box (blur it so the keyboard dismisses and it
+    // collapses back to its idle state) and let the story resume playing.
+    replyInputRef.current?.blur();
+    setIsReplyFocused(false);
+    toast.success('Reply sent!');
   };
 
   // Format time ago
@@ -606,7 +612,7 @@ export function Status({ currentUser, friends }: StatusProps) {
   if (viewingStatus && currentViewingStatus) {
     return (
       <div
-        className="h-full flex flex-col bg-black"
+        className="fixed inset-0 z-50 h-screen w-screen flex flex-col bg-black"
         onClick={(e) => {
           // Click left/right to navigate
           const rect = (e.target as HTMLElement).getBoundingClientRect();
@@ -777,6 +783,7 @@ export function Status({ currentUser, friends }: StatusProps) {
           ) : (
             <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
               <input
+                ref={replyInputRef}
                 type="text"
                 value={replyText}
                 onChange={(e) => setReplyText(e.target.value)}
