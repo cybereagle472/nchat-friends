@@ -85,7 +85,7 @@ Wait for the deploy to finish (progress shown on screen), then open the
 Worker's **Overview** tab — you'll see a live URL like:
 
 ```
-https://nchat-api.<your-subdomain>.workers.dev
+https://nchat-friends.<your-subdomain>.workers.dev
 ```
 
 **Copy this URL** — you need it in Step 6.
@@ -119,7 +119,7 @@ needed later for push notifications.)
    Step 3).
 2. Find:
    ```
-   PUBLIC_API_URL = "https://nchat-api.YOUR-SUBDOMAIN.workers.dev"
+   PUBLIC_API_URL = "https://nchat-friends.YOUR-SUBDOMAIN.workers.dev"
    ```
    Replace it with the **real URL** you copied in Step 4.
 3. Commit directly to `arena/940244a7-nchat-friends`.
@@ -169,7 +169,7 @@ Open this in your phone's browser (plain GET, works directly in any
 browser):
 
 ```
-https://nchat-api.<your-subdomain>.workers.dev/health
+https://nchat-friends.<your-subdomain>.workers.dev/health
 ```
 
 You should see:
@@ -184,7 +184,7 @@ That confirms the Worker, D1, and R2 are all live.
 ## Step 10 — Wire up the frontend and test signup
 
 Once you've done the above, send me your Worker URL
-(`https://nchat-api.<your-subdomain>.workers.dev`) and I'll:
+(`https://nchat-friends.<your-subdomain>.workers.dev`) and I'll:
 1. Update `VITE_API_URL` in the app's config to point at it.
 2. Start the live preview so you can open the NChat app in your phone
    browser and actually sign up / log in through the real UI — a much

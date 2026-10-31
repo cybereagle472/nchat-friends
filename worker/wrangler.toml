@@ -1,4 +1,4 @@
-name = "nchat-api"
+name = "nchat-friends"
 main = "src/index.ts"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
@@ -29,7 +29,7 @@ new_sqlite_classes = ["RealtimeRoom"]
 [vars]
 # Public base URL this Worker is deployed at (used to build media URLs).
 # Set the real one after your first `wrangler deploy`.
-PUBLIC_API_URL = "https://nchat-api.YOUR-SUBDOMAIN.workers.dev"
+PUBLIC_API_URL = "https://nchat-friends.YOUR-SUBDOMAIN.workers.dev"
 
 # ── Secrets (set these, never commit them) ──
 # wrangler secret put JWT_SECRET

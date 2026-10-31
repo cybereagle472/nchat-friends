@@ -145,7 +145,7 @@ npm run deploy
 Wrangler will build and upload the Worker, then print your live URL:
 
 ```
-https://nchat-api.<your-subdomain>.workers.dev
+https://nchat-friends.<your-subdomain>.workers.dev
 ```
 
 Copy that URL — you need it twice:
@@ -154,7 +154,7 @@ Copy that URL — you need it twice:
 
 ```toml
 [vars]
-PUBLIC_API_URL = "https://nchat-api.<your-subdomain>.workers.dev"
+PUBLIC_API_URL = "https://nchat-friends.<your-subdomain>.workers.dev"
 ```
 
 (This is used when building media URLs returned by `/media/upload`.)
@@ -168,7 +168,7 @@ npm run deploy
 In the **repo root** (not `worker/`), edit `.env.local`:
 
 ```bash
-VITE_API_URL=https://nchat-api.<your-subdomain>.workers.dev
+VITE_API_URL=https://nchat-friends.<your-subdomain>.workers.dev
 ```
 
 ---
@@ -179,17 +179,17 @@ Before touching the frontend, confirm the backend works end to end with curl:
 
 ```bash
 # Health check
-curl https://nchat-api.<your-subdomain>.workers.dev/health
+curl https://nchat-friends.<your-subdomain>.workers.dev/health
 # → {"ok":true}
 
 # Sign up a test user
-curl -X POST https://nchat-api.<your-subdomain>.workers.dev/auth/signup \
+curl -X POST https://nchat-friends.<your-subdomain>.workers.dev/auth/signup \
   -H "Content-Type: application/json" \
   -d '{"email":"test@example.com","password":"password123"}'
 # → { "user": {...}, "access_token": "...", "refresh_token": "...", "expires_in": 900 }
 
 # Use the access_token from above to call an authenticated route
-curl https://nchat-api.<your-subdomain>.workers.dev/users/me \
+curl https://nchat-friends.<your-subdomain>.workers.dev/users/me \
   -H "Authorization: Bearer <paste access_token here>"
 # → { "profile": {...} }
 ```
@@ -236,7 +236,7 @@ frontend.
 
 ## 11. (Optional) Custom domain
 
-In the Cloudflare dashboard → **Workers & Pages** → `nchat-api` →
+In the Cloudflare dashboard → **Workers & Pages** → `nchat-friends` →
 **Settings** → **Domains & Routes** → **Add** → pick a domain/subdomain you
 manage in that Cloudflare account (e.g. `api.yourapp.com`). Update
 `PUBLIC_API_URL` in `wrangler.toml` and `VITE_API_URL` in `.env.local` to
@@ -249,7 +249,7 @@ match, then redeploy.
 Cloudflare dashboard → **Workers & Pages**:
 - **D1** → `nchat-db` → **Console** tab lets you run SQL queries directly in the browser
 - **R2** → `nchat-media` → browse/delete uploaded files
-- **Workers** → `nchat-api` → **Logs** (or `npx wrangler tail`) to watch live request logs
+- **Workers** → `nchat-friends` → **Logs** (or `npx wrangler tail`) to watch live request logs
 - **Durable Objects** are listed under the Worker's bindings; they don't need separate management
 
 ---

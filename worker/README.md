@@ -52,7 +52,7 @@ npm run deploy
 ```
 
 Wrangler will print your Worker's URL, e.g.
-`https://nchat-api.your-subdomain.workers.dev`. Put that in:
+`https://nchat-friends.your-subdomain.workers.dev`. Put that in:
 
 - `worker/wrangler.toml` → `PUBLIC_API_URL` (used to build media URLs), then redeploy
 - the frontend's `.env.local` → `VITE_API_URL`
