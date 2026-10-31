@@ -355,6 +355,9 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
     // (Idempotent — if ChatView is open for this exact chat it will have
     // already applied the same update itself.)
     chatService.updateCache(userId, otherUserId, message);
+    // Also persist it to IndexedDB right away so local storage has it even
+    // if the chat never gets opened again before the app is reloaded.
+    chatService.persistIncomingMessage(userId, otherUserId, message).catch(() => {});
 
     updateData((prev) => {
       const idx = prev.chats.findIndex(c => c.user_id === otherUserId);

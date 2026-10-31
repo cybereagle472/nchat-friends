@@ -873,10 +873,42 @@ export const chatService = {
         }
       }
     } else {
-      messageCache.set(chatId, {
-        messages: [message],
-        fetchedAt: Date.now()
-      });
+      // No warm cache yet for this chat (e.g. right after a fresh page
+      // load, before this conversation has been opened/prefetched this
+      // session). Do NOT fabricate a cache entry containing only this one
+      // message — getCachedMessages()/ChatView treat whatever is cached as
+      // "the known message list" and would render it as the chat's full
+      // history, making every older message (including everything the
+      // other person had sent) appear to vanish for the moment it takes
+      // the real load to catch up. Leaving the cache cold here means
+      // ChatView's normal IndexedDB/server load path runs instead, which
+      // always fetches the complete, correct history.
+    }
+  },
+
+  /**
+   * Persist a realtime-delivered message to local storage even while its
+   * chat isn't open. Without this, a message that arrives while the user is
+   * elsewhere in the app (chat list, a different conversation) only lived
+   * in the in-memory cache — if the chat was never opened again before the
+   * app was reloaded, IndexedDB wouldn't have it until the next full server
+   * sync. Safe/idempotent: saveMessage() upserts by id.
+   */
+  async persistIncomingMessage(userId: string, contactId: string, message: Message): Promise<void> {
+    try {
+      const chatId = getChatId(userId, contactId);
+      const localMessage: LocalMessage = {
+        ...message,
+        chatId,
+        syncStatus: 'sent',
+        clientMessageId: message.client_message_id || message.id,
+        localCreatedAt: message.created_at,
+        serverCreatedAt: message.created_at,
+        retryCount: 0
+      };
+      await saveMessage(localMessage);
+    } catch (error) {
+      log.warn('Failed to persist incoming message locally (non-fatal)', error, 'chatService');
     }
   },
 
