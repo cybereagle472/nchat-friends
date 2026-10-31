@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import type { Env, Variables } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { newId, nowIso } from '../lib/id';
-import { broadcastToRoom, roomIdFor } from '../lib/realtime';
+import { broadcastToUser } from '../lib/realtime';
 
 const messages = new Hono<{ Bindings: Env; Variables: Variables }>();
 messages.use('*', requireAuth);
@@ -32,18 +32,42 @@ function messageJson(row: any) {
   };
 }
 
-// GET /messages/with/:userId — conversation history with another user
+// Fan out a message-related event to both participants' personal realtime
+// rooms. A single WebSocket per logged-in user (connected to their own
+// `user:<id>` room) is enough to receive every conversation's events —
+// no need for the client to join one room per contact.
+async function broadcastToParticipants(env: Env, userA: string, userB: string, payload: unknown) {
+  await Promise.all([broadcastToUser(env, userA, payload), broadcastToUser(env, userB, payload)]);
+}
+
+// GET /messages/with/:otherId — conversation history with another user.
+// Supports ?limit= (default/max 200) and ?before= (ISO timestamp) for
+// infinite-scroll pagination; always returns oldest-first.
 messages.get('/with/:otherId', async (c) => {
   const userId = c.get('userId');
   const otherId = c.req.param('otherId');
-  const { results } = await c.env.DB.prepare(
-    `SELECT * FROM messages
-     WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
-     ORDER BY created_at ASC LIMIT 200`
-  )
-    .bind(userId, otherId, otherId, userId)
+  const limit = Math.min(Math.max(Number(c.req.query('limit')) || 200, 1), 200);
+  const before = c.req.query('before');
+
+  let sql = `SELECT * FROM messages WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)`;
+  const binds: unknown[] = [userId, otherId, otherId, userId];
+  if (before) {
+    sql += ' AND created_at < ?';
+    binds.push(before);
+  }
+  sql += ' ORDER BY created_at DESC LIMIT ?';
+  binds.push(limit);
+
+  const { results } = await c.env.DB.prepare(sql)
+    .bind(...binds)
     .all();
-  return c.json({ messages: (results ?? []).map(messageJson) });
+
+  const msgs = (results ?? [])
+    .map(messageJson)
+    .filter((m) => !(m.deleted_for ?? []).includes(userId))
+    .reverse();
+
+  return c.json({ messages: msgs });
 });
 
 // GET /messages/chats — chat list: friends with a conversation + last message + unread count
@@ -128,8 +152,8 @@ messages.post('/', async (c) => {
   const row = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first();
   const msg = messageJson(row);
 
-  // Fan out to both participants' realtime room so open chats update live.
-  await broadcastToRoom(c.env, roomIdFor(userId, receiver_id), { type: 'message:new', message: msg });
+  // Fan out to both participants so any open tab/device updates live.
+  await broadcastToParticipants(c.env, userId, receiver_id, { type: 'message:new', message: msg });
 
   return c.json({ message: msg }, 201);
 });
@@ -140,8 +164,16 @@ messages.patch('/:id', async (c) => {
   const { content } = await c.req.json().catch(() => ({}));
   const row = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ? AND sender_id = ?').bind(id, userId).first<{
     receiver_id: string;
+    created_at: string;
+    type: string;
   }>();
   if (!row) return c.json({ error: 'Message not found' }, 404);
+  if (row.type !== 'text') return c.json({ error: 'Only text messages can be edited' }, 400);
+
+  const fifteenMinutes = 15 * 60 * 1000;
+  if (Date.now() - new Date(row.created_at).getTime() > fifteenMinutes) {
+    return c.json({ error: 'Messages can only be edited within 15 minutes' }, 400);
+  }
 
   await c.env.DB.prepare(
     "UPDATE messages SET content = ?, is_edited = 1, edited_at = datetime('now') WHERE id = ?"
@@ -149,10 +181,11 @@ messages.patch('/:id', async (c) => {
     .bind(content, id)
     .run();
   const updated = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first();
-  await broadcastToRoom(c.env, roomIdFor(userId, row.receiver_id), { type: 'message:edit', message: messageJson(updated) });
+  await broadcastToParticipants(c.env, userId, row.receiver_id, { type: 'message:edit', message: messageJson(updated) });
   return c.json({ message: messageJson(updated) });
 });
 
+// DELETE /messages/:id — delete for everyone (sender only)
 messages.delete('/:id', async (c) => {
   const userId = c.get('userId');
   const id = c.req.param('id');
@@ -161,8 +194,31 @@ messages.delete('/:id', async (c) => {
   }>();
   if (!row) return c.json({ error: 'Message not found' }, 404);
 
-  await c.env.DB.prepare('UPDATE messages SET is_deleted = 1, content = ? WHERE id = ?').bind('', id).run();
-  await broadcastToRoom(c.env, roomIdFor(userId, row.receiver_id), { type: 'message:delete', messageId: id });
+  await c.env.DB.prepare("UPDATE messages SET is_deleted = 1, content = '' WHERE id = ?").bind(id).run();
+  await broadcastToParticipants(c.env, userId, row.receiver_id, {
+    type: 'message:delete',
+    messageId: id,
+    sender_id: userId,
+    receiver_id: row.receiver_id,
+  });
+  return c.json({ success: true });
+});
+
+// POST /messages/:id/delete-for-me — hide a message for the requester only.
+messages.post('/:id/delete-for-me', async (c) => {
+  const userId = c.get('userId');
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare(
+    'SELECT deleted_for FROM messages WHERE id = ? AND (sender_id = ? OR receiver_id = ?)'
+  )
+    .bind(id, userId, userId)
+    .first<{ deleted_for: string | null }>();
+  if (!row) return c.json({ error: 'Message not found' }, 404);
+
+  const deletedFor: string[] = row.deleted_for ? JSON.parse(row.deleted_for) : [];
+  if (!deletedFor.includes(userId)) deletedFor.push(userId);
+
+  await c.env.DB.prepare('UPDATE messages SET deleted_for = ? WHERE id = ?').bind(JSON.stringify(deletedFor), id).run();
   return c.json({ success: true });
 });
 
@@ -183,17 +239,36 @@ messages.post('/:id/reaction', async (c) => {
   if (reactions[emoji].length === 0) delete reactions[emoji];
 
   await c.env.DB.prepare('UPDATE messages SET reactions = ? WHERE id = ?').bind(JSON.stringify(reactions), id).run();
-  const other = row.sender_id === userId ? row.receiver_id : row.sender_id;
-  await broadcastToRoom(c.env, roomIdFor(userId, other), { type: 'message:reaction', messageId: id, reactions });
+  await broadcastToParticipants(c.env, row.sender_id, row.receiver_id, {
+    type: 'message:reaction',
+    messageId: id,
+    reactions,
+    sender_id: row.sender_id,
+    receiver_id: row.receiver_id,
+  });
   return c.json({ reactions });
 });
 
 messages.post('/mark-read', async (c) => {
   const userId = c.get('userId');
   const { sender_id } = await c.req.json().catch(() => ({}));
-  await c.env.DB.prepare('UPDATE messages SET is_read = 1 WHERE sender_id = ? AND receiver_id = ?')
+  if (!sender_id) return c.json({ error: 'sender_id is required' }, 400);
+
+  const { results } = await c.env.DB.prepare(
+    'SELECT id FROM messages WHERE sender_id = ? AND receiver_id = ? AND is_read = 0'
+  )
     .bind(sender_id, userId)
-    .run();
+    .all<{ id: string }>();
+  const messageIds = (results ?? []).map((r) => r.id);
+
+  if (messageIds.length > 0) {
+    await c.env.DB.prepare('UPDATE messages SET is_read = 1 WHERE sender_id = ? AND receiver_id = ?')
+      .bind(sender_id, userId)
+      .run();
+    // Let the sender's open chat / device know their messages were read.
+    await broadcastToUser(c.env, sender_id, { type: 'message:read', reader_id: userId, message_ids: messageIds });
+  }
+
   return c.json({ success: true });
 });
 

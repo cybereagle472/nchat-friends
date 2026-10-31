@@ -49,7 +49,14 @@ app.get('/realtime/connect', async (c) => {
   const payload = await verifyJWT<{ sub: string }>(token, c.env.JWT_SECRET);
   if (!payload?.sub) return c.json({ error: 'Invalid or expired token' }, 401);
 
+  // A user's personal room carries private events (their own messages,
+  // friend requests, etc.) — only that user may connect to it.
+  if (room.startsWith('user:') && room !== `user:${payload.sub}`) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
   const id = c.env.REALTIME.idFromName(room);
+
   const stub = c.env.REALTIME.get(id);
   return stub.fetch(c.req.raw);
 });

@@ -1,16 +1,17 @@
 /**
- * Chat Service - Production-Ready Offline-First Implementation
+ * Chat Service - Production-Ready Offline-First Implementation (Cloudflare Worker backend)
  *
  * Features:
  * - Idempotent message sending with client_message_id
  * - Offline queue with automatic retry
  * - Local-first UI updates
  * - Sync reconciliation
- * - Optimized batch queries
  * - Message pre-fetching for instant chat loading (WhatsApp-style)
+ * - Realtime updates over a single per-user WebSocket (src/lib/realtimeClient.ts)
  */
 
-import { supabase } from '../supabaseClient';
+import { apiFetch, ApiError } from '../lib/apiClient';
+import { realtimeClient } from '../lib/realtimeClient';
 import { retry } from '../utils/retry';
 import { Message, Contact, UserProfile } from '../types';
 import {
@@ -48,6 +49,12 @@ const messageRateLimiter = new RateLimiter(
   RATE_LIMITS.MESSAGES_PER_MINUTE,
   60000 // 1 minute window
 );
+
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message;
+  if (err instanceof Error) return err.message;
+  return fallback;
+}
 
 export interface SendMessageParams {
   senderId: string;
@@ -214,7 +221,8 @@ export const chatService = {
   },
 
   /**
-   * Send message to server with idempotency
+   * Send message to server with idempotency (the Worker also de-dupes by
+   * client_message_id, so a retried call is always safe)
    */
   async sendToServer(params: {
     clientMessageId: string;
@@ -225,57 +233,27 @@ export const chatService = {
     duration?: number;
     replyToId?: string;
   }): Promise<{ success: boolean; message?: Message; error?: string }> {
-    // Retry logic for transient errors
     try {
       return await retry(async () => {
-        const { data: existing } = await supabase
-          .from('messages')
-          .select('*')
-          .eq('client_message_id', params.clientMessageId)
-          .maybeSingle();
-
-        if (existing) {
-          return { success: true, message: existing as Message };
-        }
-
-        const { data, error } = await supabase
-          .from('messages')
-          .insert({
-            sender_id: params.senderId,
+        const { message } = await apiFetch<{ message: Message }>('/messages', {
+          method: 'POST',
+          body: JSON.stringify({
             receiver_id: params.receiverId,
             content: params.content,
             type: params.type,
-            message_type: params.type,
             duration: params.duration,
-            replied_to_id: params.replyToId,
+            reply_to: params.replyToId,
             client_message_id: params.clientMessageId
           })
-          .select()
-          .single();
-
-        if (error) {
-          if (error.code === '23505' && error.message?.includes('client_message_id')) {
-            const { data: existingMsg } = await supabase
-              .from('messages')
-              .select('*')
-              .eq('client_message_id', params.clientMessageId)
-              .single();
-
-            if (existingMsg) {
-              return { success: true, message: existingMsg as Message };
-            }
-          }
-          throw new Error(error.message || 'Failed to send message');
-        }
-
-        return { success: true, message: data as Message };
+        });
+        return { success: true, message };
       }, {
         maxRetries: 3,
         delay: 1000,
         backoff: true
       });
     } catch (error: any) {
-      return { success: false, error: error.message || 'Failed to send message' };
+      return { success: false, error: errorMessage(error, 'Failed to send message') };
     }
   },
 
@@ -336,7 +314,7 @@ export const chatService = {
         }
       } catch (error) {
         log.error('Failed to process pending message', error, 'chatService');
-        
+
         await updatePendingMessageStatus(
           pending.clientMessageId,
           'failed',
@@ -376,22 +354,14 @@ export const chatService = {
 
     if (isOnline()) {
       try {
-        let query = supabase
-          .from('messages')
-          .select('*')
-          .or(
-            `and(sender_id.eq.${userId},receiver_id.eq.${contactId}),and(sender_id.eq.${contactId},receiver_id.eq.${userId})`
-          )
-          .order('created_at', { ascending: false })
-          .limit(limit);
+        const params = new URLSearchParams({ limit: String(limit) });
+        if (beforeTimestamp) params.set('before', beforeTimestamp);
 
-        if (beforeTimestamp) {
-          query = query.lt('created_at', beforeTimestamp);
-        }
+        const { messages: serverMessages } = await apiFetch<{ messages: Message[] }>(
+          `/messages/with/${contactId}?${params.toString()}`
+        );
 
-        const { data: serverMessages, error } = await query;
-
-        if (!error && serverMessages) {
+        if (serverMessages) {
           const localMessagesToSave: LocalMessage[] = serverMessages.map(msg => ({
             ...msg,
             chatId,
@@ -443,63 +413,31 @@ export const chatService = {
   },
 
   /**
-   * Mark messages as read
+   * Mark messages as read (the Worker notifies the sender's live session)
    */
-  async markAsRead(userId: string, senderId: string): Promise<void> {
+  async markAsRead(_userId: string, senderId: string): Promise<void> {
     if (!isOnline()) return;
-
-    // First get the IDs of messages to be marked as read
-    const { data: unreadMessages } = await supabase
-      .from('messages')
-      .select('id')
-      .eq('sender_id', senderId)
-      .eq('receiver_id', userId)
-      .eq('is_read', false);
-
-    if (!unreadMessages || unreadMessages.length === 0) return;
-
-    const messageIds = unreadMessages.map(m => m.id);
-
-    // Update messages as read
-    await supabase
-      .from('messages')
-      .update({ is_read: true })
-      .in('id', messageIds);
-
-    // Broadcast read receipt event to notify the sender
-    const channel = supabase.channel(`read_receipts_${senderId}`);
-    await channel.send({
-      type: 'broadcast',
-      event: 'messages_read',
-      payload: {
-        reader_id: userId,
-        message_ids: messageIds
-      }
-    });
-    await channel.unsubscribe();
+    try {
+      await apiFetch('/messages/mark-read', {
+        method: 'POST',
+        body: JSON.stringify({ sender_id: senderId })
+      });
+    } catch (error) {
+      log.error('Error marking messages as read', error, 'chatService');
+    }
   },
 
   /**
-   * Delete message for self
+   * Delete message for self only
    */
-  async deleteForMe(messageId: string, userId: string): Promise<{ success: boolean }> {
-    const { data: message } = await supabase
-      .from('messages')
-      .select('deleted_for')
-      .eq('id', messageId)
-      .single();
-
-    const deletedFor = message?.deleted_for || [];
-    if (!deletedFor.includes(userId)) {
-      deletedFor.push(userId);
+  async deleteForMe(messageId: string, _userId: string): Promise<{ success: boolean }> {
+    try {
+      await apiFetch(`/messages/${messageId}/delete-for-me`, { method: 'POST' });
+      return { success: true };
+    } catch (error) {
+      log.error('Error deleting message for self', error, 'chatService');
+      return { success: false };
     }
-
-    const { error } = await supabase
-      .from('messages')
-      .update({ deleted_for: deletedFor })
-      .eq('id', messageId);
-
-    return { success: !error };
   },
 
   /**
@@ -507,306 +445,203 @@ export const chatService = {
    */
   async deleteForEveryone(
     messageId: string,
-    senderId: string
+    _senderId: string
   ): Promise<{ success: boolean; error?: string }> {
-    const { error } = await supabase
-      .from('messages')
-      .update({ is_deleted: true, content: 'This message was deleted' })
-      .eq('id', messageId)
-      .eq('sender_id', senderId);
-
-    if (error) {
-      return { success: false, error: 'You can only delete your own messages' };
+    try {
+      await apiFetch(`/messages/${messageId}`, { method: 'DELETE' });
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: errorMessage(error, 'You can only delete your own messages') };
     }
-
-    return { success: true };
   },
 
   /**
-   * Add reaction to message
+   * Add reaction to message (the Worker's endpoint toggles, which is what we want here)
    */
-  async addReaction(messageId: string, userId: string, emoji: string): Promise<void> {
-    const { data: message } = await supabase
-      .from('messages')
-      .select('reactions')
-      .eq('id', messageId)
-      .single();
-
-    const reactions = message?.reactions || {};
-    if (!reactions[emoji]) {
-      reactions[emoji] = [];
+  async addReaction(messageId: string, _userId: string, emoji: string): Promise<void> {
+    try {
+      await apiFetch(`/messages/${messageId}/reaction`, {
+        method: 'POST',
+        body: JSON.stringify({ emoji })
+      });
+    } catch (error) {
+      log.error('Error adding reaction', error, 'chatService');
     }
-
-    if (!reactions[emoji].includes(userId)) {
-      reactions[emoji].push(userId);
-    }
-
-    await supabase
-      .from('messages')
-      .update({ reactions })
-      .eq('id', messageId);
   },
 
   /**
    * Remove reaction from message
    */
-  async removeReaction(messageId: string, userId: string, emoji: string): Promise<void> {
-    const { data: message } = await supabase
-      .from('messages')
-      .select('reactions')
-      .eq('id', messageId)
-      .single();
-
-    const reactions = message?.reactions || {};
-    if (reactions[emoji]) {
-      reactions[emoji] = reactions[emoji].filter((id: string) => id !== userId);
-      if (reactions[emoji].length === 0) {
-        delete reactions[emoji];
-      }
+  async removeReaction(messageId: string, _userId: string, emoji: string): Promise<void> {
+    try {
+      // Same toggle endpoint as addReaction — calling it again removes an
+      // existing reaction from this user for this emoji.
+      await apiFetch(`/messages/${messageId}/reaction`, {
+        method: 'POST',
+        body: JSON.stringify({ emoji })
+      });
+    } catch (error) {
+      log.error('Error removing reaction', error, 'chatService');
     }
-
-    await supabase
-      .from('messages')
-      .update({ reactions })
-      .eq('id', messageId);
   },
 
   /**
-   * Get chat list with last messages - OPTIMIZED: Single SQL query via RPC
-   * Replaces 2N queries with 1 single database call
+   * Get chat list with last messages + unread counts
    */
   async getChatList(userId: string, friendIds: string[]): Promise<Contact[]> {
     if (friendIds.length === 0) return [];
 
-    // Use optimized RPC function - 1 query instead of 2N queries
-    const { data, error } = await supabase.rpc('get_chat_list_optimized', {
-      p_user_id: userId,
-      p_friend_ids: friendIds
-    });
+    try {
+      const { chats } = await apiFetch<{ chats: any[] }>('/messages/chats');
+      if (!chats) return [];
 
-    if (error) {
-      console.error('Error fetching chat list:', error);
-      // Fallback to old method if RPC fails
-      return this.getChatListFallback(userId, friendIds);
-    }
-
-    if (!data || data.length === 0) return [];
-
-    // Transform RPC result to Contact[] format
-    const chats: Contact[] = data.map((row: any) => {
-      const profile: UserProfile = {
-        id: row.user_id,
-        email: '',
-        full_name: row.full_name || '',
-        username: row.username,
-        avatar_url: row.avatar_url,
-        bio: row.bio,
-        is_online: row.is_online,
-        last_seen: row.last_seen
-      };
-
-      const lastMessage: Message | undefined = row.last_message_id ? {
-        id: row.last_message_id,
-        sender_id: row.last_message_sender_id,
-        receiver_id: row.last_message_sender_id === userId ? row.user_id : userId,
-        content: row.last_message_content || '',
-        type: (row.last_message_type || 'text') as Message['type'],
-        created_at: row.last_message_created_at,
-        is_read: row.last_message_is_read
-      } : undefined;
-
-      return {
+      const result: Contact[] = chats.map((row) => ({
         user_id: row.user_id,
         status: 'accepted' as const,
-        profile,
-        lastMessage,
-        unreadCount: Number(row.unread_count) || 0
-      };
-    });
+        profile: {
+          id: row.profile.id,
+          email: row.profile.email || '',
+          full_name: row.profile.full_name || '',
+          username: row.profile.username,
+          avatar_url: row.profile.avatar_url
+        } as UserProfile,
+        lastMessage: row.lastMessage as Message | undefined,
+        unreadCount: Number(row.unreadCount) || 0
+      }));
 
-    // Cache profiles for offline access
-    const profiles = chats.map(c => c.profile);
-    cacheProfiles(profiles).catch(() => {});
+      cacheProfiles(result.map(c => c.profile)).catch(() => {});
 
-    // Already sorted by last_message_created_at DESC from SQL
-    return chats;
+      return result;
+    } catch (error) {
+      console.error('Error fetching chat list:', error);
+      return this.getChatListFallback(userId, friendIds);
+    }
   },
 
   /**
-   * Fallback method if RPC function is not available
+   * Fallback method if the combined /messages/chats endpoint is unreachable
    */
   async getChatListFallback(userId: string, friendIds: string[]): Promise<Contact[]> {
-    const { data: profiles } = await supabase
-      .from('profiles')
-      .select('*')
-      .in('id', friendIds);
+    try {
+      const results = await Promise.all(
+        friendIds.map(async (friendId) => {
+          const [profileResult, messagesResult] = await Promise.all([
+            apiFetch<{ profile: UserProfile }>(`/users/${friendId}`).catch(() => null),
+            apiFetch<{ messages: Message[] }>(`/messages/with/${friendId}?limit=1`).catch(() => ({ messages: [] as Message[] }))
+          ]);
 
-    if (!profiles) return [];
+          if (!profileResult) return null;
 
-    await cacheProfiles(profiles as UserProfile[]);
+          await cacheProfiles([profileResult.profile]).catch(() => {});
 
-    const messagePromises = profiles.map(async (profile) => {
-      const [lastMessageResult, unreadCountResult] = await Promise.all([
-        supabase
-          .from('messages')
-          .select('*')
-          .or(
-            `and(sender_id.eq.${userId},receiver_id.eq.${profile.id}),and(sender_id.eq.${profile.id},receiver_id.eq.${userId})`
-          )
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle(),
+          const lastMessage = messagesResult.messages[messagesResult.messages.length - 1];
 
-        supabase
-          .from('messages')
-          .select('*', { count: 'exact', head: true })
-          .eq('sender_id', profile.id)
-          .eq('receiver_id', userId)
-          .eq('is_read', false)
-      ]);
+          return {
+            user_id: friendId,
+            status: 'accepted' as const,
+            profile: profileResult.profile,
+            lastMessage,
+            unreadCount: lastMessage && lastMessage.receiver_id === userId && !lastMessage.is_read ? 1 : 0
+          };
+        })
+      );
 
-      return {
-        user_id: profile.id,
-        status: 'accepted' as const,
-        profile: profile as UserProfile,
-        lastMessage: lastMessageResult.data as Message | undefined,
-        unreadCount: unreadCountResult.count || 0
-      };
-    });
-
-    const results = await Promise.all(messagePromises);
-
-    return results.sort((a, b) => {
-      const aTime = a.lastMessage?.created_at || '0';
-      const bTime = b.lastMessage?.created_at || '0';
-      return bTime.localeCompare(aTime);
-    });
+      return (results.filter(Boolean) as Contact[]).sort((a, b) => {
+        const aTime = a.lastMessage?.created_at || '0';
+        const bTime = b.lastMessage?.created_at || '0';
+        return bTime.localeCompare(aTime);
+      });
+    } catch {
+      return [];
+    }
   },
 
   /**
-   * Subscribe to messages realtime
+   * Subscribe to message events for this user, across every conversation.
+   * Backed by a single shared WebSocket (src/lib/realtimeClient.ts) instead
+   * of per-table Supabase subscriptions.
    */
   subscribeToMessages(
     userId: string,
     onNewMessage: (message: Message) => void,
     onUpdate: (message: Message) => void
   ) {
-    return supabase
-      .channel('messages_' + userId)
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages' },
-        async (payload) => {
-          const msg = payload.new as Message;
-          if (msg.sender_id === userId || msg.receiver_id === userId) {
-            const existingLocal = msg.client_message_id
-              ? await getMessageByClientId(msg.client_message_id)
-              : null;
+    const subs = [
+      realtimeClient.on('message:new', async (payload) => {
+        const msg = payload.message as Message;
+        if (msg.sender_id === userId || msg.receiver_id === userId) {
+          const existingLocal = msg.client_message_id
+            ? await getMessageByClientId(msg.client_message_id)
+            : null;
 
-            if (existingLocal && existingLocal.syncStatus === 'pending') {
-              await updateMessageSyncStatus(
-                existingLocal.id,
-                'sent',
-                msg.id,
-                msg.created_at
-              );
-            }
+          if (existingLocal && existingLocal.syncStatus === 'pending') {
+            await updateMessageSyncStatus(existingLocal.id, 'sent', msg.id, msg.created_at);
+          }
 
-            onNewMessage(msg);
-          }
+          onNewMessage(msg);
         }
-      )
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'messages' },
-        (payload) => {
-          const msg = payload.new as Message;
-          if (msg.sender_id === userId || msg.receiver_id === userId) {
-            onUpdate(msg);
-          }
+      }),
+      realtimeClient.on('message:edit', (payload) => {
+        const msg = payload.message as Message;
+        if (msg.sender_id === userId || msg.receiver_id === userId) {
+          onUpdate(msg);
         }
-      )
-      .subscribe();
+      }),
+      realtimeClient.on('message:delete', (payload) => {
+        if (payload.sender_id === userId || payload.receiver_id === userId) {
+          onUpdate({
+            id: payload.messageId,
+            sender_id: payload.sender_id,
+            receiver_id: payload.receiver_id,
+            is_deleted: true,
+            content: ''
+          } as Message);
+        }
+      }),
+      realtimeClient.on('message:reaction', (payload) => {
+        if (payload.sender_id === userId || payload.receiver_id === userId) {
+          onUpdate({
+            id: payload.messageId,
+            sender_id: payload.sender_id,
+            receiver_id: payload.receiver_id,
+            reactions: payload.reactions
+          } as Message);
+        }
+      })
+    ];
+
+    return { unsubscribe: () => subs.forEach((s) => s.unsubscribe()) };
   },
 
   /**
    * Subscribe to read receipts (for sender to know when their messages are read)
    */
   subscribeToReadReceipts(
-    userId: string,
+    _userId: string,
     onMessagesRead: (messageIds: string[]) => void
   ) {
-    return supabase
-      .channel(`read_receipts_${userId}`)
-      .on(
-        'broadcast',
-        { event: 'messages_read' },
-        (payload: { payload: { reader_id: string; message_ids: string[] } }) => {
-          if (payload.payload && payload.payload.message_ids) {
-            onMessagesRead(payload.payload.message_ids);
-          }
-        }
-      )
-      .subscribe();
+    return realtimeClient.on('message:read', (payload) => {
+      if (payload.message_ids) onMessagesRead(payload.message_ids);
+    });
   },
 
   /**
-   * Edit a sent message (only text messages, only by sender)
+   * Edit a sent message (only text messages, only by sender — enforced server-side too)
    */
   async editMessage(
     messageId: string,
-    senderId: string,
+    _senderId: string,
     newContent: string
   ): Promise<{ success: boolean; error?: string }> {
     try {
-      // First verify the message belongs to the sender
-      const { data: existingMessage, error: fetchError } = await supabase
-        .from('messages')
-        .select('sender_id, type, created_at')
-        .eq('id', messageId)
-        .single();
-
-      if (fetchError || !existingMessage) {
-        return { success: false, error: 'Message not found' };
-      }
-
-      if (existingMessage.sender_id !== senderId) {
-        return { success: false, error: 'You can only edit your own messages' };
-      }
-
-      if (existingMessage.type !== 'text') {
-        return { success: false, error: 'Only text messages can be edited' };
-      }
-
-      // Check if message is too old (optional: 15 minutes limit like WhatsApp)
-      const messageTime = new Date(existingMessage.created_at).getTime();
-      const now = Date.now();
-      const fifteenMinutes = 15 * 60 * 1000;
-
-      if (now - messageTime > fifteenMinutes) {
-        return { success: false, error: 'Messages can only be edited within 15 minutes' };
-      }
-
-      // Update the message
-      const { error: updateError } = await supabase
-        .from('messages')
-        .update({
-          content: newContent,
-          is_edited: true,
-          edited_at: new Date().toISOString()
-        })
-        .eq('id', messageId)
-        .eq('sender_id', senderId);
-
-      if (updateError) {
-        log.error('Failed to edit message', updateError, 'chatService');
-        return { success: false, error: updateError.message };
-      }
-
+      await apiFetch(`/messages/${messageId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ content: newContent })
+      });
       return { success: true };
-    } catch (error: any) {
+    } catch (error) {
       log.error('Edit message failed', error, 'chatService');
-      return { success: false, error: error.message || 'Failed to edit message' };
+      return { success: false, error: errorMessage(error, 'Failed to edit message') };
     }
   },
 
@@ -824,39 +659,31 @@ export const chatService = {
       for (const receiverId of receiverIds) {
         const clientMessageId = generateClientMessageId();
 
-        // Prepare forwarded message content
-        const forwardedContent = originalMessage.type === 'text'
-          ? originalMessage.content
-          : originalMessage.content; // For media, content contains the URL
-
-        const { error } = await supabase
-          .from('messages')
-          .insert({
-            sender_id: senderId,
-            receiver_id: receiverId,
-            content: forwardedContent,
-            type: originalMessage.type,
-            media_url: originalMessage.media_url,
-            thumbnail_url: originalMessage.thumbnail_url,
-            file_name: originalMessage.fileName,
-            file_size: originalMessage.fileSize,
-            duration: originalMessage.duration,
-            client_message_id: clientMessageId,
-            is_read: false,
-            is_deleted: false
+        try {
+          await apiFetch('/messages', {
+            method: 'POST',
+            body: JSON.stringify({
+              receiver_id: receiverId,
+              content: originalMessage.content,
+              type: originalMessage.type,
+              media_url: originalMessage.media_url,
+              thumbnail_url: originalMessage.thumbnail_url,
+              fileName: originalMessage.fileName,
+              fileSize: originalMessage.fileSize,
+              duration: originalMessage.duration,
+              client_message_id: clientMessageId
+            })
           });
-
-        if (!error) {
           sentCount++;
-        } else {
+        } catch (error) {
           log.error('Failed to forward message', error, 'chatService');
         }
       }
 
+      void senderId;
       return { success: sentCount > 0, sentCount };
     } catch (error: any) {
-      log.error('Forward to users failed', error, 'chatService');
-      return { success: false, sentCount, error: error.message };
+      return { success: false, sentCount, error: errorMessage(error, 'Failed to forward message') };
     }
   },
 
@@ -874,37 +701,27 @@ export const chatService = {
       for (const groupId of groupIds) {
         const clientMessageId = generateClientMessageId();
 
-        const forwardedContent = originalMessage.type === 'text'
-          ? originalMessage.content
-          : originalMessage.content;
-
-        const { error } = await supabase
-          .from('group_messages')
-          .insert({
-            group_id: groupId,
-            sender_id: senderId,
-            content: forwardedContent,
-            type: originalMessage.type,
-            media_url: originalMessage.media_url,
-            thumbnail_url: originalMessage.thumbnail_url,
-            file_name: originalMessage.fileName,
-            file_size: originalMessage.fileSize,
-            duration: originalMessage.duration,
-            client_message_id: clientMessageId,
-            is_deleted: false
+        try {
+          await apiFetch(`/groups/${groupId}/messages`, {
+            method: 'POST',
+            body: JSON.stringify({
+              content: originalMessage.content,
+              type: originalMessage.type,
+              media_url: originalMessage.media_url,
+              thumbnail_url: originalMessage.thumbnail_url,
+              client_message_id: clientMessageId
+            })
           });
-
-        if (!error) {
           sentCount++;
-        } else {
+        } catch (error) {
           log.error('Failed to forward message to group', error, 'chatService');
         }
       }
 
+      void senderId;
       return { success: sentCount > 0, sentCount };
     } catch (error: any) {
-      log.error('Forward to groups failed', error, 'chatService');
-      return { success: false, sentCount, error: error.message };
+      return { success: false, sentCount, error: errorMessage(error, 'Failed to forward message') };
     }
   },
 
@@ -946,19 +763,13 @@ export const chatService = {
 
             // Background fetch from server if online
             if (isOnline()) {
-              const { data: serverMessages } = await supabase
-                .from('messages')
-                .select('*')
-                .or(
-                  `and(sender_id.eq.${userId},receiver_id.eq.${contactId}),and(sender_id.eq.${contactId},receiver_id.eq.${userId})`
-                )
-                .order('created_at', { ascending: false })
-                .limit(limit);
+              const { messages: serverMessages } = await apiFetch<{ messages: Message[] }>(
+                `/messages/with/${contactId}?limit=${limit}`
+              );
 
               if (serverMessages && serverMessages.length > 0) {
-                const messages = serverMessages.reverse() as Message[];
                 messageCache.set(chatId, {
-                  messages,
+                  messages: serverMessages,
                   fetchedAt: Date.now()
                 });
 

@@ -18,7 +18,7 @@ import { profileService } from './services/profileService';
 import { callService } from './services/callService';
 import { GroupWithMembers } from './services/groupService';
 import { UserProfile, Contact, Call } from './types';
-import { supabase } from './supabaseClient';
+import { realtimeClient } from './lib/realtimeClient';
 import { useAppData } from './hooks/useAppData';
 
 type AppView = 'chats' | 'status' | 'groups' | 'discover' | 'history';
@@ -63,10 +63,8 @@ function App() {
           const id = await authService.getCurrentUserId();
           setUserId(id);
 
-          // Get email from session
-          const { data: { session } } = await supabase.auth.getSession();
-          if (session?.user?.email) {
-            setUserEmail(session.user.email);
+          if (authState.user?.email) {
+            setUserEmail(authState.user.email);
           }
         }
       } catch (error) {
@@ -107,53 +105,34 @@ function App() {
     };
   }, []);
 
-  // Update online status
+  // Update online status.
+  // The Worker derives is_online server-side from a presence heartbeat
+  // timestamp (see worker/src/routes/users.ts POST /presence) — there's no
+  // explicit "set offline" call; a user is simply considered offline once
+  // their last heartbeat is older than the server's threshold.
   useEffect(() => {
     if (!currentUser?.id) return;
 
-    // Set online
-    const setOnline = async () => {
-      await supabase
-        .from('profiles')
-        .update({ is_online: true, last_seen: new Date().toISOString() })
-        .eq('id', currentUser.id);
+    const sendHeartbeat = () => {
+      void profileService.updateLastSeen(currentUser.id);
     };
 
-    // Set offline
-    const setOffline = async () => {
-      await supabase
-        .from('profiles')
-        .update({ is_online: false, last_seen: new Date().toISOString() })
-        .eq('id', currentUser.id);
-    };
+    sendHeartbeat();
 
-    setOnline();
-
-    // Update on visibility change
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        setOnline();
-      } else {
-        setOffline();
+        sendHeartbeat();
       }
     };
 
-    // Update on beforeunload
-    const handleBeforeUnload = () => {
-      setOffline();
-    };
-
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('beforeunload', handleBeforeUnload);
 
     // Periodic heartbeat
-    const heartbeat = setInterval(setOnline, 30000);
+    const heartbeat = setInterval(sendHeartbeat, 30000);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('beforeunload', handleBeforeUnload);
       clearInterval(heartbeat);
-      setOffline();
     };
   }, [currentUser?.id]);
 
@@ -199,10 +178,8 @@ function App() {
       }
       setIsAuthenticated(true);
 
-      // Get email
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session?.user?.email) {
-        setUserEmail(session.user.email);
+      if (profile?.email) {
+        setUserEmail(profile.email);
       }
     }
   }, []);
@@ -274,6 +251,7 @@ function App() {
   }, []);
 
   const handleLogout = useCallback(() => {
+    realtimeClient.disconnect();
     setIsAuthenticated(false);
     setCurrentUser(null);
     setShowSettings(false);

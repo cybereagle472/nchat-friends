@@ -19,7 +19,7 @@ export const profileService = {
   // Get all profiles (for discover/find friends)
   async getAllProfiles(): Promise<UserProfile[]> {
     try {
-      const { profiles } = await apiFetch<{ profiles: UserProfile[] }>('/users/');
+      const { profiles } = await apiFetch<{ profiles: UserProfile[] }>('/users');
       return profiles.filter((p) => p.full_name && p.username);
     } catch (err) {
       console.error('Error fetching all profiles:', err);

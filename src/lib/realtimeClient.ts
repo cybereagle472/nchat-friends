@@ -1,46 +1,61 @@
 /**
- * Realtime client (replaces Supabase Realtime channels).
+ * Realtime client for the Cloudflare Worker backend (replaces Supabase
+ * Realtime channels).
  *
- * Opens one WebSocket per "room" against the Worker's Durable Object
- * (`/realtime/connect?room=...`), multiplexes multiple local subscribers
- * onto the same socket, and auto-reconnects with backoff.
+ * The Worker gives every logged-in user a personal room (`user:<id>`) and
+ * fans out every event relevant to them into it — new/edited/deleted
+ * messages, reactions, read receipts, friend requests/accepts, etc. So a
+ * single WebSocket per session is enough for the whole app: open it once,
+ * and let any service register interest in specific event `type`s.
  */
-import { wsUrlForRoom } from './apiClient';
+import { wsUrlForRoom, getCurrentUserId } from './apiClient';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type Handler = (data: any) => void;
+export type RealtimeHandler = (payload: any) => void;
 
-class RoomConnection {
-  private ws: WebSocket | null = null;
-  private handlers = new Set<Handler>();
-  private room: string;
+class RealtimeClient {
+  private socket: WebSocket | null = null;
+  private userId: string | null = null;
+  private handlers = new Map<string, Set<RealtimeHandler>>();
+  private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private reconnectDelay = 1000;
-  private closed = false;
+  private closedByClient = false;
 
-  constructor(room: string) {
-    this.room = room;
-    this.connect();
+  connect(userId: string) {
+    if (this.userId === userId && this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    this.disconnect();
+    this.userId = userId;
+    this.closedByClient = false;
+    this.open();
   }
 
-  private connect() {
-    if (this.closed) return;
+  private open() {
+    if (!this.userId) return;
     try {
-      this.ws = new WebSocket(wsUrlForRoom(this.room));
-      this.ws.onopen = () => {
-        this.reconnectDelay = 1000;
+      const url = wsUrlForRoom(`user:${this.userId}`);
+      const ws = new WebSocket(url);
+      this.socket = ws;
+
+      ws.onopen = () => {
+        this.reconnectAttempts = 0;
       };
-      this.ws.onmessage = (ev) => {
+
+      ws.onmessage = (event) => {
         try {
-          const data = JSON.parse(ev.data as string);
-          this.handlers.forEach((h) => h(data));
+          const data = JSON.parse(event.data);
+          if (data?.type) this.emit(data.type, data);
         } catch {
           /* ignore malformed frames */
         }
       };
-      this.ws.onclose = () => this.scheduleReconnect();
-      this.ws.onerror = () => {
-        this.ws?.close();
+
+      ws.onclose = () => {
+        if (!this.closedByClient) this.scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        ws.close();
       };
     } catch {
       this.scheduleReconnect();
@@ -48,61 +63,55 @@ class RoomConnection {
   }
 
   private scheduleReconnect() {
-    if (this.closed || this.reconnectTimer) return;
+    if (this.reconnectTimer) return;
+    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 15000);
+    this.reconnectAttempts++;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      this.reconnectDelay = Math.min(this.reconnectDelay * 1.5, 15000);
-      this.connect();
-    }, this.reconnectDelay);
+      if (!this.closedByClient && this.userId) this.open();
+    }, delay);
   }
 
-  send(data: unknown) {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(data));
-  }
-
-  subscribe(handler: Handler): () => void {
-    this.handlers.add(handler);
-    return () => this.handlers.delete(handler);
-  }
-
-  release() {
-    this.closed = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.ws?.close();
-  }
-}
-
-const rooms = new Map<string, { conn: RoomConnection; refCount: number }>();
-
-/** Subscribe to a room; returns an unsubscribe function. Connections are ref-counted and shared. */
-export function joinRoom(room: string, handler: Handler): () => void {
-  let entry = rooms.get(room);
-  if (!entry) {
-    entry = { conn: new RoomConnection(room), refCount: 0 };
-    rooms.set(room, entry);
-  }
-  entry.refCount++;
-  const unsubscribe = entry.conn.subscribe(handler);
-  return () => {
-    unsubscribe();
-    entry!.refCount--;
-    if (entry!.refCount <= 0) {
-      entry!.conn.release();
-      rooms.delete(room);
+  disconnect() {
+    this.closedByClient = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
-  };
+    this.socket?.close();
+    this.socket = null;
+    this.userId = null;
+  }
+
+  on(type: string, handler: RealtimeHandler): { unsubscribe: () => void } {
+    // Make sure a connection exists even if connect() wasn't called yet
+    // (e.g. a service subscribes before the app's top-level effect runs).
+    const uid = this.userId || getCurrentUserId();
+    if (uid) this.connect(uid);
+
+    let set = this.handlers.get(type);
+    if (!set) {
+      set = new Set();
+      this.handlers.set(type, set);
+    }
+    set.add(handler);
+
+    return {
+      unsubscribe: () => {
+        set?.delete(handler);
+      }
+    };
+  }
+
+  private emit(type: string, payload: any) {
+    this.handlers.get(type)?.forEach((h) => {
+      try {
+        h(payload);
+      } catch (err) {
+        console.error('[realtimeClient] handler error:', err);
+      }
+    });
+  }
 }
 
-export function sendToRoom(room: string, data: unknown) {
-  rooms.get(room)?.conn.send(data);
-}
-
-export function dmRoomId(userA: string, userB: string): string {
-  return `dm:${[userA, userB].sort().join(':')}`;
-}
-export function groupRoomId(groupId: string): string {
-  return `group:${groupId}`;
-}
-export function userRoomId(userId: string): string {
-  return `user:${userId}`;
-}
+export const realtimeClient = new RealtimeClient();

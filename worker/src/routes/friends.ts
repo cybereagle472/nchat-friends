@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Env, Variables } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { newId } from '../lib/id';
+import { broadcastToUser } from '../lib/realtime';
 
 const friends = new Hono<{ Bindings: Env; Variables: Variables }>();
 friends.use('*', requireAuth);
@@ -48,6 +49,12 @@ friends.post('/request', async (c) => {
     .bind(id, userId, receiver_id)
     .run();
 
+  const sender = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+  await broadcastToUser(c.env, receiver_id, {
+    type: 'friend:request',
+    request: { id, sender_id: userId, receiver_id, status: 'pending', sender_profile: sender ? profilePublic(sender) : undefined },
+  });
+
   return c.json({ success: true, id }, 201);
 });
 
@@ -72,10 +79,17 @@ friends.post('/:id/respond', async (c) => {
         'INSERT OR IGNORE INTO friendships (id, user1_id, user2_id) VALUES (?, ?, ?)'
       ).bind(friendshipId, req.sender_id, req.receiver_id),
     ]);
+
+    const accepter = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+    await broadcastToUser(c.env, req.sender_id, {
+      type: 'friend:accepted',
+      friend: accepter ? profilePublic(accepter) : { id: userId },
+    });
   } else {
     await c.env.DB.prepare("UPDATE friend_requests SET status = 'rejected', updated_at = datetime('now') WHERE id = ?")
       .bind(requestId)
       .run();
+    await broadcastToUser(c.env, req.sender_id, { type: 'friend:declined', userId });
   }
   return c.json({ success: true });
 });
@@ -121,11 +135,15 @@ friends.get('/requests', async (c) => {
 friends.get('/sent', async (c) => {
   const userId = c.get('userId');
   const { results } = await c.env.DB.prepare(
-    `SELECT receiver_id FROM friend_requests WHERE sender_id = ? AND status = 'pending'`
+    `SELECT id, receiver_id, created_at, updated_at FROM friend_requests WHERE sender_id = ? AND status = 'pending'`
   )
     .bind(userId)
-    .all<{ receiver_id: string }>();
-  return c.json({ receiverIds: (results ?? []).map((r) => r.receiver_id) });
+    .all<{ id: string; receiver_id: string; created_at: string; updated_at: string }>();
+  const rows = results ?? [];
+  return c.json({
+    receiverIds: rows.map((r) => r.receiver_id),
+    requests: rows.map((r) => ({ id: r.id, receiver_id: r.receiver_id, created_at: r.created_at, updated_at: r.updated_at })),
+  });
 });
 
 friends.get('/', async (c) => {

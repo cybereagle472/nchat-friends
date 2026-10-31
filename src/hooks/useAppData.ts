@@ -15,7 +15,7 @@ import { groupService, GroupWithMembers } from '../services/groupService';
 import { callService } from '../services/callService';
 import { profileService } from '../services/profileService';
 import { Contact, UserProfile, FriendRequest, CallHistory } from '../types';
-import { supabase } from '../supabaseClient';
+import { realtimeClient } from '../lib/realtimeClient';
 
 // ============================================
 // INSTANT CACHE UTILITIES
@@ -440,11 +440,6 @@ export function useAppData(userId: string) {
     [refreshChats]
   );
 
-  const debouncedRefreshFriends = useMemo(
-    () => debounce(refreshFriends, 300),
-    [refreshFriends]
-  );
-
   const debouncedRefreshGroups = useMemo(
     () => debounce(refreshGroups, 300),
     [refreshGroups]
@@ -464,9 +459,15 @@ export function useAppData(userId: string) {
     [refreshFriends, refreshRequests]
   );
 
-  // Set up real-time subscriptions with DEBOUNCED callbacks
+  // Set up real-time subscriptions with DEBOUNCED callbacks.
+  // Messages and friend events arrive instantly over the shared per-user
+  // WebSocket (src/lib/realtimeClient.ts, backed by the Worker's Durable
+  // Objects). Groups/calls don't have that wiring yet, so they fall back to
+  // light polling in the meantime — still "actually works", just not instant.
   useEffect(() => {
-    // Messages subscription - debounced to batch rapid messages
+    realtimeClient.connect(userId);
+
+    // Messages - debounced to batch rapid messages
     const messagesChannel = chatService.subscribeToMessages(
       userId,
       () => debouncedRefreshChats(),
@@ -474,54 +475,24 @@ export function useAppData(userId: string) {
     );
     subscriptionsRef.current.push(messagesChannel);
 
-    // Friend requests subscription - combined debounced callback
-    const friendsChannel = supabase
-      .channel('app_friends_' + userId)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests' }, () => {
-        debouncedRefreshFriendsAndRequests();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'friendships' }, () => {
-        debouncedRefreshFriendsAndRequests();
-      })
-      .subscribe();
-    subscriptionsRef.current.push(friendsChannel);
+    // Friend requests sent to me, and acceptances of requests I sent
+    const friendRequestSub = realtimeClient.on('friend:request', () => debouncedRefreshFriendsAndRequests());
+    const friendAcceptedSub = realtimeClient.on('friend:accepted', () => debouncedRefreshFriendsAndRequests());
+    const friendDeclinedSub = realtimeClient.on('friend:declined', () => debouncedRefreshFriendsAndRequests());
+    subscriptionsRef.current.push(friendRequestSub, friendAcceptedSub, friendDeclinedSub);
 
-    // Groups subscription
-    const groupsChannel = supabase
-      .channel('app_groups_' + userId)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'group_members', filter: `user_id=eq.${userId}` }, () => {
-        debouncedRefreshGroups();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'group_messages' }, () => {
-        debouncedRefreshGroups();
-      })
-      .subscribe();
-    subscriptionsRef.current.push(groupsChannel);
-
-    // Profiles subscription (for online status) - debounced
-    const profilesChannel = supabase
-      .channel('app_profiles_' + userId)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles' }, () => {
-        debouncedRefreshFriends();
-        debouncedRefreshChats();
-      })
-      .subscribe();
-    subscriptionsRef.current.push(profilesChannel);
-
-    // Call history subscription
-    const callsChannel = supabase
-      .channel('app_calls_' + userId)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'calls' }, () => {
-        debouncedRefreshCallHistory();
-      })
-      .subscribe();
-    subscriptionsRef.current.push(callsChannel);
+    // Groups / call history: poll periodically until they get dedicated
+    // realtime events of their own.
+    const groupsInterval = setInterval(() => debouncedRefreshGroups(), 20000);
+    const callsInterval = setInterval(() => debouncedRefreshCallHistory(), 30000);
 
     return () => {
       subscriptionsRef.current.forEach(sub => sub.unsubscribe());
       subscriptionsRef.current = [];
+      clearInterval(groupsInterval);
+      clearInterval(callsInterval);
     };
-  }, [userId, debouncedRefreshChats, debouncedRefreshFriends, debouncedRefreshGroups, debouncedRefreshFriendsAndRequests, debouncedRefreshCallHistory]);
+  }, [userId, debouncedRefreshChats, debouncedRefreshGroups, debouncedRefreshFriendsAndRequests, debouncedRefreshCallHistory]);
 
   return {
     ...data,

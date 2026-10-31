@@ -31,3 +31,9 @@ export async function broadcastToRoom(env: Env, roomId: string, payload: unknown
     headers: { 'Content-Type': 'application/json' },
   });
 }
+
+/** Convenience wrapper: send an event straight to a user's personal room. */
+export async function broadcastToUser(env: Env, userId: string, payload: unknown): Promise<void> {
+  await broadcastToRoom(env, userRoomId(userId), payload);
+}
+
