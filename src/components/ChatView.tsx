@@ -1742,33 +1742,42 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           {voiceState.isLocked ? (
             // Locked Recording Mode
             <div className="px-4 py-3">
+              {/* `min-w-0` + `overflow-hidden` on the waveform cell and
+                  `shrink-0` on every other control are both required here:
+                  this row used to render up to 50 fixed-width (4px) bars
+                  inside a plain `flex-1` cell, which has no min-width
+                  override by default — flexbox's automatic minimum size
+                  for a non-wrapping row of fixed-width children is the sum
+                  of their widths, so the cell refused to shrink below
+                  ~400px and pushed the pause/duration/send buttons straight
+                  off the right edge of the screen on real phones. */}
               <div className="flex items-center gap-3">
                 <button
                   onClick={() => stopRecording(true)}
-                  className="w-10 h-10 rounded-full bg-red-100 text-red-500 flex items-center justify-center hover:bg-red-200 transition-colors"
+                  className="w-10 h-10 shrink-0 rounded-full bg-red-100 text-red-500 flex items-center justify-center hover:bg-red-200 transition-colors"
                 >
                   <Trash2 className="w-5 h-5" />
                 </button>
 
                 {/* Real-time Waveform */}
-                <div className="flex-1 flex items-center gap-1 h-10 px-2">
-                  {voiceState.waveformData.map((value, i) => (
+                <div className="flex-1 min-w-0 overflow-hidden flex items-center gap-1 h-10 px-2">
+                  {voiceState.waveformData.slice(-18).map((value, i) => (
                     <div
                       key={i}
-                      className={`w-1 bg-violet-500 rounded-full transition-all duration-75 ${voiceState.isPaused ? 'opacity-50' : ''}`}
+                      className={`w-1 shrink-0 bg-violet-500 rounded-full transition-all duration-75 ${voiceState.isPaused ? 'opacity-50' : ''}`}
                       style={{ height: `${Math.max(4, value * 32)}px` }}
                     />
                   ))}
                   {/* Fill remaining space with placeholder bars */}
-                  {Array.from({ length: Math.max(0, 50 - voiceState.waveformData.length) }).map((_, i) => (
-                    <div key={`placeholder-${i}`} className="w-1 h-1 bg-slate-300 rounded-full" />
+                  {Array.from({ length: Math.max(0, 18 - voiceState.waveformData.length) }).map((_, i) => (
+                    <div key={`placeholder-${i}`} className="w-1 h-1 shrink-0 bg-slate-300 rounded-full" />
                   ))}
                 </div>
 
                 {/* Pause / Resume the locked recording in place */}
                 <button
                   onClick={() => (voiceState.isPaused ? resumeRecording() : pauseRecording())}
-                  className="w-10 h-10 rounded-full bg-violet-100 text-violet-600 flex items-center justify-center hover:bg-violet-200 transition-colors"
+                  className="w-10 h-10 shrink-0 rounded-full bg-violet-100 text-violet-600 flex items-center justify-center hover:bg-violet-200 transition-colors"
                   aria-label={voiceState.isPaused ? 'Resume recording' : 'Pause recording'}
                 >
                   {voiceState.isPaused ? (
@@ -1778,7 +1787,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
                   )}
                 </button>
 
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 shrink-0">
                   <div className={`w-2 h-2 rounded-full bg-red-500 ${voiceState.isPaused ? '' : 'animate-pulse'}`} />
                   <span className="text-sm font-semibold text-slate-700 tabular-nums min-w-[40px]">
                     {formatDuration(voiceState.duration)}
@@ -1788,7 +1797,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
                 <button
                   onClick={() => stopRecording(false)}
-                  className="w-10 h-10 rounded-full bg-gradient-to-r from-violet-500 to-purple-500 text-white flex items-center justify-center shadow-lg"
+                  className="w-10 h-10 shrink-0 rounded-full bg-gradient-to-r from-violet-500 to-purple-500 text-white flex items-center justify-center shadow-lg"
                 >
                   <Send className="w-5 h-5" />
                 </button>
@@ -2583,6 +2592,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           display: flex;
           align-items: center;
           gap: 2px;
+          flex-shrink: 0;
           color: rgba(255, 255, 255, 0.7);
           font-size: 12px;
           animation: slide-hint 1.5s ease-in-out infinite;
@@ -2608,11 +2618,13 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           justify-content: center;
           gap: 2px;
           height: 32px;
-          min-width: 80px;
+          min-width: 0;
+          overflow: hidden;
         }
 
         .voice-waveform-bar {
           width: 3px;
+          flex-shrink: 0;
           background: rgba(255, 255, 255, 0.8);
           border-radius: 2px;
           transition: height 0.05s ease;
@@ -2623,6 +2635,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           display: flex;
           align-items: center;
           gap: 12px;
+          flex-shrink: 0;
         }
 
         .voice-duration {
