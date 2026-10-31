@@ -6,6 +6,7 @@ import { typingService } from '../services/typingService';
 import { groupService, GroupWithMembers } from '../services/groupService';
 import { friendService } from '../services/friendService';
 import { getChatId, getChatMessages, saveMessages, LocalMessage } from '../utils/offlineStorage';
+import { presenceStatusText } from '../utils/presenceFormat';
 import { Message, UserProfile, Contact } from '../types';
 import { MessageActions, ForwardDialog, ReactionsDisplay } from './MessageActions';
 
@@ -203,13 +204,20 @@ interface MediaViewerState {
 }
 
 export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: ChatViewProps) {
-  const [messages, setMessages] = useState<Message[]>([]);
+  // Seed state synchronously from the in-memory cache (if warm) so reopening a
+  // chat you just viewed never renders an empty/skeleton frame before
+  // painting — this is what eliminates the visible "blink" on reopen.
+  const [messages, setMessages] = useState<Message[]>(
+    () => chatService.getCachedMessages(currentUser.id, contact.user_id) || []
+  );
   const [inputMessage, setInputMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [showMediaOptions, setShowMediaOptions] = useState(false);
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [isInitialLoad, setIsInitialLoad] = useState(
+    () => !(chatService.getCachedMessages(currentUser.id, contact.user_id)?.length)
+  );
 
   // Menu and Block states
   const [showMenu, setShowMenu] = useState(false);
@@ -443,14 +451,12 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     prevMessagesLengthRef.current = messages.length;
   }, [messages.length]);
 
-  // Debounced typing indicator - prevents lag on fast typing
-  const debouncedSendTyping = useMemo(
-    () => debounce(() => {
-      typingService.sendTyping(currentUser.id, contact.user_id);
-    }, 300),
-    [currentUser.id, contact.user_id]
-  );
-
+  // "Stopped typing" fires once, 2s after the user's last keystroke.
+  // (typingService.sendTyping already throttles "is typing" internally —
+  // it sends instantly on the first keystroke and at most once every 500ms
+  // after that, so it must be called directly on every keystroke rather
+  // than behind an extra debounce, otherwise the very first signal gets
+  // delayed and the indicator feels laggy instead of instant like WhatsApp.)
   const debouncedStopTyping = useMemo(
     () => debounce(() => {
       typingService.sendStoppedTyping(currentUser.id, contact.user_id);
@@ -463,10 +469,10 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     // Update state immediately (React batches this)
     setInputMessage(value);
 
-    // Non-blocking typing indicator
-    debouncedSendTyping();
+    // Non-blocking typing indicator — instant start, auto-expiring stop
+    typingService.sendTyping(currentUser.id, contact.user_id);
     debouncedStopTyping();
-  }, [debouncedSendTyping, debouncedStopTyping]);
+  }, [currentUser.id, contact.user_id, debouncedStopTyping]);
 
   const handleSendMessage = async () => {
     if (!inputMessage.trim() || sending) return;
@@ -1372,13 +1378,20 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
           <div className="flex-1 min-w-0">
             <h2 className="text-base font-semibold truncate">{contact.profile.full_name}</h2>
-            <p className="text-xs text-white/80">
+            <p key={isTyping ? 'typing' : 'status'} className="text-xs text-white/80 h-4 flex items-center animate-fade-in">
               {isTyping ? (
-                <span className="text-green-300">typing...</span>
-              ) : contact.profile.is_online ? (
-                'Online'
+                <span className="flex items-center gap-1.5 text-green-300 font-medium">
+                  typing
+                  <span className="flex items-end gap-0.5 h-2">
+                    <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '0ms' }} />
+                    <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '150ms' }} />
+                    <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '300ms' }} />
+                  </span>
+                </span>
               ) : (
-                'Offline'
+                <span className={contact.profile.is_online ? 'text-green-300 font-medium' : ''}>
+                  {presenceStatusText(contact.profile.is_online, contact.profile.last_seen)}
+                </span>
               )}
             </p>
           </div>
@@ -1485,7 +1498,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         ) : (
           messages.map((message) => (
             <MessageBubble
-              key={message.id || message.client_message_id}
+              key={message.client_message_id || message.id}
               message={message}
               isOwn={message.sender_id === currentUser.id}
               currentUserId={currentUser.id}

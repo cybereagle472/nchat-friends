@@ -514,7 +514,9 @@ export const chatService = {
           email: row.profile.email || '',
           full_name: row.profile.full_name || '',
           username: row.profile.username,
-          avatar_url: row.profile.avatar_url
+          avatar_url: row.profile.avatar_url,
+          is_online: row.profile.is_online,
+          last_seen: row.profile.last_seen
         } as UserProfile,
         lastMessage: row.lastMessage as Message | undefined,
         unreadCount: Number(row.unreadCount) || 0

@@ -121,6 +121,21 @@
   animation: float 3s ease-in-out infinite;
 }
 
+@keyframes typingDotBounce {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.6;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+.typing-dot {
+  animation: typingDotBounce 1.4s ease-in-out infinite;
+}
+
 @keyframes scaleIn {
   from {
     transform: scale(0.92);

@@ -22,6 +22,7 @@ import {
   Users
 } from 'lucide-react';
 import { friendService } from '../services/friendService';
+import { presenceStatusText } from '../utils/presenceFormat';
 import { UserProfile, FriendRequest, Contact } from '../types';
 
 interface Friend {
@@ -368,7 +369,7 @@ export function Discover({
                         {friend.profile.is_online ? (
                           <span className="text-green-600 font-medium">Online</span>
                         ) : (
-                          friend.profile.last_seen ? `Last seen ${new Date(friend.profile.last_seen).toLocaleDateString()}` : 'Offline'
+                          presenceStatusText(friend.profile.is_online, friend.profile.last_seen)
                         )}
                       </p>
                     </div>
