@@ -217,6 +217,9 @@ interface VoiceRecordingState {
   startX: number;
   currentX: number;
   waveformData: number[];
+  // 0-1 progress toward the swipe-up-to-lock threshold, drives the lock
+  // icon sliding up as visual feedback (WhatsApp-style) while recording.
+  lockProgress: number;
 }
 
 // Media Viewer State
@@ -256,8 +259,18 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     isCancelling: false,
     startX: 0,
     currentX: 0,
-    waveformData: []
+    waveformData: [],
+    lockProgress: 0
   });
+  // Brief "Hold to record a voice message" nudge shown when a press is too
+  // short/still to have been a deliberate recording (see MIN_HOLD_MS below).
+  const [showHoldHint, setShowHoldHint] = useState(false);
+  const holdHintTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const flashHoldHint = useCallback(() => {
+    setShowHoldHint(true);
+    if (holdHintTimeoutRef.current) clearTimeout(holdHintTimeoutRef.current);
+    holdHintTimeoutRef.current = setTimeout(() => setShowHoldHint(false), 1800);
+  }, []);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -808,7 +821,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         duration: 0,
         isLocked: false,
         isCancelling: false,
-        waveformData: []
+        waveformData: [],
+        lockProgress: 0
       }));
 
       // Start real-time waveform analysis
@@ -848,7 +862,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         isCancelling: false,
         startX: 0,
         currentX: 0,
-        waveformData: []
+        waveformData: [],
+        lockProgress: 0
       });
     }
   };
@@ -886,7 +901,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
       isCancelling: false,
       startX: 0,
       currentX: 0,
-      waveformData: []
+      waveformData: [],
+      lockProgress: 0
     });
   };
 
@@ -928,12 +944,28 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   // Track if we're currently in a voice recording drag gesture
   const isRecordingGestureRef = useRef(false);
   const startXRef = useRef(0);
+  const recordingTouchStartedAtRef = useRef(0);
+  // The mic button unmounts the instant recording starts (swapped for the
+  // recording overlay below), so voiceButtonRef.current is null for the
+  // rest of the gesture — its position must be captured up front here,
+  // otherwise swipe-up-to-lock can never detect anything.
+  const recordingButtonRectRef = useRef<DOMRect | null>(null);
+
+  const LOCK_SWIPE_UP_PX = 60;
+  const CANCEL_SWIPE_PX = 100;
+  // Below this hold duration (with negligible drag) a press is almost
+  // certainly an accidental tap rather than a deliberate recording, so it's
+  // cancelled instead of sending a near-silent sliver of a voice message —
+  // mirrors WhatsApp's "hold to record" behavior.
+  const MIN_HOLD_MS = 300;
 
   const handleVoiceButtonTouchStart = (e: React.TouchEvent | React.MouseEvent) => {
     e.preventDefault();
     const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
     startXRef.current = clientX;
+    recordingTouchStartedAtRef.current = Date.now();
     isRecordingGestureRef.current = true;
+    recordingButtonRectRef.current = voiceButtonRef.current?.getBoundingClientRect() ?? null;
     setVoiceState(prev => ({ ...prev, startX: clientX, currentX: clientX }));
     startRecording();
 
@@ -944,28 +976,40 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     }
   };
 
+  // Shared drag-update logic for both mouse and touch move handlers.
+  const applyVoiceDrag = (clientX: number, clientY: number, prev: VoiceRecordingState): VoiceRecordingState => {
+    const swipeDistance = startXRef.current - clientX;
+    const buttonRect = recordingButtonRectRef.current;
+
+    let isLocked = prev.isLocked;
+    let lockProgress = prev.lockProgress;
+
+    if (prev.isLocked) {
+      lockProgress = 1;
+    } else if (buttonRect) {
+      const liftPx = buttonRect.top - clientY;
+      lockProgress = Math.max(0, Math.min(1, liftPx / LOCK_SWIPE_UP_PX));
+      if (liftPx > LOCK_SWIPE_UP_PX) {
+        isLocked = true;
+        lockProgress = 1;
+        if (typeof navigator !== 'undefined' && navigator.vibrate) {
+          navigator.vibrate(15);
+        }
+      }
+    }
+
+    return {
+      ...prev,
+      currentX: clientX,
+      isLocked,
+      lockProgress,
+      isCancelling: swipeDistance > CANCEL_SWIPE_PX
+    };
+  };
+
   const handleGlobalMouseMove = useCallback((e: MouseEvent) => {
     if (!isRecordingGestureRef.current) return;
-
-    const clientX = e.clientX;
-    const clientY = e.clientY;
-    const swipeDistance = startXRef.current - clientX;
-
-    setVoiceState(prev => {
-      // Check for lock (swipe up)
-      const buttonRect = voiceButtonRef.current?.getBoundingClientRect();
-      let isLocked = prev.isLocked;
-      if (buttonRect && clientY < buttonRect.top - 60 && !prev.isLocked) {
-        isLocked = true;
-      }
-
-      return {
-        ...prev,
-        currentX: clientX,
-        isLocked,
-        isCancelling: swipeDistance > 100
-      };
-    });
+    setVoiceState(prev => applyVoiceDrag(e.clientX, e.clientY, prev));
   }, []);
 
   const handleGlobalMouseUp = useCallback(() => {
@@ -982,7 +1026,12 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
       }
 
       const swipeDistance = startXRef.current - prev.currentX;
-      if (prev.isCancelling || swipeDistance > 100) {
+      const heldMs = Date.now() - recordingTouchStartedAtRef.current;
+      if (heldMs < MIN_HOLD_MS && Math.abs(swipeDistance) < 10) {
+        // Too brief to be a deliberate recording — treat as an accidental tap.
+        setTimeout(() => stopRecording(true), 0);
+        flashHoldHint();
+      } else if (prev.isCancelling || swipeDistance > CANCEL_SWIPE_PX) {
         // Cancel recording
         setTimeout(() => stopRecording(true), 0);
       } else {
@@ -998,23 +1047,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
     const clientX = e.touches[0].clientX;
     const clientY = e.touches[0].clientY;
-    const swipeDistance = startXRef.current - clientX;
-
-    setVoiceState(prev => {
-      // Check for lock (swipe up)
-      const buttonRect = voiceButtonRef.current?.getBoundingClientRect();
-      let isLocked = prev.isLocked;
-      if (buttonRect && clientY < buttonRect.top - 60 && !prev.isLocked) {
-        isLocked = true;
-      }
-
-      return {
-        ...prev,
-        currentX: clientX,
-        isLocked,
-        isCancelling: swipeDistance > 100
-      };
-    });
+    setVoiceState(prev => applyVoiceDrag(clientX, clientY, prev));
   };
 
   const handleVoiceButtonTouchEnd = () => {
@@ -1027,7 +1060,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     }
 
     const swipeDistance = startXRef.current - voiceState.currentX;
-    if (voiceState.isCancelling || swipeDistance > 100) {
+    const heldMs = Date.now() - recordingTouchStartedAtRef.current;
+    if (heldMs < MIN_HOLD_MS && Math.abs(swipeDistance) < 10) {
+      stopRecording(true);
+      flashHoldHint();
+    } else if (voiceState.isCancelling || swipeDistance > CANCEL_SWIPE_PX) {
       stopRecording(true);
     } else {
       stopRecording(false);
@@ -1036,9 +1073,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
   // Cleanup global event listeners on unmount
   useEffect(() => {
+
     return () => {
       document.removeEventListener('mousemove', handleGlobalMouseMove);
       document.removeEventListener('mouseup', handleGlobalMouseUp);
+      if (holdHintTimeoutRef.current) clearTimeout(holdHintTimeoutRef.current);
     };
   }, [handleGlobalMouseMove, handleGlobalMouseUp]);
 
@@ -1680,8 +1719,18 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
                     <span>{formatDuration(voiceState.duration)}</span>
                   </div>
 
-                  {/* Lock indicator - swipe up to lock */}
-                  <div className="voice-lock-hint">
+                  {/* Lock indicator - swipe up to lock. Slides up and
+                      brightens as the user drags toward the threshold, so
+                      the gesture has clear visual feedback instead of
+                      snapping on/off with no warning. */}
+                  <div
+                    className="voice-lock-hint"
+                    style={{
+                      transform: `translateY(${-voiceState.lockProgress * 10}px)`,
+                      opacity: 0.55 + voiceState.lockProgress * 0.45
+                    }}
+                  >
+                    <ChevronLeft className="w-3 h-3 rotate-90 -mb-1 opacity-70" />
                     <Lock className="w-3.5 h-3.5" />
                   </div>
                 </div>
@@ -1819,16 +1868,23 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
                   <Send className={`w-5 h-5 transition-opacity ${sending ? 'opacity-50' : ''}`} strokeWidth={2} />
                 </button>
               ) : (
-                <button
-                  ref={voiceButtonRef}
-                  onTouchStart={handleVoiceButtonTouchStart}
-                  onTouchMove={handleVoiceButtonTouchMove}
-                  onTouchEnd={handleVoiceButtonTouchEnd}
-                  onMouseDown={handleVoiceButtonTouchStart}
-                  className="chat-voice-btn"
-                >
-                  <Mic className="w-5 h-5" strokeWidth={2} />
-                </button>
+                <div className="relative">
+                  {showHoldHint && (
+                    <div className="voice-hold-hint">
+                      Hold to record a voice message
+                    </div>
+                  )}
+                  <button
+                    ref={voiceButtonRef}
+                    onTouchStart={handleVoiceButtonTouchStart}
+                    onTouchMove={handleVoiceButtonTouchMove}
+                    onTouchEnd={handleVoiceButtonTouchEnd}
+                    onMouseDown={handleVoiceButtonTouchStart}
+                    className="chat-voice-btn"
+                  >
+                    <Mic className="w-5 h-5" strokeWidth={2} />
+                  </button>
+                </div>
               )}
             </div>
           </div>
@@ -2092,6 +2148,37 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           user-select: none;
           -webkit-user-select: none;
           touch-action: none;
+        }
+
+        .voice-hold-hint {
+          position: absolute;
+          bottom: calc(100% + 10px);
+          right: 0;
+          white-space: nowrap;
+          background: rgba(30, 27, 46, 0.92);
+          color: white;
+          font-size: 12.5px;
+          font-weight: 500;
+          padding: 7px 12px;
+          border-radius: 10px;
+          box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+          animation: hold-hint-pop 0.18s ease-out;
+          pointer-events: none;
+          z-index: 5;
+        }
+
+        .voice-hold-hint::after {
+          content: '';
+          position: absolute;
+          top: 100%;
+          right: 16px;
+          border: 5px solid transparent;
+          border-top-color: rgba(30, 27, 46, 0.92);
+        }
+
+        @keyframes hold-hint-pop {
+          from { opacity: 0; transform: translateY(4px); }
+          to { opacity: 1; transform: translateY(0); }
         }
 
         .chat-send-btn:hover,
@@ -2415,6 +2502,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
         .voice-lock-hint {
           display: flex;
+          flex-direction: column;
           align-items: center;
           justify-content: center;
           width: 32px;
@@ -2422,12 +2510,10 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           background: rgba(255, 255, 255, 0.2);
           border-radius: 50%;
           color: rgba(255, 255, 255, 0.8);
-          animation: lock-bounce 2s ease-in-out infinite;
-        }
-
-        @keyframes lock-bounce {
-          0%, 100% { transform: translateY(0); }
-          50% { transform: translateY(-3px); }
+          /* Position/opacity are driven live by how far the user has
+             dragged up toward the lock threshold (see lockProgress), this
+             transition just smooths out the per-frame updates. */
+          transition: transform 0.08s linear, opacity 0.08s linear;
         }
 
         .voice-mic-float {
