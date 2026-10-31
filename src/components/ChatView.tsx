@@ -734,6 +734,63 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   // Track if recording was cancelled (ref for closure)
   const isCancellingRef = useRef(false);
 
+  // Real-time waveform sampling loop — pulled out to component scope (not
+  // just a local closure inside startRecording) so pauseRecording/
+  // resumeRecording can stop and restart the exact same loop.
+  const updateWaveform = useCallback(() => {
+    if (!analyserRef.current) return;
+
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+    analyserRef.current.getByteFrequencyData(dataArray);
+
+    // Get average amplitude from frequency data
+    const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+    const normalizedValue = average / 255;
+    fullWaveformRef.current.push(normalizedValue);
+
+    setVoiceState(prev => ({
+      ...prev,
+      waveformData: [...prev.waveformData.slice(-49), normalizedValue]
+    }));
+
+    animationFrameRef.current = requestAnimationFrame(updateWaveform);
+  }, []);
+
+  const startDurationTimer = useCallback(() => {
+    if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current);
+    recordingIntervalRef.current = setInterval(() => {
+      setVoiceState(prev => ({ ...prev, duration: prev.duration + 1 }));
+    }, 1000);
+  }, []);
+
+  // Pause/resume a *locked* recording in place (same clip, same upload at
+  // the end) — mirrors WhatsApp's locked-recording pause button. Recording
+  // must be locked first since while the mic button is still being held
+  // there's no separate tap target for this.
+  const pauseRecording = useCallback(() => {
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.pause();
+    }
+    if (recordingIntervalRef.current) {
+      clearInterval(recordingIntervalRef.current);
+      recordingIntervalRef.current = null;
+    }
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    setVoiceState(prev => ({ ...prev, isPaused: true }));
+  }, []);
+
+  const resumeRecording = useCallback(() => {
+    if (mediaRecorderRef.current?.state === 'paused') {
+      mediaRecorderRef.current.resume();
+    }
+    setVoiceState(prev => ({ ...prev, isPaused: false }));
+    startDurationTimer();
+    updateWaveform();
+  }, [startDurationTimer, updateWaveform]);
+
   // Voice Recording Functions with Real-time Waveform
   const startRecording = async () => {
     console.log('Starting voice recording...');
@@ -818,6 +875,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
       setVoiceState(prev => ({
         ...prev,
         isRecording: true,
+        isPaused: false,
         duration: 0,
         isLocked: false,
         isCancelling: false,
@@ -825,31 +883,9 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         lockProgress: 0
       }));
 
-      // Start real-time waveform analysis
-      const updateWaveform = () => {
-        if (!analyserRef.current) return;
-
-        const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
-        analyserRef.current.getByteFrequencyData(dataArray);
-
-        // Get average amplitude from frequency data
-        const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-        const normalizedValue = average / 255;
-        fullWaveformRef.current.push(normalizedValue);
-
-        setVoiceState(prev => ({
-          ...prev,
-          waveformData: [...prev.waveformData.slice(-49), normalizedValue]
-        }));
-
-        animationFrameRef.current = requestAnimationFrame(updateWaveform);
-      };
-
+      // Start real-time waveform analysis + duration timer
       updateWaveform();
-
-      recordingIntervalRef.current = setInterval(() => {
-        setVoiceState(prev => ({ ...prev, duration: prev.duration + 1 }));
-      }, 1000);
+      startDurationTimer();
 
     } catch (error) {
       console.error('Error starting recording:', error);
@@ -959,23 +995,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   // mirrors WhatsApp's "hold to record" behavior.
   const MIN_HOLD_MS = 300;
 
-  const handleVoiceButtonTouchStart = (e: React.TouchEvent | React.MouseEvent) => {
-    e.preventDefault();
-    const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
-    startXRef.current = clientX;
-    recordingTouchStartedAtRef.current = Date.now();
-    isRecordingGestureRef.current = true;
-    recordingButtonRectRef.current = voiceButtonRef.current?.getBoundingClientRect() ?? null;
-    setVoiceState(prev => ({ ...prev, startX: clientX, currentX: clientX }));
-    startRecording();
-
-    // Add global event listeners for mouse (touch events bubble automatically)
-    if (!('touches' in e)) {
-      document.addEventListener('mousemove', handleGlobalMouseMove);
-      document.addEventListener('mouseup', handleGlobalMouseUp);
-    }
-  };
-
   // Shared drag-update logic for both mouse and touch move handlers.
   const applyVoiceDrag = (clientX: number, clientY: number, prev: VoiceRecordingState): VoiceRecordingState => {
     const swipeDistance = startXRef.current - clientX;
@@ -1007,21 +1026,13 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     };
   };
 
-  const handleGlobalMouseMove = useCallback((e: MouseEvent) => {
-    if (!isRecordingGestureRef.current) return;
-    setVoiceState(prev => applyVoiceDrag(e.clientX, e.clientY, prev));
-  }, []);
-
-  const handleGlobalMouseUp = useCallback(() => {
-    document.removeEventListener('mousemove', handleGlobalMouseMove);
-    document.removeEventListener('mouseup', handleGlobalMouseUp);
-
-    if (!isRecordingGestureRef.current) return;
-    isRecordingGestureRef.current = false;
-
+  // Called once the finger/mouse lifts (and the gesture wasn't a lock) to
+  // decide whether to cancel, send, or — for a too-brief/too-still press —
+  // treat it as an accidental tap.
+  const finishVoiceGesture = useCallback(() => {
     setVoiceState(prev => {
       if (prev.isLocked) {
-        // Keep recording, user will tap send/cancel buttons
+        // Keep recording, user will tap pause/send/cancel buttons instead.
         return prev;
       }
 
@@ -1040,46 +1051,80 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
       }
       return prev;
     });
-  }, [handleGlobalMouseMove]);
+  }, [flashHoldHint]);
 
-  const handleVoiceButtonTouchMove = (e: React.TouchEvent) => {
-    if (!voiceState.isRecording || !isRecordingGestureRef.current) return;
+  // Mouse (desktop) drag handlers — bound to `document`, not the mic
+  // button, since they must keep firing after the button unmounts.
+  const handleGlobalMouseMove = useCallback((e: MouseEvent) => {
+    if (!isRecordingGestureRef.current) return;
+    setVoiceState(prev => applyVoiceDrag(e.clientX, e.clientY, prev));
+  }, []);
 
-    const clientX = e.touches[0].clientX;
-    const clientY = e.touches[0].clientY;
-    setVoiceState(prev => applyVoiceDrag(clientX, clientY, prev));
-  };
-
-  const handleVoiceButtonTouchEnd = () => {
-    if (!voiceState.isRecording || !isRecordingGestureRef.current) return;
+  const handleGlobalMouseUp = useCallback(() => {
+    document.removeEventListener('mousemove', handleGlobalMouseMove);
+    document.removeEventListener('mouseup', handleGlobalMouseUp);
+    if (!isRecordingGestureRef.current) return;
     isRecordingGestureRef.current = false;
+    finishVoiceGesture();
+  }, [handleGlobalMouseMove, finishVoiceGesture]);
 
-    if (voiceState.isLocked) {
-      // Keep recording, user will tap send/cancel
-      return;
-    }
+  // Touch (phone) drag handlers — also bound to `document` rather than the
+  // mic button. The button is swapped out for the recording overlay the
+  // instant recording starts, and once the node a touch's listeners were
+  // registered on is removed from the DOM, the browser stops delivering
+  // further touchmove/touchend events to it — which is exactly why
+  // slide-to-cancel/slide-up-to-lock never appeared to do anything.
+  // `{ passive: false }` is required so preventDefault() can actually stop
+  // the page from scrolling while the user is dragging the bubble around.
+  const handleGlobalTouchMove = useCallback((e: TouchEvent) => {
+    if (!isRecordingGestureRef.current) return;
+    const touch = e.touches[0];
+    if (!touch) return;
+    e.preventDefault();
+    setVoiceState(prev => applyVoiceDrag(touch.clientX, touch.clientY, prev));
+  }, []);
 
-    const swipeDistance = startXRef.current - voiceState.currentX;
-    const heldMs = Date.now() - recordingTouchStartedAtRef.current;
-    if (heldMs < MIN_HOLD_MS && Math.abs(swipeDistance) < 10) {
-      stopRecording(true);
-      flashHoldHint();
-    } else if (voiceState.isCancelling || swipeDistance > CANCEL_SWIPE_PX) {
-      stopRecording(true);
+  const handleGlobalTouchEnd = useCallback(() => {
+    document.removeEventListener('touchmove', handleGlobalTouchMove);
+    document.removeEventListener('touchend', handleGlobalTouchEnd);
+    document.removeEventListener('touchcancel', handleGlobalTouchEnd);
+    if (!isRecordingGestureRef.current) return;
+    isRecordingGestureRef.current = false;
+    finishVoiceGesture();
+  }, [handleGlobalTouchMove, finishVoiceGesture]);
+
+  const handleVoiceButtonTouchStart = (e: React.TouchEvent | React.MouseEvent) => {
+    e.preventDefault();
+    const isTouch = 'touches' in e;
+    const clientX = isTouch ? e.touches[0].clientX : e.clientX;
+    startXRef.current = clientX;
+    recordingTouchStartedAtRef.current = Date.now();
+    isRecordingGestureRef.current = true;
+    recordingButtonRectRef.current = voiceButtonRef.current?.getBoundingClientRect() ?? null;
+    setVoiceState(prev => ({ ...prev, startX: clientX, currentX: clientX }));
+    startRecording();
+
+    if (isTouch) {
+      document.addEventListener('touchmove', handleGlobalTouchMove, { passive: false });
+      document.addEventListener('touchend', handleGlobalTouchEnd);
+      document.addEventListener('touchcancel', handleGlobalTouchEnd);
     } else {
-      stopRecording(false);
+      document.addEventListener('mousemove', handleGlobalMouseMove);
+      document.addEventListener('mouseup', handleGlobalMouseUp);
     }
   };
 
   // Cleanup global event listeners on unmount
   useEffect(() => {
-
     return () => {
       document.removeEventListener('mousemove', handleGlobalMouseMove);
       document.removeEventListener('mouseup', handleGlobalMouseUp);
+      document.removeEventListener('touchmove', handleGlobalTouchMove);
+      document.removeEventListener('touchend', handleGlobalTouchEnd);
+      document.removeEventListener('touchcancel', handleGlobalTouchEnd);
       if (holdHintTimeoutRef.current) clearTimeout(holdHintTimeoutRef.current);
     };
-  }, [handleGlobalMouseMove, handleGlobalMouseUp]);
+  }, [handleGlobalMouseMove, handleGlobalMouseUp, handleGlobalTouchMove, handleGlobalTouchEnd]);
 
   // Audio Playback
   const toggleAudioPlayback = (messageId: string, audioUrl: string) => {
@@ -1647,7 +1692,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
                   {voiceState.waveformData.map((value, i) => (
                     <div
                       key={i}
-                      className="w-1 bg-violet-500 rounded-full transition-all duration-75"
+                      className={`w-1 bg-violet-500 rounded-full transition-all duration-75 ${voiceState.isPaused ? 'opacity-50' : ''}`}
                       style={{ height: `${Math.max(4, value * 32)}px` }}
                     />
                   ))}
@@ -1657,12 +1702,26 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
                   ))}
                 </div>
 
+                {/* Pause / Resume the locked recording in place */}
+                <button
+                  onClick={() => (voiceState.isPaused ? resumeRecording() : pauseRecording())}
+                  className="w-10 h-10 rounded-full bg-violet-100 text-violet-600 flex items-center justify-center hover:bg-violet-200 transition-colors"
+                  aria-label={voiceState.isPaused ? 'Resume recording' : 'Pause recording'}
+                >
+                  {voiceState.isPaused ? (
+                    <Play className="w-5 h-5 ml-0.5" fill="currentColor" />
+                  ) : (
+                    <Pause className="w-5 h-5" fill="currentColor" />
+                  )}
+                </button>
+
                 <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                  <div className={`w-2 h-2 rounded-full bg-red-500 ${voiceState.isPaused ? '' : 'animate-pulse'}`} />
                   <span className="text-sm font-semibold text-slate-700 tabular-nums min-w-[40px]">
                     {formatDuration(voiceState.duration)}
                   </span>
                 </div>
+
 
                 <button
                   onClick={() => stopRecording(false)}
@@ -1877,8 +1936,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
                   <button
                     ref={voiceButtonRef}
                     onTouchStart={handleVoiceButtonTouchStart}
-                    onTouchMove={handleVoiceButtonTouchMove}
-                    onTouchEnd={handleVoiceButtonTouchEnd}
                     onMouseDown={handleVoiceButtonTouchStart}
                     className="chat-voice-btn"
                   >
