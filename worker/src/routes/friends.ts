@@ -178,6 +178,9 @@ friends.delete('/:friendId', async (c) => {
       userId
     ),
   ]);
+  // Let the other side know live too, so their Friends/Chats tabs drop this
+  // person immediately instead of waiting for their next manual refresh.
+  await broadcastToUser(c.env, friendId, { type: 'friend:removed', userId });
   return c.json({ success: true });
 });
 

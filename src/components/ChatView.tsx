@@ -498,7 +498,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         senderId: currentUser.id,
         receiverId: contact.user_id,
         content: messageContent,
-        type: 'text'
+        type: 'text',
+        clientMessageId: tempId
       });
 
       // Update the optimistic message with real data from server

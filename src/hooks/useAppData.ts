@@ -369,7 +369,23 @@ export function useAppData(userId: string) {
       });
 
     updateData({ friendRequests, suggestions, sentRequestIds });
+
+    // Keep the Friends tab (and Chats tab) in sync too — accepting/declining
+    // a request, or cancelling a sent one, changes the friend list, but this
+    // function already fetched it above so reuse it instead of a 2nd call.
+    if (friendsResult.success && friendsResult.data) {
+      const friends: Friend[] = friendsResult.data.friends.map(profile => ({
+        id: profile.id,
+        profile
+      }));
+      updateData({ friends });
+      if (friendIds.length > 0) {
+        const chats = await chatService.getChatList(userId, friendIds);
+        updateData({ chats });
+      }
+    }
   }, [userId, updateData]);
+
 
   const refreshCallHistory = useCallback(async () => {
     const result = await callService.getCallHistory(userId);
@@ -475,11 +491,14 @@ export function useAppData(userId: string) {
     );
     subscriptionsRef.current.push(messagesChannel);
 
-    // Friend requests sent to me, and acceptances of requests I sent
+    // Friend requests sent to me, acceptances/declines of requests I sent,
+    // and the other side unfriending me — all need to refresh both the
+    // Friends and Chats tabs live.
     const friendRequestSub = realtimeClient.on('friend:request', () => debouncedRefreshFriendsAndRequests());
     const friendAcceptedSub = realtimeClient.on('friend:accepted', () => debouncedRefreshFriendsAndRequests());
     const friendDeclinedSub = realtimeClient.on('friend:declined', () => debouncedRefreshFriendsAndRequests());
-    subscriptionsRef.current.push(friendRequestSub, friendAcceptedSub, friendDeclinedSub);
+    const friendRemovedSub = realtimeClient.on('friend:removed', () => debouncedRefreshFriendsAndRequests());
+    subscriptionsRef.current.push(friendRequestSub, friendAcceptedSub, friendDeclinedSub, friendRemovedSub);
 
     // Groups / call history: poll periodically until they get dedicated
     // realtime events of their own.

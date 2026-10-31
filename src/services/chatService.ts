@@ -63,7 +63,15 @@ export interface SendMessageParams {
   type?: Message['type'];
   duration?: number;
   replyToId?: string;
+  /**
+   * Optional caller-supplied idempotency id. Pass the same id you used for
+   * an optimistic local/UI message so the realtime echo of this exact send
+   * (the Worker broadcasts message:new to the sender too) reconciles with
+   * it instead of being inserted as a visual duplicate.
+   */
+  clientMessageId?: string;
 }
+
 
 export interface SendMessageResult {
   success: boolean;
@@ -92,12 +100,15 @@ export const chatService = {
     if (!messageRateLimiter.isAllowed(senderId)) {
       return {
         success: false,
-        clientMessageId: generateClientMessageId(),
+        clientMessageId: params.clientMessageId || generateClientMessageId(),
         error: `Rate limit exceeded. Maximum ${RATE_LIMITS.MESSAGES_PER_MINUTE} messages per minute.`
       };
     }
 
-    const clientMessageId = generateClientMessageId();
+    // Reuse the caller's id (e.g. a UI's optimistic-message id) when given,
+    // so the realtime echo of this exact message reconciles with the local
+    // optimistic entry instead of showing up as a second, duplicate message.
+    const clientMessageId = params.clientMessageId || generateClientMessageId();
     const chatId = getChatId(senderId, receiverId);
     const now = new Date().toISOString();
 
@@ -567,18 +578,29 @@ export const chatService = {
     onUpdate: (message: Message) => void
   ) {
     const subs = [
-      realtimeClient.on('message:new', async (payload) => {
+      realtimeClient.on('message:new', (payload) => {
         const msg = payload.message as Message;
         if (msg.sender_id === userId || msg.receiver_id === userId) {
-          const existingLocal = msg.client_message_id
-            ? await getMessageByClientId(msg.client_message_id)
-            : null;
-
-          if (existingLocal && existingLocal.syncStatus === 'pending') {
-            await updateMessageSyncStatus(existingLocal.id, 'sent', msg.id, msg.created_at);
-          }
-
+          // Fire the live UI update immediately and unconditionally. The
+          // local-cache (IndexedDB) reconciliation below is best-effort and
+          // must never gate it — IndexedDB can throw, or even hang
+          // indefinitely (e.g. a blocked version-upgrade across tabs), and
+          // none of that should ever be able to delay or swallow a message
+          // actually showing up live in the chat.
           onNewMessage(msg);
+
+          if (msg.client_message_id) {
+            (async () => {
+              try {
+                const existingLocal = await getMessageByClientId(msg.client_message_id!);
+                if (existingLocal && existingLocal.syncStatus === 'pending') {
+                  await updateMessageSyncStatus(existingLocal.id, 'sent', msg.id, msg.created_at);
+                }
+              } catch (err) {
+                log.warn('Failed to reconcile realtime message with local cache', err, 'chatService');
+              }
+            })();
+          }
         }
       }),
       realtimeClient.on('message:edit', (payload) => {
