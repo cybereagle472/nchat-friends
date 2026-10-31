@@ -61,6 +61,7 @@ export function Status({ currentUser, friends }: StatusProps) {
   const [caption, setCaption] = useState('');
   const [uploading, setUploading] = useState(false);
   const [replyText, setReplyText] = useState('');
+  const [isReplyFocused, setIsReplyFocused] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
 
   // Refs
@@ -135,7 +136,10 @@ export function Status({ currentUser, friends }: StatusProps) {
       return;
     }
 
-    if (isPaused) return;
+    // Also pause while the viewer list is open or the reply box is focused —
+    // either of those means the user's attention is on that UI, not on
+    // watching the story play through.
+    if (isPaused || showViewers || isReplyFocused) return;
 
     const currentStatus = viewingMyStatus
       ? myStatuses[viewingStatus?.currentIndex || 0]
@@ -164,7 +168,7 @@ export function Status({ currentUser, friends }: StatusProps) {
         clearInterval(progressIntervalRef.current);
       }
     };
-  }, [viewingStatus, viewingMyStatus, isPaused]);
+  }, [viewingStatus, viewingMyStatus, isPaused, showViewers, isReplyFocused]);
 
   // Mark status as viewed (not applicable to your own status — viewing your
   // own updates should never count as a "view" or add you to your own
@@ -372,6 +376,7 @@ export function Status({ currentUser, friends }: StatusProps) {
     setIsPaused(false);
     setShowViewers(false);
     setReplyText('');
+    setIsReplyFocused(false);
     loadStatuses(); // Refresh to update view counts
   };
 
@@ -775,6 +780,8 @@ export function Status({ currentUser, friends }: StatusProps) {
                 type="text"
                 value={replyText}
                 onChange={(e) => setReplyText(e.target.value)}
+                onFocus={() => setIsReplyFocused(true)}
+                onBlur={() => setIsReplyFocused(false)}
                 placeholder="Reply..."
                 className="flex-1 bg-white/10 text-white placeholder-white/60 px-4 py-3 rounded-full text-sm outline-none"
               />
