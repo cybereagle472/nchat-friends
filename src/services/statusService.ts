@@ -1,16 +1,22 @@
 /**
  * Status Service - WhatsApp-style Stories/Status
  *
+ * Talks to the Cloudflare Worker's /status/* routes (see worker/src/routes/status.ts)
+ * and the shared realtime WebSocket for live updates — not Supabase.
+ *
  * Features:
  * - Create text, image, video statuses
- * - 24-hour auto-expiry
+ * - 24-hour auto-expiry (enforced server-side; `expires_at` is just informational here)
  * - View tracking with real-time updates
- * - Privacy controls (everyone, contacts, custom)
- * - Reply to status
- * - Mute status from specific users
+ * - Privacy controls (defaults to "contacts"; custom audience lists aren't
+ *   supported by the backend yet, see worker schema)
+ * - Reply to status (sent as a normal direct message)
+ * - Mute status updates from specific users
  */
 
-import { supabase } from '../supabaseClient';
+import { apiFetch, ApiError } from '../lib/apiClient';
+import { realtimeClient } from '../lib/realtimeClient';
+import { chatService } from './chatService';
 import {
   Status,
   StatusView,
@@ -19,10 +25,8 @@ import {
   UserProfile
 } from '../types';
 import { mediaService } from './mediaService';
-import { generateVideoThumbnail, getVideoDuration } from '../utils/mediaUtils';
 
 // Constants
-const STATUS_EXPIRY_HOURS = 24;
 const MAX_TEXT_LENGTH = 700;
 const MAX_CAPTION_LENGTH = 200;
 
@@ -51,58 +55,51 @@ export const STATUS_FONTS = [
   'bold',         // Bold sans
 ];
 
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message;
+  if (err instanceof Error) return err.message;
+  return fallback;
+}
+
+// Raw row shape returned by the Worker for /status/feed (joined with the
+// poster's profile columns and a `viewed_by_me` flag).
+interface FeedRow extends Status {
+  full_name: string;
+  username?: string;
+  avatar_url?: string;
+  viewed_by_me: number | boolean;
+}
+
 export const statusService = {
   /**
    * Create a text status
    */
   async createTextStatus(
-    userId: string,
+    _userId: string,
     text: string,
     backgroundColor: string = STATUS_BACKGROUNDS[0],
     fontStyle: string = 'default',
     privacy: StatusPrivacy = 'contacts'
   ): Promise<Status | null> {
-    console.log('[StatusService] createTextStatus called', { userId, textLength: text.length, backgroundColor, fontStyle, privacy });
-
     if (!text.trim() || text.length > MAX_TEXT_LENGTH) {
       console.error('[StatusService] Invalid text status content');
       return null;
     }
 
-    const expiresAt = new Date();
-    expiresAt.setHours(expiresAt.getHours() + STATUS_EXPIRY_HOURS);
-
-    const insertData = {
-      user_id: userId,
-      content_type: 'text',
-      text_content: text.trim(),
-      background_color: backgroundColor,
-      font_style: fontStyle,
-      privacy,
-      expires_at: expiresAt.toISOString(),
-      view_count: 0
-    };
-
-    console.log('[StatusService] Inserting status into database...', insertData);
-
     try {
-      const { data, error } = await supabase
-        .from('statuses')
-        .insert(insertData)
-        .select()
-        .single();
-
-      console.log('[StatusService] Insert result - data:', data, 'error:', error);
-
-      if (error) {
-        console.error('[StatusService] Error creating text status:', error.message, error.details, error.hint, error.code);
-        return null;
-      }
-
-      console.log('[StatusService] Status created successfully:', data);
-      return data;
+      const { status } = await apiFetch<{ status: Status }>('/status', {
+        method: 'POST',
+        body: JSON.stringify({
+          content_type: 'text',
+          text_content: text.trim(),
+          background_color: backgroundColor,
+          font_style: fontStyle,
+          privacy
+        })
+      });
+      return status;
     } catch (err) {
-      console.error('[StatusService] Exception during insert:', err);
+      console.error('[StatusService] Error creating text status:', errorMessage(err, 'unknown error'));
       return null;
     }
   },
@@ -117,38 +114,24 @@ export const statusService = {
     privacy: StatusPrivacy = 'contacts'
   ): Promise<Status | null> {
     try {
-      // Upload image using mediaService
       const result = await mediaService.uploadMedia(imageFile, userId);
       if (!result.success || !result.url) {
         console.error('Failed to upload status image:', result.error);
         return null;
       }
 
-      const expiresAt = new Date();
-      expiresAt.setHours(expiresAt.getHours() + STATUS_EXPIRY_HOURS);
-
-      const { data, error } = await supabase
-        .from('statuses')
-        .insert({
-          user_id: userId,
+      const { status } = await apiFetch<{ status: Status }>('/status', {
+        method: 'POST',
+        body: JSON.stringify({
           content_type: 'image',
           content_url: result.url,
           caption: caption?.trim().slice(0, MAX_CAPTION_LENGTH),
-          privacy,
-          expires_at: expiresAt.toISOString(),
-          view_count: 0
+          privacy
         })
-        .select()
-        .single();
-
-      if (error) {
-        console.error('Error creating image status:', error);
-        return null;
-      }
-
-      return data;
+      });
+      return status;
     } catch (error) {
-      console.error('Error creating image status:', error);
+      console.error('Error creating image status:', errorMessage(error, 'unknown error'));
       return null;
     }
   },
@@ -163,63 +146,27 @@ export const statusService = {
     privacy: StatusPrivacy = 'contacts'
   ): Promise<Status | null> {
     try {
-      // Upload video using mediaService
+      // mediaService already generates a thumbnail + duration for videos.
       const result = await mediaService.uploadMedia(videoFile, userId);
       if (!result.success || !result.url) {
         console.error('Failed to upload status video:', result.error);
         return null;
       }
 
-      // Generate thumbnail
-      let thumbnailUrl: string | undefined;
-      try {
-        const thumbnailBlob = await generateVideoThumbnail(videoFile);
-        if (thumbnailBlob) {
-          const thumbnailFile = new File([thumbnailBlob], 'thumbnail.jpg', { type: 'image/jpeg' });
-          const thumbnailResult = await mediaService.uploadMedia(thumbnailFile, userId);
-          if (thumbnailResult.success) {
-            thumbnailUrl = thumbnailResult.url;
-          }
-        }
-      } catch (e) {
-        console.warn('Could not generate video thumbnail:', e);
-      }
-
-      // Get video duration
-      let duration = 0;
-      try {
-        duration = await getVideoDuration(videoFile);
-      } catch (e) {
-        console.warn('Could not get video duration:', e);
-      }
-
-      const expiresAt = new Date();
-      expiresAt.setHours(expiresAt.getHours() + STATUS_EXPIRY_HOURS);
-
-      const { data, error } = await supabase
-        .from('statuses')
-        .insert({
-          user_id: userId,
+      const { status } = await apiFetch<{ status: Status }>('/status', {
+        method: 'POST',
+        body: JSON.stringify({
           content_type: 'video',
           content_url: result.url,
-          thumbnail_url: thumbnailUrl,
-          duration: Math.round(duration),
+          thumbnail_url: result.thumbnailUrl,
+          duration: result.metadata?.duration ? Math.round(result.metadata.duration) : undefined,
           caption: caption?.trim().slice(0, MAX_CAPTION_LENGTH),
-          privacy,
-          expires_at: expiresAt.toISOString(),
-          view_count: 0
+          privacy
         })
-        .select()
-        .single();
-
-      if (error) {
-        console.error('Error creating video status:', error);
-        return null;
-      }
-
-      return data;
+      });
+      return status;
     } catch (error) {
-      console.error('Error creating video status:', error);
+      console.error('Error creating video status:', errorMessage(error, 'unknown error'));
       return null;
     }
   },
@@ -227,80 +174,61 @@ export const statusService = {
   /**
    * Get my statuses (for viewing my own status)
    */
-  async getMyStatuses(userId: string): Promise<Status[]> {
-    const { data, error } = await supabase
-      .from('statuses')
-      .select('*')
-      .eq('user_id', userId)
-      .gt('expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      console.error('Error fetching my statuses:', error);
+  async getMyStatuses(_userId: string): Promise<Status[]> {
+    try {
+      const { statuses } = await apiFetch<{ statuses: Status[] }>('/status/mine');
+      return statuses || [];
+    } catch (error) {
+      console.error('Error fetching my statuses:', errorMessage(error, 'unknown error'));
       return [];
     }
-
-    return data || [];
   },
 
   /**
    * Get contacts' statuses (for status list view)
    */
-  async getContactsStatuses(userId: string, contactIds: string[]): Promise<UserStatuses[]> {
+  async getContactsStatuses(_userId: string, contactIds: string[]): Promise<UserStatuses[]> {
     if (contactIds.length === 0) return [];
 
-    // Get all active statuses from contacts
-    const { data: statuses, error } = await supabase
-      .from('statuses')
-      .select('*')
-      .in('user_id', contactIds)
-      .gt('expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      console.error('Error fetching contacts statuses:', error);
+    let rows: FeedRow[];
+    try {
+      const res = await apiFetch<{ statuses: FeedRow[] }>('/status/feed');
+      rows = res.statuses || [];
+    } catch (error) {
+      console.error('Error fetching contacts statuses:', errorMessage(error, 'unknown error'));
       return [];
     }
 
-    if (!statuses || statuses.length === 0) return [];
+    if (rows.length === 0) return [];
 
-    // Get unique user IDs from statuses
-    const statusUserIds = [...new Set(statuses.map(s => s.user_id))];
+    // Only keep statuses from people who are still in the current friends
+    // list (the feed is already friendship-scoped server-side, but this
+    // guards against a stale contactIds list passed in by the caller).
+    const contactIdSet = new Set(contactIds);
 
-    // Fetch profiles for these users
-    const { data: profiles } = await supabase
-      .from('profiles')
-      .select('id, full_name, username, avatar_url, is_online')
-      .in('id', statusUserIds);
-
-    const profileMap = new Map(profiles?.map(p => [p.id, p]) || []);
-
-    // Get viewed status IDs for this user
-    const statusIds = statuses.map(s => s.id);
-    const { data: views } = await supabase
-      .from('status_views')
-      .select('status_id')
-      .eq('viewer_id', userId)
-      .in('status_id', statusIds);
-
-    const viewedStatusIds = new Set(views?.map(v => v.status_id) || []);
-
-    // Group by user
     const userStatusMap = new Map<string, UserStatuses>();
 
-    for (const status of statuses) {
-      const profile = profileMap.get(status.user_id) as UserProfile;
-      if (!profile) continue;
+    for (const row of rows) {
+      if (!contactIdSet.has(row.user_id)) continue;
 
-      const existing = userStatusMap.get(status.user_id);
-      const hasUnviewed = !viewedStatusIds.has(status.id);
+      const profile: UserProfile = {
+        id: row.user_id,
+        email: '',
+        full_name: row.full_name,
+        username: row.username,
+        avatar_url: row.avatar_url
+      } as UserProfile;
 
+      const { full_name: _fn, username: _un, avatar_url: _au, viewed_by_me, ...status } = row;
+      const hasUnviewed = !viewed_by_me;
+
+      const existing = userStatusMap.get(row.user_id);
       if (existing) {
         existing.statuses.push(status);
         if (hasUnviewed) existing.hasUnviewed = true;
       } else {
-        userStatusMap.set(status.user_id, {
-          user_id: status.user_id,
+        userStatusMap.set(row.user_id, {
+          user_id: row.user_id,
           user_profile: profile,
           statuses: [status],
           hasUnviewed,
@@ -320,67 +248,47 @@ export const statusService = {
   /**
    * Mark status as viewed
    */
-  async viewStatus(statusId: string, viewerId: string): Promise<boolean> {
-    // Check if already viewed
-    const { data: existing } = await supabase
-      .from('status_views')
-      .select('id')
-      .eq('status_id', statusId)
-      .eq('viewer_id', viewerId)
-      .single();
-
-    if (existing) return true; // Already viewed
-
-    // Insert view
-    const { error } = await supabase
-      .from('status_views')
-      .insert({
-        status_id: statusId,
-        viewer_id: viewerId
-      });
-
-    if (error) {
-      console.error('Error recording status view:', error);
+  async viewStatus(statusId: string, _viewerId: string): Promise<boolean> {
+    try {
+      await apiFetch(`/status/${statusId}/view`, { method: 'POST' });
+      return true;
+    } catch (error) {
+      console.error('Error recording status view:', errorMessage(error, 'unknown error'));
       return false;
     }
-
-    // Update view count
-    await supabase.rpc('increment_status_view_count', { status_id: statusId });
-
-    return true;
   },
 
   /**
    * Get viewers of a status (for status owner)
    */
   async getStatusViewers(statusId: string): Promise<StatusView[]> {
-    const { data, error } = await supabase
-      .from('status_views')
-      .select(`
-        *,
-        viewer:viewer_id (
-          id,
-          full_name,
-          username,
-          avatar_url
-        )
-      `)
-      .eq('status_id', statusId)
-      .order('viewed_at', { ascending: false });
+    try {
+      const { views } = await apiFetch<{
+        views: (StatusView & { full_name: string; username?: string; avatar_url?: string })[];
+      }>(`/status/${statusId}/views`);
 
-    if (error) {
-      console.error('Error fetching status viewers:', error);
+      return (views || []).map((view) => ({
+        id: view.id,
+        status_id: view.status_id,
+        viewer_id: view.viewer_id,
+        viewed_at: view.viewed_at,
+        viewer_profile: {
+          id: view.viewer_id,
+          email: '',
+          full_name: view.full_name,
+          username: view.username,
+          avatar_url: view.avatar_url
+        } as UserProfile
+      }));
+    } catch (error) {
+      console.error('Error fetching status viewers:', errorMessage(error, 'unknown error'));
       return [];
     }
-
-    return (data || []).map(view => ({
-      ...view,
-      viewer_profile: view.viewer as unknown as UserProfile
-    }));
   },
 
   /**
-   * Reply to a status
+   * Reply to a status — sent as a normal direct message so it shows up in
+   * the regular chat with that person, just like WhatsApp does.
    */
   async replyToStatus(
     statusId: string,
@@ -388,175 +296,103 @@ export const statusService = {
     statusOwnerId: string,
     content: string
   ): Promise<boolean> {
-    // Create a direct message as a status reply
-    const { error } = await supabase
-      .from('messages')
-      .insert({
-        sender_id: senderId,
-        receiver_id: statusOwnerId,
-        content: content.trim(),
-        type: 'text',
-        reply_to: `status:${statusId}` // Special format to identify status replies
-      });
-
-    if (error) {
-      console.error('Error replying to status:', error);
-      return false;
-    }
-
-    return true;
+    const result = await chatService.sendMessage({
+      senderId,
+      receiverId: statusOwnerId,
+      content: content.trim(),
+      type: 'text',
+      replyToId: `status:${statusId}`
+    });
+    return result.success;
   },
 
   /**
    * Delete a status
    */
-  async deleteStatus(statusId: string, userId: string): Promise<boolean> {
-    const { error } = await supabase
-      .from('statuses')
-      .delete()
-      .eq('id', statusId)
-      .eq('user_id', userId);
-
-    if (error) {
-      console.error('Error deleting status:', error);
+  async deleteStatus(statusId: string, _userId: string): Promise<boolean> {
+    try {
+      await apiFetch(`/status/${statusId}`, { method: 'DELETE' });
+      return true;
+    } catch (error) {
+      console.error('Error deleting status:', errorMessage(error, 'unknown error'));
       return false;
     }
-
-    return true;
   },
 
   /**
    * Mute statuses from a user
    */
-  async muteUserStatus(userId: string, muteUserId: string): Promise<boolean> {
-    const { error } = await supabase
-      .from('muted_statuses')
-      .upsert({
-        user_id: userId,
-        muted_user_id: muteUserId
+  async muteUserStatus(_userId: string, muteUserId: string): Promise<boolean> {
+    try {
+      await apiFetch('/status/mute', {
+        method: 'POST',
+        body: JSON.stringify({ muted_user_id: muteUserId })
       });
-
-    if (error) {
-      console.error('Error muting user status:', error);
+      return true;
+    } catch (error) {
+      console.error('Error muting user status:', errorMessage(error, 'unknown error'));
       return false;
     }
-
-    return true;
   },
 
   /**
    * Unmute statuses from a user
    */
-  async unmuteUserStatus(userId: string, muteUserId: string): Promise<boolean> {
-    const { error } = await supabase
-      .from('muted_statuses')
-      .delete()
-      .eq('user_id', userId)
-      .eq('muted_user_id', muteUserId);
-
-    if (error) {
-      console.error('Error unmuting user status:', error);
+  async unmuteUserStatus(_userId: string, muteUserId: string): Promise<boolean> {
+    try {
+      await apiFetch(`/status/mute/${muteUserId}`, { method: 'DELETE' });
+      return true;
+    } catch (error) {
+      console.error('Error unmuting user status:', errorMessage(error, 'unknown error'));
       return false;
     }
-
-    return true;
   },
 
   /**
    * Get list of muted status users
    */
-  async getMutedStatusUsers(userId: string): Promise<string[]> {
-    const { data, error } = await supabase
-      .from('muted_statuses')
-      .select('muted_user_id')
-      .eq('user_id', userId);
-
-    if (error) {
-      console.error('Error fetching muted status users:', error);
+  async getMutedStatusUsers(_userId: string): Promise<string[]> {
+    try {
+      const { muted } = await apiFetch<{ muted: string[] }>('/status/muted');
+      return muted || [];
+    } catch (error) {
+      console.error('Error fetching muted status users:', errorMessage(error, 'unknown error'));
       return [];
     }
-
-    return (data || []).map(d => d.muted_user_id);
   },
 
   /**
-   * Subscribe to new statuses from contacts
+   * Subscribe to new statuses from contacts (live, via the realtime WebSocket)
    */
   subscribeToStatuses(
-    userId: string,
-    contactIds: string[],
+    _userId: string,
+    _contactIds: string[],
     onNewStatus: (status: Status) => void
   ): { unsubscribe: () => void } {
-    const channel = supabase
-      .channel(`statuses_${userId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'statuses',
-          filter: `user_id=in.(${contactIds.join(',')})`
-        },
-        (payload) => {
-          onNewStatus(payload.new as Status);
-        }
-      )
-      .subscribe();
-
-    return {
-      unsubscribe: () => {
-        supabase.removeChannel(channel);
-      }
-    };
+    const sub = realtimeClient.on('status:new', (payload) => {
+      if (payload?.status) onNewStatus(payload.status as Status);
+    });
+    return { unsubscribe: sub.unsubscribe };
   },
 
   /**
-   * Subscribe to views on my statuses
+   * Subscribe to views on my statuses (live, via the realtime WebSocket)
    */
   subscribeToMyStatusViews(
-    userId: string,
+    _userId: string,
     onNewView: (view: StatusView) => void
   ): { unsubscribe: () => void } {
-    // First get my status IDs
-    const channel = supabase
-      .channel(`status_views_${userId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'status_views'
-        },
-        async (payload) => {
-          // Check if this view is for one of my statuses
-          const { data: status } = await supabase
-            .from('statuses')
-            .select('user_id')
-            .eq('id', payload.new.status_id)
-            .single();
-
-          if (status?.user_id === userId) {
-            // Get viewer profile
-            const { data: viewer } = await supabase
-              .from('profiles')
-              .select('*')
-              .eq('id', payload.new.viewer_id)
-              .single();
-
-            onNewView({
-              ...payload.new as StatusView,
-              viewer_profile: viewer
-            });
-          }
-        }
-      )
-      .subscribe();
-
-    return {
-      unsubscribe: () => {
-        supabase.removeChannel(channel);
-      }
-    };
+    const sub = realtimeClient.on('status:view', (payload) => {
+      if (!payload?.status_id || !payload?.viewer_id) return;
+      onNewView({
+        id: `${payload.status_id}:${payload.viewer_id}`,
+        status_id: payload.status_id,
+        viewer_id: payload.viewer_id,
+        viewed_at: new Date().toISOString(),
+        viewer_profile: payload.viewer_profile as UserProfile | undefined
+      });
+    });
+    return { unsubscribe: sub.unsubscribe };
   }
 };
 

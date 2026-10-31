@@ -47,6 +47,7 @@ export function Status({ currentUser, friends }: StatusProps) {
   } | null>(null);
   const [viewingMyStatus, setViewingMyStatus] = useState(false);
   const [statusViewers, setStatusViewers] = useState<StatusView[]>([]);
+  const viewersPanelStatusIdRef = useRef<string | null>(null);
   const [showViewers, setShowViewers] = useState(false);
 
   // Create status state
@@ -105,6 +106,24 @@ export function Status({ currentUser, friends }: StatusProps) {
 
     return () => subscription.unsubscribe();
   }, [currentUser.id, friends, loadStatuses]);
+
+  // Subscribe to views on my own statuses — updates the view count live
+  // while I'm looking at my status, and the viewer list if it's open.
+  useEffect(() => {
+    const subscription = statusService.subscribeToMyStatusViews(currentUser.id, (view) => {
+      setMyStatuses(prev =>
+        prev.map(s => (s.id === view.status_id ? { ...s, view_count: s.view_count + 1 } : s))
+      );
+      setStatusViewers(prev => {
+        if (prev.length === 0) return prev;
+        if (viewersPanelStatusIdRef.current !== view.status_id) return prev;
+        if (prev.some(v => v.viewer_id === view.viewer_id)) return prev;
+        return [view, ...prev];
+      });
+    });
+
+    return () => subscription.unsubscribe();
+  }, [currentUser.id]);
 
   // Progress bar timer for status viewing
   useEffect(() => {
@@ -372,6 +391,7 @@ export function Status({ currentUser, friends }: StatusProps) {
 
   // Load viewers for current status
   const loadViewers = async (statusId: string) => {
+    viewersPanelStatusIdRef.current = statusId;
     const viewers = await statusService.getStatusViewers(statusId);
     setStatusViewers(viewers);
     setShowViewers(true);

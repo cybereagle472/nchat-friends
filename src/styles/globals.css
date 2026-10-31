@@ -14,6 +14,49 @@
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
   }
+
+  /*
+   * App-wide "native app" feel: nothing in the UI — message text, names,
+   * timestamps, buttons, nav tabs, labels, images — should ever get
+   * highlighted from a double-tap, triple-click, or a mobile long-press,
+   * and long-pressing shouldn't pop up the OS's Copy/Share callout either.
+   * Text inputs, textareas and contenteditable areas are explicitly
+   * exempted so typing, editing, and placing/selecting the cursor inside
+   * a message you're composing still behaves completely normally.
+   */
+  html {
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  *:not(input):not(textarea):not([contenteditable="true"]):not([contenteditable=""]) {
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  input,
+  textarea,
+  [contenteditable="true"],
+  [contenteditable=""] {
+    -webkit-user-select: text;
+    -moz-user-select: text;
+    -ms-user-select: text;
+    user-select: text;
+    -webkit-touch-callout: default;
+  }
+
+  /* Images shouldn't be draggable or show the long-press save/copy callout. */
+  img {
+    -webkit-user-drag: none;
+    user-drag: none;
+    -webkit-touch-callout: none;
+  }
 }
 
 @keyframes blob {
