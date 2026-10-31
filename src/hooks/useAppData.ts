@@ -142,6 +142,10 @@ const INITIAL_DATA: AppData = {
 // Global in-memory cache - persists across re-renders
 let globalCache: AppData = { ...INITIAL_DATA };
 
+// Run the one-time local-storage repair (see chatService.repairLocalMessageStore)
+// at most once per page load, regardless of how many times useAppData mounts.
+let localMessageStoreRepaired = false;
+
 export function useAppData(userId: string, activeChatUserId?: string | null) {
   // INSTANT: Try localStorage cache first (synchronous, 0ms)
   const [data, setData] = useState<AppData>(() => {
@@ -566,6 +570,14 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
       setData(globalCache);
       // Refresh in background
       loadAllData();
+    }
+
+    // Self-heal any local message storage left corrupted by a past sync bug
+    // (see offlineStorage.repairDuplicateClientMessageIds) — fire-and-forget,
+    // once per page load, so it never blocks or delays anything visible.
+    if (!localMessageStoreRepaired) {
+      localMessageStoreRepaired = true;
+      chatService.repairLocalMessageStore().catch(() => {});
     }
   }, [loadAllData]);
 

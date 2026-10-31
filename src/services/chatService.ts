@@ -28,6 +28,7 @@ import {
   getMessageByClientId,
   cacheProfiles,
   isOnline,
+  repairDuplicateClientMessageIds,
   LocalMessage,
   PendingMessage,
   MessageSyncStatus
@@ -884,6 +885,21 @@ export const chatService = {
    */
   clearCache(): void {
     messageCache.clear();
+  },
+
+  /**
+   * One-time repair for local storage left over from a past bug where a
+   * sent message's temp id wasn't cleanly swapped for its server id (see
+   * offlineStorage.updateMessageSyncStatus). Safe to call repeatedly; call
+   * it once on app start so devices that already hit the bug self-heal
+   * without the user needing to clear any data.
+   */
+  async repairLocalMessageStore(): Promise<void> {
+    try {
+      await repairDuplicateClientMessageIds();
+    } catch (error) {
+      log.warn('Local message store repair failed (non-fatal)', error, 'chatService');
+    }
   },
 
   /**
