@@ -41,9 +41,22 @@ function downsampleWaveform(samples: number[], targetBars: number = VOICE_WAVEFO
     const end = Math.max(start + 1, Math.floor((i + 1) * bucketSize));
     const slice = samples.slice(start, end);
     const avg = slice.reduce((a, b) => a + b, 0) / (slice.length || 1);
-    bars.push(Math.round(avg * 100) / 100);
+    bars.push(avg);
   }
-  return bars.join(',');
+
+  // getByteFrequencyData() averages across the *entire* FFT range, most of
+  // which carries no energy for a voice recording (speech barely reaches
+  // past a few kHz), so the raw per-bucket averages end up clustered in a
+  // narrow, low band (observed: mostly ~0.03–0.12) no matter how loud or
+  // expressive the actual audio is. Rendering that raw gave every bar
+  // nearly the same (floored) height — a flat row of dots instead of a
+  // waveform. Normalizing each clip to its own loudest bucket (the same
+  // technique real waveform UIs use) stretches whatever real variation
+  // exists back out across the full 0–1 range, so quiet vs. loud moments
+  // in *this* clip are actually visually distinguishable.
+  const max = Math.max(...bars, 0);
+  const normalized = max > 0 ? bars.map((v) => v / max) : bars;
+  return normalized.map((v) => Math.round(v * 100) / 100).join(',');
 }
 
 // Memoized Message Bubble - prevents re-render of all messages when one changes
@@ -296,6 +309,18 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   // the live "now recording" visual, this keeps the full recording so a
   // real, whole-message waveform can be saved and shown once it's sent).
   const fullWaveformRef = useRef<number[]>([]);
+  // Mirrors voiceState.duration, kept in sync everywhere that state updates.
+  // stopRecording() is a plain (non-memoized) function, and the gesture
+  // handlers that end up calling it (finishVoiceGesture et al.) are
+  // useCallback'd with stable/empty deps, so they close over the
+  // *original, mount-time* `stopRecording` — whose captured `voiceState`
+  // is permanently frozen at duration: 0. Reading from this ref instead
+  // sidesteps the stale closure entirely (refs are always read live,
+  // regardless of which render's closure does the reading), which is why
+  // every voice message was being saved/shown as 0:01 no matter how long
+  // it was actually held for.
+  const durationRef = useRef(0);
+
   // Snapshot of the duration/waveform at the moment recording stops — the
   // MediaRecorder's onstop callback fires asynchronously afterward, by which
   // point voiceState has already been reset back to 0/empty, so it can't be
@@ -795,7 +820,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   const startDurationTimer = useCallback(() => {
     if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current);
     recordingIntervalRef.current = setInterval(() => {
-      setVoiceState(prev => ({ ...prev, duration: prev.duration + 1 }));
+      setVoiceState(prev => {
+        const duration = prev.duration + 1;
+        durationRef.current = duration;
+        return { ...prev, duration };
+      });
     }, 1000);
   }, []);
 
@@ -832,6 +861,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     console.log('Starting voice recording...');
     isCancellingRef.current = false;
     fullWaveformRef.current = [];
+    durationRef.current = 0;
 
     try {
       // Request microphone permission
@@ -955,18 +985,29 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     // their end as a safety net, but this makes it disappear instantly).
     typingService.sendStoppedRecording(currentUser.id, contact.user_id);
 
-    // Snapshot the final duration/waveform now, while voiceState still has
-    // them — onstop (below) fires asynchronously and runs after voiceState
-    // has already been reset to 0/empty by the setVoiceState call below.
-    // `voiceState.duration` only increments once per *completed* second
-    // (see startDurationTimer), so any recording released before its first
-    // full second elapsed — anywhere from the ~300ms minimum hold up to
-    // just under 1s — reports 0 even though real audio was captured. A
-    // sent voice message is never actually silent/instant (the accidental-
-    // tap guard above already filters those out), so floor the displayed/
-    // stored duration at 1 second, matching WhatsApp's own convention of
-    // never showing a voice note as "0:00".
-    lastRecordingRef.current = { duration: Math.max(1, voiceState.duration), waveform: fullWaveformRef.current };
+    // Snapshot the final duration/waveform now, while they're still live —
+    // onstop (below) fires asynchronously and runs after voiceState has
+    // already been reset to 0/empty by the setVoiceState call below.
+    //
+    // Read from durationRef, NOT voiceState.duration: stopRecording is a
+    // plain (non-memoized) function, and every path that calls it
+    // (finishVoiceGesture, the lock-panel send/cancel buttons) is a
+    // useCallback/handler that was created once with a stable/empty
+    // dependency list, so it closes over the mount-time `stopRecording` —
+    // whose captured `voiceState` is permanently frozen at duration: 0.
+    // That's why every voice message was being saved as "0:01" regardless
+    // of how long it was actually held for. durationRef is a ref, so it's
+    // always read live no matter which stale closure does the reading.
+    //
+    // It also only increments once per *completed* second (see
+    // startDurationTimer), so any recording released before its first full
+    // second elapsed — anywhere from the ~300ms minimum hold up to just
+    // under 1s — would still read 0 even with the stale-closure bug fixed.
+    // A sent voice message is never actually silent/instant (the
+    // accidental-tap guard above already filters those out), so floor the
+    // displayed/stored duration at 1 second, matching WhatsApp's own
+    // convention of never showing a voice note as "0:00".
+    lastRecordingRef.current = { duration: Math.max(1, durationRef.current), waveform: fullWaveformRef.current };
 
     if (recordingIntervalRef.current) {
       clearInterval(recordingIntervalRef.current);
@@ -1350,16 +1391,15 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
             {waveformData.map((value, i) => {
               const isPlayed = i < playedBars;
               const isPlayhead = isPlaying && i === playedBars;
-              // Real recorded amplitude tends to cluster low (most speech
-              // only lights up a fraction of the frequency bins an average
-              // is taken over), so a plain linear scale plus a small floor
-              // still rendered as a near-flat row of dots. A gamma curve
-              // (sqrt-ish) lifts quieter bars more than loud ones, and a
-              // higher floor guarantees every bar reads as a real bar —
-              // together these make even a quiet recording look like an
-              // actual waveform instead of a dotted line.
+              // `value` is already normalized per-clip at record time (see
+              // downsampleWaveform) so it genuinely spans ~0–1 with real
+              // contrast between quiet and loud moments. A light gamma lift
+              // still helps quieter-but-real bars stay readable, and a
+              // small floor just keeps a near-silent bucket from collapsing
+              // to an invisible sliver — neither needs to be aggressive
+              // anymore now that the underlying data isn't clustered flat.
               const clamped = Math.max(0, Math.min(1, value));
-              const visualHeight = Math.max(0.3, Math.pow(clamped, 0.55));
+              const visualHeight = Math.max(0.12, Math.pow(clamped, 0.7));
               return (
                 <div
                   key={i}
