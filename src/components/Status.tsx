@@ -618,7 +618,7 @@ export function Status({ currentUser, friends }: StatusProps) {
     // through above it.
     return createPortal(
       <div
-        className="fixed inset-0 z-[100] h-screen w-screen flex flex-col bg-black"
+        className="fixed inset-0 z-[100] flex flex-col bg-black"
         onClick={(e) => {
           // Click left/right to navigate
           const rect = (e.target as HTMLElement).getBoundingClientRect();
@@ -774,7 +774,7 @@ export function Status({ currentUser, friends }: StatusProps) {
         )}
 
         {/* Bottom - View count or Reply */}
-        <div className="absolute bottom-0 left-0 right-0 z-20 p-4 bg-gradient-to-t from-black/50">
+        <div className="absolute bottom-0 left-0 right-0 z-20 px-4 pt-4 bg-gradient-to-t from-black/50" style={{ paddingBottom: 'max(1rem, env(safe-area-inset-bottom))' }}>
           {viewingMyStatus ? (
             <button
               onClick={(e) => {
