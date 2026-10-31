@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { Toaster } from 'sonner';
 import { MessageCircle, Circle, UsersRound, Compass, Clock } from 'lucide-react';
 import { Auth } from './components/Auth';
 import { ProfileSetup } from './components/ProfileSetup';
@@ -29,7 +30,7 @@ interface CallState {
   incomingCall?: Call;
 }
 
-export default function App() {
+function App() {
   // Auth state
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [needsProfileSetup, setNeedsProfileSetup] = useState(false);
@@ -591,5 +592,22 @@ function MainApp({
         />
       )}
     </div>
+  );
+}
+
+/** Mounts the toast notification system alongside the app, regardless of which screen is active. */
+export default function AppRoot() {
+  return (
+    <>
+      <App />
+      <Toaster
+        position="top-center"
+        richColors
+        closeButton
+        toastOptions={{
+          style: { borderRadius: '1rem' },
+        }}
+      />
+    </>
   );
 }

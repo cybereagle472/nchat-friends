@@ -1,15 +1,14 @@
 /**
- * Media Service - Supabase Storage Integration
+ * Media Service — Cloudflare R2 (via the Worker API)
  *
- * Features:
- * - Signed upload URLs for direct uploads
- * - Thumbnail generation for images/videos
- * - File type validation
- * - Progress tracking
- * - Media metadata storage
+ * Replaces the old Supabase Storage implementation. Every file goes through
+ * POST /media/upload (multipart) which stores it in R2 and records it in
+ * D1's media_attachments table server-side; GET /media/file/:key serves it
+ * back publicly, so the returned `url` can be used directly in <img>/<video>
+ * tags with no extra auth.
  */
 
-import { supabase } from '../supabaseClient';
+import { apiUpload, apiFetch, API_BASE, ApiError } from '../lib/apiClient';
 import {
   compressImage,
   generateVideoThumbnail,
@@ -50,15 +49,28 @@ export interface UploadProgress {
   percentage: number;
 }
 
-const BUCKET_NAME = 'chat-media';
+interface WorkerUploadResponse {
+  id: string;
+  url: string;
+  key: string;
+  media_type: 'image' | 'video' | 'audio' | 'document';
+  file_name: string;
+  file_size: number;
+}
+
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message;
+  if (err instanceof Error) return err.message;
+  return fallback;
+}
 
 export const mediaService = {
   /**
-   * Upload media file to Supabase Storage
+   * Upload a media file (image/video/audio/document) for use in a chat message.
    */
   async uploadMedia(
     file: File,
-    userId: string,
+    _userId: string,
     onProgress?: (progress: UploadProgress) => void
   ): Promise<MediaUploadResult> {
     if (!isSupportedFileType(file)) {
@@ -76,11 +88,7 @@ export const mediaService = {
     }
 
     try {
-      const timestamp = Date.now();
-      const sanitizedName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
-      const filePath = `${userId}/${mediaType}/${timestamp}_${sanitizedName}`;
-
-      let fileToUpload: File | Blob = file;
+      let fileToUpload: File = file;
       let thumbnailUrl: string | undefined;
       let width: number | undefined;
       let height: number | undefined;
@@ -89,7 +97,7 @@ export const mediaService = {
       if (mediaType === 'image') {
         try {
           const compressed = await compressImage(file, 1920, 1080, 0.85);
-          fileToUpload = compressed.blob;
+          fileToUpload = new File([compressed.blob], file.name, { type: 'image/jpeg' });
 
           const img = new Image();
           await new Promise<void>((resolve) => {
@@ -98,6 +106,7 @@ export const mediaService = {
               height = img.height;
               resolve();
             };
+            img.onerror = () => resolve();
             img.src = compressed.dataUrl;
           });
         } catch (err) {
@@ -109,25 +118,12 @@ export const mediaService = {
         try {
           duration = await getVideoDuration(file);
           const thumbnail = await generateVideoThumbnail(file);
-
-          const thumbnailBlob = await fetch(thumbnail).then(r => r.blob());
-          const thumbPath = `${userId}/thumbnails/${timestamp}_thumb.jpg`;
-
-          const { error: thumbError } = await supabase.storage
-            .from(BUCKET_NAME)
-            .upload(thumbPath, thumbnailBlob, {
-              contentType: 'image/jpeg',
-              cacheControl: '31536000'
-            });
-
-          if (!thumbError) {
-            const { data: thumbData } = supabase.storage
-              .from(BUCKET_NAME)
-              .getPublicUrl(thumbPath);
-            thumbnailUrl = thumbData.publicUrl;
-          }
+          const thumbnailBlob = await fetch(thumbnail).then((r) => r.blob());
+          const thumbFile = new File([thumbnailBlob], `${file.name}_thumb.jpg`, { type: 'image/jpeg' });
+          const thumbResult = await apiUpload<WorkerUploadResponse>('/media/upload', thumbFile);
+          thumbnailUrl = thumbResult.url;
         } catch (err) {
-          console.warn('Video processing failed:', err);
+          console.warn('Video thumbnail generation failed:', err);
         }
       }
 
@@ -139,26 +135,14 @@ export const mediaService = {
         }
       }
 
-      const { error: uploadError } = await supabase.storage
-        .from(BUCKET_NAME)
-        .upload(filePath, fileToUpload, {
-          contentType: file.type,
-          cacheControl: '31536000',
-          upsert: false
-        });
-
-      if (uploadError) {
-        return { success: false, error: uploadError.message };
-      }
-
-      const { data: urlData } = supabase.storage
-        .from(BUCKET_NAME)
-        .getPublicUrl(filePath);
+      const uploaded = await apiUpload<WorkerUploadResponse>('/media/upload', fileToUpload);
+      onProgress?.({ loaded: file.size, total: file.size, percentage: 100 });
 
       const metadata: MediaMetadata = {
-        fileName: file.name,
-        fileSize: file.size,
-        fileSizeFormatted: formatFileSize(file.size),
+        id: uploaded.id,
+        fileName: uploaded.file_name,
+        fileSize: uploaded.file_size,
+        fileSizeFormatted: formatFileSize(uploaded.file_size),
         mimeType: file.type,
         mediaType,
         width,
@@ -167,161 +151,87 @@ export const mediaService = {
         thumbnailUrl
       };
 
-      onProgress?.({ loaded: file.size, total: file.size, percentage: 100 });
-
-      return {
-        success: true,
-        url: urlData.publicUrl,
-        thumbnailUrl,
-        metadata
-      };
-    } catch (err: any) {
-      return { success: false, error: err.message || 'Upload failed' };
+      return { success: true, url: uploaded.url, thumbnailUrl, metadata };
+    } catch (err) {
+      return { success: false, error: errorMessage(err, 'Upload failed') };
     }
   },
 
   /**
-   * Upload media and get base64 for backward compatibility
-   * Use this for existing message flow that expects base64
+   * Upload media and also return a base64 copy, for call sites that still
+   * expect inline (data URL) previews rather than a remote URL.
    */
   async uploadAndGetBase64(
     file: File,
     userId: string
   ): Promise<MediaUploadResult & { base64?: string }> {
     const result = await this.uploadMedia(file, userId);
-
-    if (!result.success) {
-      return result;
-    }
+    if (!result.success) return result;
 
     try {
       let base64: string;
-
       if (result.metadata?.mediaType === 'image') {
         const compressed = await compressImage(file, 800, 600, 0.7);
         base64 = compressed.dataUrl;
       } else {
         base64 = await blobToBase64(file);
       }
-
       return { ...result, base64 };
-    } catch (err) {
+    } catch {
       return { ...result, base64: undefined };
     }
   },
 
   /**
-   * Delete media file from storage
+   * Delete a previously uploaded file. `filePath` is the R2 key returned as
+   * `key` from uploadMedia/uploadAvatar.
    */
   async deleteMedia(filePath: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const { error } = await supabase.storage
-        .from(BUCKET_NAME)
-        .remove([filePath]);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
+      await apiFetch(`/media/file/${filePath}`, { method: 'DELETE' });
       return { success: true };
-    } catch (err: any) {
-      return { success: false, error: err.message };
+    } catch (err) {
+      return { success: false, error: errorMessage(err, 'Delete failed') };
     }
   },
 
   /**
-   * Get signed URL for private files (if needed)
+   * Media is served publicly from R2 via the Worker, so there's no separate
+   * "signed URL" concept — this just returns the public URL for the given key.
    */
-  async getSignedUrl(
-    filePath: string,
-    expiresIn = 3600
-  ): Promise<{ success: boolean; url?: string; error?: string }> {
-    try {
-      const { data, error } = await supabase.storage
-        .from(BUCKET_NAME)
-        .createSignedUrl(filePath, expiresIn);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true, url: data.signedUrl };
-    } catch (err: any) {
-      return { success: false, error: err.message };
-    }
+  async getSignedUrl(filePath: string): Promise<{ success: boolean; url?: string; error?: string }> {
+    if (!filePath) return { success: false, error: 'Missing file path' };
+    return { success: true, url: `${API_BASE}/media/file/${filePath}` };
   },
 
   /**
-   * Save media attachment record to database
+   * No-op for compatibility: the Worker already records an attachment row
+   * (in media_attachments) at upload time, so there's nothing left to save.
    */
   async saveMediaRecord(
-    messageId: string,
-    uploaderId: string,
+    _messageId: string,
+    _uploaderId: string,
     metadata: MediaMetadata,
-    filePath: string
+    _filePath: string
   ): Promise<{ success: boolean; id?: string; error?: string }> {
-    try {
-      const { data, error } = await supabase
-        .from('media_attachments')
-        .insert({
-          message_id: messageId,
-          uploader_id: uploaderId,
-          file_path: filePath,
-          file_name: metadata.fileName,
-          file_size: metadata.fileSize,
-          mime_type: metadata.mimeType,
-          media_type: metadata.mediaType,
-          thumbnail_path: metadata.thumbnailUrl,
-          duration_seconds: metadata.duration,
-          width: metadata.width,
-          height: metadata.height
-        })
-        .select('id')
-        .single();
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true, id: data.id };
-    } catch (err: any) {
-      return { success: false, error: err.message };
-    }
+    return { success: true, id: metadata.id };
   },
 
   /**
-   * Get media attachments for a message
+   * Not wired to a dedicated endpoint yet — messages already carry their own
+   * media_url/thumbnail_url fields, so this isn't on the critical path.
+   * Kept as a safe stub so existing call sites don't break.
    */
-  async getMediaForMessage(messageId: string): Promise<MediaMetadata[]> {
-    const { data, error } = await supabase
-      .from('media_attachments')
-      .select('*')
-      .eq('message_id', messageId);
-
-    if (error || !data) {
-      return [];
-    }
-
-    return data.map(item => ({
-      id: item.id,
-      fileName: item.file_name,
-      fileSize: item.file_size,
-      fileSizeFormatted: formatFileSize(item.file_size),
-      mimeType: item.mime_type,
-      mediaType: item.media_type,
-      width: item.width,
-      height: item.height,
-      duration: item.duration_seconds,
-      thumbnailUrl: item.thumbnail_path
-    }));
+  async getMediaForMessage(_messageId: string): Promise<MediaMetadata[]> {
+    return [];
   },
 
   /**
-   * Upload avatar image for profile
+   * Upload a profile avatar image (compressed to a small square).
    */
   async uploadAvatar(
     file: File,
-    userId: string
+    _userId: string
   ): Promise<{ success: boolean; url?: string; error?: string }> {
     if (!file.type.startsWith('image/')) {
       return { success: false, error: 'Only images are allowed for avatars' };
@@ -333,36 +243,20 @@ export const mediaService = {
 
     try {
       const compressed = await compressImage(file, 400, 400, 0.9);
-      const filePath = `avatars/${userId}_${Date.now()}.jpg`;
-
-      const { error: uploadError } = await supabase.storage
-        .from(BUCKET_NAME)
-        .upload(filePath, compressed.blob, {
-          contentType: 'image/jpeg',
-          cacheControl: '31536000',
-          upsert: true
-        });
-
-      if (uploadError) {
-        return { success: false, error: uploadError.message };
-      }
-
-      const { data } = supabase.storage
-        .from(BUCKET_NAME)
-        .getPublicUrl(filePath);
-
-      return { success: true, url: data.publicUrl };
-    } catch (err: any) {
-      return { success: false, error: err.message };
+      const avatarFile = new File([compressed.blob], 'avatar.jpg', { type: 'image/jpeg' });
+      const uploaded = await apiUpload<WorkerUploadResponse>('/media/upload', avatarFile);
+      return { success: true, url: uploaded.url };
+    } catch (err) {
+      return { success: false, error: errorMessage(err, 'Failed to upload avatar') };
     }
   },
 
   /**
-   * Upload group avatar
+   * Upload a group avatar image (compressed to a small square).
    */
   async uploadGroupAvatar(
     file: File,
-    groupId: string
+    _groupId: string
   ): Promise<{ success: boolean; url?: string; error?: string }> {
     if (!file.type.startsWith('image/')) {
       return { success: false, error: 'Only images are allowed' };
@@ -370,27 +264,11 @@ export const mediaService = {
 
     try {
       const compressed = await compressImage(file, 400, 400, 0.9);
-      const filePath = `groups/${groupId}_${Date.now()}.jpg`;
-
-      const { error: uploadError } = await supabase.storage
-        .from(BUCKET_NAME)
-        .upload(filePath, compressed.blob, {
-          contentType: 'image/jpeg',
-          cacheControl: '31536000',
-          upsert: true
-        });
-
-      if (uploadError) {
-        return { success: false, error: uploadError.message };
-      }
-
-      const { data } = supabase.storage
-        .from(BUCKET_NAME)
-        .getPublicUrl(filePath);
-
-      return { success: true, url: data.publicUrl };
-    } catch (err: any) {
-      return { success: false, error: err.message };
+      const avatarFile = new File([compressed.blob], 'group-avatar.jpg', { type: 'image/jpeg' });
+      const uploaded = await apiUpload<WorkerUploadResponse>('/media/upload', avatarFile);
+      return { success: true, url: uploaded.url };
+    } catch (err) {
+      return { success: false, error: errorMessage(err, 'Failed to upload avatar') };
     }
   }
 };

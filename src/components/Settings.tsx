@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { toast } from 'sonner';
 import {
   ArrowLeft,
   User,
@@ -44,6 +45,17 @@ const ADMIN_EMAIL = 'kazmiinasir6@gmail.com';
 
 // Check if current user is admin
 const isAdmin = (email: string) => email.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+
+/** Renders an avatar image, falling back to an initial if there's no URL or the image fails to load. */
+function AvatarOrInitial({ src, alt, initial }: { src?: string | null; alt: string; initial: string }) {
+  const [broken, setBroken] = useState(false);
+
+  if (!src || broken) {
+    return <span>{initial}</span>;
+  }
+
+  return <img src={src} alt={alt} onError={() => setBroken(true)} />;
+}
 
 export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: SettingsProps) {
   const [section, setSection] = useState<SettingsSection>('main');
@@ -168,21 +180,30 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
 
     try {
       const file = new File([blob], `avatar_${Date.now()}.jpg`, { type: 'image/jpeg' });
-      const result = await mediaService.uploadMedia(file, currentUser.id);
+      const result = await mediaService.uploadAvatar(file, currentUser.id);
 
-      if (result.success && result.url) {
-        const updateResult = await profileService.updateProfile(currentUser.id, {
-          avatar_url: result.url
-        });
-        if (updateResult.success) {
-          const updatedProfile = await profileService.getProfile(currentUser.id);
-          if (updatedProfile) {
-            onProfileUpdate(updatedProfile);
-          }
-        }
+      if (!result.success || !result.url) {
+        toast.error(result.error || 'Failed to upload photo. Please try again.');
+        return;
       }
-    } catch (error) {
+
+      const updateResult = await profileService.updateProfile(currentUser.id, {
+        avatar_url: result.url
+      });
+
+      if (!updateResult.success) {
+        toast.error(updateResult.error || 'Photo uploaded but could not be saved to your profile.');
+        return;
+      }
+
+      const updatedProfile = await profileService.getProfile(currentUser.id);
+      if (updatedProfile) {
+        onProfileUpdate(updatedProfile);
+      }
+      toast.success('Profile photo updated');
+    } catch (error: any) {
       console.error('Error updating avatar:', error);
+      toast.error(error?.message || 'Something went wrong while updating your photo.');
     } finally {
       setSaving(false);
     }
@@ -320,11 +341,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           {/* Profile Card */}
           <button onClick={() => setSection('profile')} className="settings-profile-card">
             <div className="settings-avatar">
-              {currentUser.avatar_url ? (
-                <img src={currentUser.avatar_url} alt="" />
-              ) : (
-                <span>{currentUser.full_name?.charAt(0)}</span>
-              )}
+              <AvatarOrInitial
+                key={currentUser.avatar_url || 'none'}
+                src={currentUser.avatar_url}
+                alt=""
+                initial={currentUser.full_name?.charAt(0) || '?'}
+              />
             </div>
             <div className="settings-profile-info">
               <h2>{currentUser.full_name}</h2>
@@ -486,11 +508,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           <div className="profile-avatar-section">
             <div className="profile-avatar-wrapper">
               <div className="profile-avatar-large">
-                {currentUser.avatar_url ? (
-                  <img src={currentUser.avatar_url} alt="" />
-                ) : (
-                  <span>{currentUser.full_name?.charAt(0)}</span>
-                )}
+                <AvatarOrInitial
+                  key={currentUser.avatar_url || 'none'}
+                  src={currentUser.avatar_url}
+                  alt=""
+                  initial={currentUser.full_name?.charAt(0) || '?'}
+                />
               </div>
               <label className="profile-camera-btn">
                 <Camera className={`w-5 h-5 ${saving ? 'opacity-50' : ''}`} />
@@ -742,11 +765,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
               {blockedUsers.map((user) => (
                 <div key={user.id} className="blocked-user-item">
                   <div className="blocked-user-avatar">
-                    {user.avatar_url ? (
-                      <img src={user.avatar_url} alt={user.full_name} />
-                    ) : (
-                      <span>{user.full_name?.charAt(0).toUpperCase()}</span>
-                    )}
+                    <AvatarOrInitial
+                      key={user.avatar_url || 'none'}
+                      src={user.avatar_url}
+                      alt={user.full_name}
+                      initial={user.full_name?.charAt(0).toUpperCase() || '?'}
+                    />
                   </div>
                   <div className="blocked-user-info">
                     <span className="blocked-user-name">{user.full_name}</span>
@@ -786,11 +810,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           {/* Admin Badge */}
           <div className="admin-badge">
             <div className="admin-badge-avatar">
-              {currentUser.avatar_url ? (
-                <img src={currentUser.avatar_url} alt="" />
-              ) : (
-                <span>{currentUser.full_name?.charAt(0)}</span>
-              )}
+              <AvatarOrInitial
+                key={currentUser.avatar_url || 'none'}
+                src={currentUser.avatar_url}
+                alt=""
+                initial={currentUser.full_name?.charAt(0) || '?'}
+              />
             </div>
             <div className="admin-badge-info">
               <div className="admin-badge-name">
