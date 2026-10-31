@@ -166,15 +166,17 @@ export function Status({ currentUser, friends }: StatusProps) {
     };
   }, [viewingStatus, viewingMyStatus, isPaused]);
 
-  // Mark status as viewed
+  // Mark status as viewed (not applicable to your own status — viewing your
+  // own updates should never count as a "view" or add you to your own
+  // viewer list, so skip the call entirely).
   useEffect(() => {
-    if (!viewingStatus) return;
+    if (!viewingStatus || viewingMyStatus) return;
 
     const currentStatus = viewingStatus.userStatuses.statuses[viewingStatus.currentIndex];
     if (currentStatus) {
       statusService.viewStatus(currentStatus.id, currentUser.id);
     }
-  }, [viewingStatus?.currentIndex, currentUser.id]);
+  }, [viewingStatus?.currentIndex, viewingMyStatus, currentUser.id]);
 
   // Handle file selection
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -297,7 +299,7 @@ export function Status({ currentUser, friends }: StatusProps) {
             user_profile: currentUser,
             statuses: myStatuses,
             hasUnviewed: false,
-            lastStatusAt: myStatuses[0]?.created_at || ''
+            lastStatusAt: myStatuses[myStatuses.length - 1]?.created_at || ''
           },
           currentIndex: nextIndex
         });
@@ -383,7 +385,7 @@ export function Status({ currentUser, friends }: StatusProps) {
         user_profile: currentUser,
         statuses: myStatuses,
         hasUnviewed: false,
-        lastStatusAt: myStatuses[0]?.created_at || ''
+        lastStatusAt: myStatuses[myStatuses.length - 1]?.created_at || ''
       },
       currentIndex: 0
     });

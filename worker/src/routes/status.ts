@@ -71,7 +71,12 @@ status.post('/', async (c) => {
 status.get('/mine', async (c) => {
   const userId = c.get('userId');
   const { results } = await c.env.DB.prepare(
-    `SELECT * FROM statuses WHERE user_id = ? AND expires_at > datetime('now') ORDER BY created_at DESC`
+    `SELECT s.id, s.user_id, s.content_type, s.content_url, s.text_content, s.background_color,
+            s.font_style, s.thumbnail_url, s.duration, s.caption, s.privacy, s.created_at, s.expires_at,
+            (SELECT COUNT(*) FROM status_views sv WHERE sv.status_id = s.id AND sv.viewer_id != s.user_id) as view_count
+     FROM statuses s
+     WHERE s.user_id = ? AND s.expires_at > datetime('now')
+     ORDER BY s.created_at ASC`
   )
     .bind(userId)
     .all();
@@ -81,6 +86,9 @@ status.get('/mine', async (c) => {
 // Statuses from friends, grouped by user. Includes whether the current
 // viewer has already seen each one, so the client doesn't need a second
 // round trip just to render the unviewed/viewed ring around an avatar.
+// Ordered oldest-first so a contact's multiple updates play back in the
+// order they actually happened (WhatsApp-style) — the client re-sorts
+// which *contact* appears first by most-recent activity separately.
 status.get('/feed', async (c) => {
   const userId = c.get('userId');
   const { results } = await c.env.DB.prepare(
@@ -91,7 +99,7 @@ status.get('/feed', async (c) => {
      JOIN friendships f ON (f.user1_id = ? AND f.user2_id = s.user_id) OR (f.user2_id = ? AND f.user1_id = s.user_id)
      WHERE s.expires_at > datetime('now')
        AND s.user_id NOT IN (SELECT muted_user_id FROM muted_statuses WHERE user_id = ?)
-     ORDER BY s.created_at DESC`
+     ORDER BY s.created_at ASC`
   )
     .bind(userId, userId, userId, userId)
     .all();
@@ -107,6 +115,12 @@ status.post('/:id/view', async (c) => {
     .first<{ user_id: string }>();
   if (!statusRow) return c.json({ error: 'Status not found' }, 404);
 
+  // Viewing your own status is not a "view" — don't record it, don't count
+  // it, and don't notify yourself.
+  if (statusRow.user_id === userId) {
+    return c.json({ success: true });
+  }
+
   const inserted = await c.env.DB.prepare('INSERT OR IGNORE INTO status_views (id, status_id, viewer_id) VALUES (?, ?, ?)')
     .bind(newId(), id, userId)
     .run();
@@ -114,19 +128,17 @@ status.post('/:id/view', async (c) => {
   if (inserted.meta.changes > 0) {
     await c.env.DB.prepare('UPDATE statuses SET view_count = view_count + 1 WHERE id = ?').bind(id).run();
 
-    // Tell the status owner (if it's not their own view) so their viewer
-    // list / view count updates live while they're looking at it.
-    if (statusRow.user_id !== userId) {
-      const viewer = await c.env.DB.prepare('SELECT full_name, username, avatar_url FROM users WHERE id = ?')
-        .bind(userId)
-        .first<{ full_name: string; username: string | null; avatar_url: string | null }>();
-      await broadcastToUser(c.env, statusRow.user_id, {
-        type: 'status:view',
-        status_id: id,
-        viewer_id: userId,
-        viewer_profile: viewer ? { id: userId, ...viewer } : undefined
-      });
-    }
+    // Tell the status owner so their viewer list / view count updates live
+    // while they're looking at it.
+    const viewer = await c.env.DB.prepare('SELECT full_name, username, avatar_url FROM users WHERE id = ?')
+      .bind(userId)
+      .first<{ full_name: string; username: string | null; avatar_url: string | null }>();
+    await broadcastToUser(c.env, statusRow.user_id, {
+      type: 'status:view',
+      status_id: id,
+      viewer_id: userId,
+      viewer_profile: viewer ? { id: userId, ...viewer } : undefined
+    });
   }
 
   return c.json({ success: true });
@@ -136,7 +148,10 @@ status.get('/:id/views', async (c) => {
   const id = c.req.param('id');
   const { results } = await c.env.DB.prepare(
     `SELECT sv.*, u.full_name, u.username, u.avatar_url FROM status_views sv
-     JOIN users u ON u.id = sv.viewer_id WHERE sv.status_id = ? ORDER BY sv.viewed_at DESC`
+     JOIN users u ON u.id = sv.viewer_id
+     JOIN statuses s ON s.id = sv.status_id
+     WHERE sv.status_id = ? AND sv.viewer_id != s.user_id
+     ORDER BY sv.viewed_at DESC`
   )
     .bind(id)
     .all();

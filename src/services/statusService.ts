@@ -226,6 +226,10 @@ export const statusService = {
       if (existing) {
         existing.statuses.push(status);
         if (hasUnviewed) existing.hasUnviewed = true;
+        // Rows arrive oldest-first per user (so the story plays back in the
+        // order it was posted), so the one just pushed is always the most
+        // recent one seen so far — keep lastStatusAt in sync with it.
+        existing.lastStatusAt = status.created_at;
       } else {
         userStatusMap.set(row.user_id, {
           user_id: row.user_id,
