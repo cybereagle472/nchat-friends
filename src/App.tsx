@@ -367,8 +367,21 @@ function MainApp({
   handleProfileUpdate: (profile: UserProfile) => void;
   handleMessageFromHistory: (userId: string) => void;
 }) {
-  // Preload ALL data on mount - this is the key to instant tabs
-  const appData = useAppData(currentUser.id);
+  // Preload ALL data on mount - this is the key to instant tabs. Passing the
+  // currently-open chat's id lets the hook avoid bumping that chat's unread
+  // badge for messages the user is already looking at live.
+  const appData = useAppData(currentUser.id, selectedChat?.user_id ?? null);
+
+  // The moment a chat is opened (from the Chats list, Discover, or call
+  // history), its unread badge should disappear instantly rather than
+  // waiting for the next full chats refresh — which could otherwise race
+  // with the server-side mark-as-read call and leave a stale badge showing.
+  useEffect(() => {
+    if (selectedChat?.user_id) {
+      appData.markChatRead(selectedChat.user_id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedChat?.user_id]);
 
   // `selectedChat` is a snapshot taken at the moment a chat was opened (from
   // the Chats list, Discover, or history), so its `profile` (online status,

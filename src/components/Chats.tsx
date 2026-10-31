@@ -1,4 +1,4 @@
-import { Search, Settings, Plus, Image, Mic, Video, FileText, MapPin } from 'lucide-react';
+import { Search, Settings, Plus, Image, Mic, Video, FileText, MapPin, Check, CheckCheck } from 'lucide-react';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { typingService } from '../services/typingService';
 import { chatService } from '../services/chatService';
@@ -18,56 +18,13 @@ interface ChatsProps {
 export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenSettings }: ChatsProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
-  const [localUnreadCounts, setLocalUnreadCounts] = useState<Map<string, number>>(new Map());
   const typingSubscriptionsRef = useRef<Map<string, { unsubscribe: () => void }>>(new Map());
-  const messageSubscriptionRef = useRef<{ unsubscribe: () => void } | null>(null);
 
-  // Sync local unread counts with props
-  useEffect(() => {
-    const newCounts = new Map<string, number>();
-    chats.forEach(chat => {
-      newCounts.set(chat.user_id, chat.unreadCount || 0);
-    });
-    setLocalUnreadCounts(newCounts);
-  }, [chats]);
-
-  // Subscribe to new messages to update unread counts in real-time
-  useEffect(() => {
-    if (messageSubscriptionRef.current) {
-      messageSubscriptionRef.current.unsubscribe();
-    }
-
-    messageSubscriptionRef.current = chatService.subscribeToMessages(
-      currentUser.id,
-      (message) => {
-        // New message received from someone else - increment unread count
-        if (message.receiver_id === currentUser.id && message.sender_id !== currentUser.id) {
-          setLocalUnreadCounts(prev => {
-            const newCounts = new Map(prev);
-            const currentCount = newCounts.get(message.sender_id) || 0;
-            newCounts.set(message.sender_id, currentCount + 1);
-            return newCounts;
-          });
-        }
-      },
-      () => {} // onUpdate - not needed for unread counts
-    );
-
-    return () => {
-      if (messageSubscriptionRef.current) {
-        messageSubscriptionRef.current.unsubscribe();
-      }
-    };
-  }, [currentUser.id]);
-
-  // Handle opening a chat - clear unread count immediately
+  // Unread counts and "seen" ticks come straight from the `chats` prop now —
+  // it's kept live and instant by useAppData's realtime message/read-receipt
+  // handling, so there's no need (and no benefit) to shadow it with separate
+  // local state here.
   const handleOpenChat = useCallback((contact: Contact) => {
-    // Immediately set unread count to 0 for this chat
-    setLocalUnreadCounts(prev => {
-      const newCounts = new Map(prev);
-      newCounts.set(contact.user_id, 0);
-      return newCounts;
-    });
     onOpenChat(contact);
   }, [onOpenChat]);
 
@@ -147,26 +104,31 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
       return null;
     }
 
-    if (!chat.lastMessage) return { text: 'No messages yet', icon: null };
+    if (!chat.lastMessage) return { text: 'No messages yet', icon: null, deliveryStatus: null };
 
     const isMe = chat.lastMessage.sender_id === currentUser.id;
-    const prefix = isMe ? 'You: ' : '';
+    // WhatsApp-style delivery tick, only for messages *I* sent: a single
+    // gray check once it's reached the server, a double blue check once the
+    // other person has read it (kept live by applyReadReceipt in useAppData).
+    const deliveryStatus: 'sent' | 'read' | null = isMe
+      ? (chat.lastMessage.is_read ? 'read' : 'sent')
+      : null;
 
     switch (chat.lastMessage.type) {
       case 'image':
-        return { text: `${prefix}Photo`, icon: <Image className="w-4 h-4" /> };
+        return { text: `Photo`, icon: <Image className="w-4 h-4" />, deliveryStatus };
       case 'voice':
-        return { text: `${prefix}Voice message`, icon: <Mic className="w-4 h-4" /> };
+        return { text: `Voice message`, icon: <Mic className="w-4 h-4" />, deliveryStatus };
       case 'video':
-        return { text: `${prefix}Video`, icon: <Video className="w-4 h-4" /> };
+        return { text: `Video`, icon: <Video className="w-4 h-4" />, deliveryStatus };
       case 'file':
-        return { text: `${prefix}Document`, icon: <FileText className="w-4 h-4" /> };
+        return { text: `Document`, icon: <FileText className="w-4 h-4" />, deliveryStatus };
       case 'gif':
-        return { text: `${prefix}GIF`, icon: null };
+        return { text: `GIF`, icon: null, deliveryStatus };
       case 'location':
-        return { text: `${prefix}Location`, icon: <MapPin className="w-4 h-4" /> };
+        return { text: `Location`, icon: <MapPin className="w-4 h-4" />, deliveryStatus };
       default:
-        return { text: `${prefix}${chat.lastMessage.content}`, icon: null };
+        return { text: `${chat.lastMessage.content}`, icon: null, deliveryStatus };
     }
   };
 
@@ -225,7 +187,7 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
             {filteredChats.map((chat) => {
               const isTyping = typingUsers.has(chat.user_id);
               const messagePreview = getMessagePreview(chat);
-              const unreadCount = localUnreadCounts.get(chat.user_id) || 0;
+              const unreadCount = chat.unreadCount || 0;
               const hasUnread = unreadCount > 0;
 
               return (
@@ -271,6 +233,15 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
                         </div>
                       ) : messagePreview && (
                         <div className={`chat-list-preview ${hasUnread ? 'unread' : ''}`}>
+                          {messagePreview.deliveryStatus && (
+                            <span className="chat-list-preview-icon chat-list-delivery-tick">
+                              {messagePreview.deliveryStatus === 'read' ? (
+                                <CheckCheck className="w-3.5 h-3.5 text-sky-500" strokeWidth={2.5} />
+                              ) : (
+                                <Check className="w-3.5 h-3.5 text-slate-400" strokeWidth={2.5} />
+                              )}
+                            </span>
+                          )}
                           {messagePreview.icon && <span className="chat-list-preview-icon">{messagePreview.icon}</span>}
                           <span className="chat-list-preview-text">{messagePreview.text}</span>
                         </div>

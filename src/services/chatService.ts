@@ -642,10 +642,10 @@ export const chatService = {
    */
   subscribeToReadReceipts(
     _userId: string,
-    onMessagesRead: (messageIds: string[]) => void
+    onMessagesRead: (messageIds: string[], readerId: string) => void
   ) {
     return realtimeClient.on('message:read', (payload) => {
-      if (payload.message_ids) onMessagesRead(payload.message_ids);
+      if (payload.message_ids) onMessagesRead(payload.message_ids, payload.reader_id);
     });
   },
 
