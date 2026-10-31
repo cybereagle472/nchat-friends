@@ -146,6 +146,52 @@ let globalCache: AppData = { ...INITIAL_DATA };
 // at most once per page load, regardless of how many times useAppData mounts.
 let localMessageStoreRepaired = false;
 
+/**
+ * Merge a freshly-fetched (server-authoritative) chat list with whatever is
+ * already in local state, without ever letting the fetch regress a chat the
+ * client already knows more about.
+ *
+ * getChatList() is called from several places (initial load, periodic
+ * friends/requests refreshes, pull-to-refresh) that can land at any time,
+ * including moments after a live message or read-receipt event already
+ * patched `unreadCount`/`lastMessage` in place locally. If that local patch
+ * happens to be newer than what this particular fetch captured (a normal
+ * race — the fetch was in flight before the live event landed, or the
+ * server's own read model hasn't caught up with a write that just
+ * happened), blindly replacing the whole list with the fetch's result would
+ * snap an already-correct unread badge back to a stale value, making it
+ * flicker or disappear for no reason visible to the user.
+ */
+function mergeChatLists(serverChats: Contact[], localChats: Contact[]): Contact[] {
+  if (localChats.length === 0) return serverChats;
+  const localByUser = new Map(localChats.map(c => [c.user_id, c]));
+
+  return serverChats.map(serverChat => {
+    const local = localByUser.get(serverChat.user_id);
+    if (!local) return serverChat;
+
+    const serverTime = serverChat.lastMessage ? new Date(serverChat.lastMessage.created_at).getTime() : 0;
+    const localTime = local.lastMessage ? new Date(local.lastMessage.created_at).getTime() : 0;
+
+    if (localTime > serverTime) {
+      // Local state has seen a newer message than this fetch did — trust
+      // its lastMessage/unreadCount instead of overwriting them.
+      return { ...serverChat, lastMessage: local.lastMessage, unreadCount: local.unreadCount };
+    }
+
+    if (localTime === serverTime && (local.unreadCount || 0) !== (serverChat.unreadCount || 0)) {
+      // Same latest message, but the unread counts disagree (e.g. the
+      // client already zeroed it on open while this fetch still reflects
+      // the pre-read-receipt count) — prefer whichever is lower, since the
+      // only way they'd disagree here is one side already knowing about a
+      // read that the other hasn't caught up with yet.
+      return { ...serverChat, unreadCount: Math.min(local.unreadCount || 0, serverChat.unreadCount || 0) };
+    }
+
+    return serverChat;
+  });
+}
+
 export function useAppData(userId: string, activeChatUserId?: string | null) {
   // INSTANT: Try localStorage cache first (synchronous, 0ms)
   const [data, setData] = useState<AppData>(() => {
@@ -303,8 +349,8 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
         }
       }
 
-      updateData({
-        chats,
+      updateData(prev => ({
+        chats: mergeChatLists(chats, prev.chats),
         friends,
         groups,
         friendRequests,
@@ -312,7 +358,7 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
         sentRequestIds,
         callHistory: historyItems,
         isReady: true
-      });
+      }));
 
     } catch (error) {
       console.error('Error loading app data:', error);
@@ -327,7 +373,7 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
     const friendIds = data.friends.map(f => f.id);
     if (friendIds.length > 0) {
       const chats = await chatService.getChatList(userId, friendIds);
-      updateData({ chats });
+      updateData(prev => ({ chats: mergeChatLists(chats, prev.chats) }));
     }
   }, [userId, data.friends, updateData]);
 
@@ -449,7 +495,7 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
       // Also refresh chats since friend list changed
       if (result.data.friendIds.length > 0) {
         const chats = await chatService.getChatList(userId, result.data.friendIds);
-        updateData({ chats });
+        updateData(prev => ({ chats: mergeChatLists(chats, prev.chats) }));
       }
     }
   }, [userId, updateData]);
@@ -507,7 +553,7 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
       updateData({ friends });
       if (friendIds.length > 0) {
         const chats = await chatService.getChatList(userId, friendIds);
-        updateData({ chats });
+        updateData(prev => ({ chats: mergeChatLists(chats, prev.chats) }));
       }
     }
   }, [userId, updateData]);
