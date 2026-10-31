@@ -1,0 +1,37 @@
+name = "nchat-api"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── D1 database (replaces Supabase Postgres) ──
+# Create with: wrangler d1 create nchat-db
+# Then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "nchat-db"
+database_id = "6dc0888d-645c-470c-8f27-fa8d5a21ba80"
+
+# ── R2 bucket (replaces Supabase Storage) ──
+# Create with: wrangler r2 bucket create nchat-media
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "nchat-media"
+
+# ── Durable Object for realtime (replaces Supabase Realtime) ──
+[[durable_objects.bindings]]
+name = "REALTIME"
+class_name = "RealtimeRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RealtimeRoom"]
+
+[vars]
+# Public base URL this Worker is deployed at (used to build media URLs).
+# Set the real one after your first `wrangler deploy`.
+PUBLIC_API_URL = "https://nchat-api.YOUR-SUBDOMAIN.workers.dev"
+
+# ── Secrets (set these, never commit them) ──
+# wrangler secret put JWT_SECRET
+# wrangler secret put VAPID_PUBLIC_KEY
+# wrangler secret put VAPID_PRIVATE_KEY
