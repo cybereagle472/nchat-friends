@@ -1895,9 +1895,38 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         style={{ display: 'none', position: 'absolute', visibility: 'hidden' }}
       />
 
-      {/* Message Input - Glassy Modern Design */}
-      {!voiceState.isRecording && (
-        <div className="relative z-10 px-3 py-3 pb-[max(12px,env(safe-area-inset-bottom))]">
+      {/* Message Input - Glassy Modern Design.
+          IMPORTANT: this used to be conditionally UNMOUNTED while recording
+          ({!voiceState.isRecording && (...)}), which removed the mic
+          <button> (the exact element that received touchstart) from the
+          DOM the instant recording began. Per the touch-events spec, once
+          an active touch's original target is disconnected from the
+          document, some browsers (confirmed: Android Chrome on the
+          reporting user's device) stop delivering touchmove/touchend for
+          that touch at all — they do NOT reliably re-target/bubble to a
+          surviving ancestor like `document`, even though Round 2's fix
+          assumed they would. That's why slide-to-cancel/slide-up-to-lock
+          never worked on a real phone despite listeners being correctly
+          attached to `document`: the events were never being dispatched
+          anywhere once the button vanished.
+          Fix: keep this whole block mounted at all times, and hide it with
+          an off-screen/opacity-0/pointer-events-none style instead of
+          unmounting it. `position: fixed` takes it out of layout flow so
+          it can't cause a layout shift or block the recording overlay
+          rendered on top of it. */}
+      <div
+        className="relative z-10 px-3 py-3 pb-[max(12px,env(safe-area-inset-bottom))]"
+        style={voiceState.isRecording ? {
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          width: 1,
+          height: 1,
+          overflow: 'hidden',
+          opacity: 0,
+          pointerEvents: 'none'
+        } : undefined}
+      >
           {/* Reply Preview */}
           {replyToMessage && (
             <div className="mb-2 bg-white/90 backdrop-blur-sm rounded-xl px-3 py-2 flex items-start gap-2 border-l-4 border-violet-500">
@@ -2009,7 +2038,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
             </div>
           </div>
         </div>
-      )}
 
       {/* Click outside to close media options */}
       {showMediaOptions && (
