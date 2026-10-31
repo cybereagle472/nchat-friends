@@ -981,9 +981,19 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           duration: durationSeconds,
           waveform: downsampleWaveform(waveformSamples)
         });
+      } else {
+        // Previously failed silently here with no feedback at all whenever
+        // uploadMedia rejected the recording (e.g. the MIME-type mismatch
+        // bug where MediaRecorder's "audio/webm;codecs=opus" never matched
+        // the supported-types allowlist's bare "audio/webm") — the user saw
+        // the recording UI finish normally with no error and no bubble, and
+        // had no way to tell anything had gone wrong. Surface it instead.
+        console.error('Voice message upload failed:', result.error);
+        alert(`Couldn't send voice message${result.error ? `: ${result.error}` : '.'} Please try again.`);
       }
     } catch (error) {
       console.error('Error sending voice message:', error);
+      alert('Couldn\'t send voice message. Please check your connection and try again.');
     } finally {
       setUploading(false);
     }

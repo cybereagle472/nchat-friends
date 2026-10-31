@@ -261,6 +261,9 @@ export const isSupportedFileType = (file: File): boolean => {
     'audio/webm',
     'audio/ogg',
     'audio/m4a',
+    'audio/mp4',
+    'audio/x-m4a',
+    'audio/aac',
     // Documents
     'application/pdf',
     'application/msword',
@@ -275,7 +278,15 @@ export const isSupportedFileType = (file: File): boolean => {
     'application/x-rar-compressed',
   ];
 
-  return supportedTypes.includes(file.type);
+  // MediaRecorder-produced blobs report a MIME type WITH codec parameters
+  // (e.g. "audio/webm;codecs=opus" on Chrome/Android, "audio/mp4;codecs=mp4a.40.2"
+  // on Safari/iOS) rather than the bare "audio/webm" in the list above. An
+  // exact-match `.includes(file.type)` check was rejecting every voice
+  // recording as an "unsupported file type" before the upload even started
+  // — the recording UI worked perfectly but sends silently did nothing.
+  // Strip any ";codecs=..." suffix before comparing.
+  const baseType = file.type.split(';')[0].trim().toLowerCase();
+  return supportedTypes.includes(baseType);
 };
 
 // Get max file size for type
