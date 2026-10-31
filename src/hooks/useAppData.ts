@@ -344,6 +344,14 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
     const isIncoming = message.receiver_id === userId;
     const isActivelyViewing = isIncoming && activeChatUserIdRef.current === message.sender_id;
 
+    // Keep chatService's per-conversation message cache warm even while that
+    // chat is closed. Without this, opening the chat afterwards has to rely
+    // on a full server round trip to pick up messages that arrived while it
+    // was shut, and would show a stale list for a moment in the meantime.
+    // (Idempotent — if ChatView is open for this exact chat it will have
+    // already applied the same update itself.)
+    chatService.updateCache(userId, otherUserId, message);
+
     updateData((prev) => {
       const idx = prev.chats.findIndex(c => c.user_id === otherUserId);
       if (idx === -1) {

@@ -387,9 +387,14 @@ export const chatService = {
 
           const mergedMessages = this.mergeMessages(localMessages, localMessagesToSave);
 
+          // mergeMessages sorts ascending (oldest first), so once a chat has
+          // accumulated more than `limit` messages, slicing from the front
+          // silently drops the newest ones — including the message that just
+          // arrived while the chat was closed. Keep the most recent `limit`
+          // instead.
           return mergedMessages
             .filter(m => !m.deleted_for?.includes(userId))
-            .slice(0, limit) as Message[];
+            .slice(-limit) as Message[];
         }
       } catch (error) {
         console.error('Error syncing messages:', error);
