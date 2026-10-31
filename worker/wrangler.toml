@@ -29,7 +29,7 @@ new_sqlite_classes = ["RealtimeRoom"]
 [vars]
 # Public base URL this Worker is deployed at (used to build media URLs).
 # Set the real one after your first `wrangler deploy`.
-PUBLIC_API_URL = "https://nchat-friends.YOUR-SUBDOMAIN.workers.dev"
+PUBLIC_API_URL = "https://nchat-friends.usa66486.workers.dev"
 
 # ── Secrets (set these, never commit them) ──
 # wrangler secret put JWT_SECRET
