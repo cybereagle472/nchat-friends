@@ -63,6 +63,13 @@ export interface SendMessageParams {
   content: string;
   type?: Message['type'];
   duration?: number;
+  /**
+   * Optional precomputed waveform/preview data. Reuses the `thumbnail_url`
+   * column server-side (meaningless for voice messages otherwise) so voice
+   * bubbles can render the *actual* recorded amplitude instead of a fake
+   * placeholder, with no schema changes required.
+   */
+  waveform?: string;
   replyToId?: string;
   /**
    * Optional caller-supplied idempotency id. Pass the same id you used for
@@ -94,6 +101,7 @@ export const chatService = {
       content,
       type = 'text',
       duration,
+      waveform,
       replyToId
     } = params;
 
@@ -120,6 +128,7 @@ export const chatService = {
       content,
       type,
       duration: duration?.toString(),
+      thumbnail_url: waveform,
       reply_to: replyToId,
       created_at: now,
       is_read: false,
@@ -143,6 +152,7 @@ export const chatService = {
         content,
         type,
         duration,
+        waveform,
         replyToId,
         createdAt: now,
         retryCount: 0,
@@ -166,6 +176,7 @@ export const chatService = {
         content,
         type,
         duration,
+        waveform,
         replyToId
       });
 
@@ -192,6 +203,7 @@ export const chatService = {
           content,
           type,
           duration,
+          waveform,
           replyToId,
           createdAt: now,
           retryCount: 1,
@@ -216,6 +228,7 @@ export const chatService = {
         content,
         type,
         duration,
+        waveform,
         replyToId,
         createdAt: now,
         retryCount: 1,
@@ -243,6 +256,7 @@ export const chatService = {
     content: string;
     type: string;
     duration?: number;
+    waveform?: string;
     replyToId?: string;
   }): Promise<{ success: boolean; message?: Message; error?: string }> {
     try {
@@ -254,6 +268,7 @@ export const chatService = {
             content: params.content,
             type: params.type,
             duration: params.duration,
+            thumbnail_url: params.waveform,
             reply_to: params.replyToId,
             client_message_id: params.clientMessageId
           })
@@ -301,6 +316,7 @@ export const chatService = {
           content: pending.content,
           type: pending.type,
           duration: pending.duration || undefined,
+          waveform: pending.waveform,
           replyToId: pending.replyToId
         });
 

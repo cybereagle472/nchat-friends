@@ -44,6 +44,7 @@ export interface PendingMessage {
   type: string;
   messageType?: 'direct' | 'group';  // To distinguish message types
   duration?: number;
+  waveform?: string;
   replyToId?: string;
   createdAt: string;
   retryCount: number;

@@ -19,6 +19,29 @@ const debounce = <T extends (...args: Parameters<T>) => void>(fn: T, delay: numb
   };
 };
 
+// Number of bars drawn in a voice message's waveform (both when recording it
+// into a storable string and when rendering it back in the bubble) — a
+// single shared constant keeps the two sides in sync.
+const VOICE_WAVEFORM_BARS = 35;
+
+// Collapse the real amplitude samples captured during a recording (one per
+// animation frame, so potentially thousands for a long message) down to a
+// fixed number of bars representing the *whole* recording, so the sent
+// message's waveform reflects the actual audio instead of a fake pattern.
+function downsampleWaveform(samples: number[], targetBars: number = VOICE_WAVEFORM_BARS): string {
+  if (samples.length === 0) return '';
+  const bucketSize = samples.length / targetBars;
+  const bars: number[] = [];
+  for (let i = 0; i < targetBars; i++) {
+    const start = Math.floor(i * bucketSize);
+    const end = Math.max(start + 1, Math.floor((i + 1) * bucketSize));
+    const slice = samples.slice(start, end);
+    const avg = slice.reduce((a, b) => a + b, 0) / (slice.length || 1);
+    bars.push(Math.round(avg * 100) / 100);
+  }
+  return bars.join(',');
+}
+
 // Memoized Message Bubble - prevents re-render of all messages when one changes
 interface MessageBubbleProps {
   message: Message;
@@ -242,6 +265,16 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  // Every amplitude sample captured for the recording in progress (unlike
+  // voiceState.waveformData, which is cropped to a short sliding window for
+  // the live "now recording" visual, this keeps the full recording so a
+  // real, whole-message waveform can be saved and shown once it's sent).
+  const fullWaveformRef = useRef<number[]>([]);
+  // Snapshot of the duration/waveform at the moment recording stops — the
+  // MediaRecorder's onstop callback fires asynchronously afterward, by which
+  // point voiceState has already been reset back to 0/empty, so it can't be
+  // read directly from there.
+  const lastRecordingRef = useRef<{ duration: number; waveform: number[] }>({ duration: 0, waveform: [] });
 
   // Media Viewer
   const [mediaViewer, setMediaViewer] = useState<MediaViewerState>({
@@ -692,6 +725,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   const startRecording = async () => {
     console.log('Starting voice recording...');
     isCancellingRef.current = false;
+    fullWaveformRef.current = [];
 
     try {
       // Request microphone permission
@@ -753,9 +787,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
         // Use ref instead of state to avoid stale closure
         if (!isCancellingRef.current && audioChunksRef.current.length > 0) {
-          const audioBlob = new Blob(audioChunksRef.current, { type: mimeType || 'audio/webm' });
-          console.log('Sending voice message, blob size:', audioBlob.size);
-          await sendVoiceMessage(audioBlob);
+          const actualType = mediaRecorder.mimeType || mimeType || 'audio/webm';
+          const audioBlob = new Blob(audioChunksRef.current, { type: actualType });
+          console.log('Sending voice message, blob size:', audioBlob.size, 'type:', actualType);
+          const { duration, waveform } = lastRecordingRef.current;
+          await sendVoiceMessage(audioBlob, duration, waveform);
         }
       };
 
@@ -785,6 +821,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         // Get average amplitude from frequency data
         const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
         const normalizedValue = average / 255;
+        fullWaveformRef.current.push(normalizedValue);
 
         setVoiceState(prev => ({
           ...prev,
@@ -819,6 +856,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   const stopRecording = (cancel: boolean = false) => {
     console.log('Stopping recording, cancel:', cancel);
 
+    // Snapshot the final duration/waveform now, while voiceState still has
+    // them — onstop (below) fires asynchronously and runs after voiceState
+    // has already been reset to 0/empty by the setVoiceState call below.
+    lastRecordingRef.current = { duration: voiceState.duration, waveform: fullWaveformRef.current };
+
     if (recordingIntervalRef.current) {
       clearInterval(recordingIntervalRef.current);
       recordingIntervalRef.current = null;
@@ -848,10 +890,22 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     });
   };
 
-  const sendVoiceMessage = async (audioBlob: Blob) => {
+  const sendVoiceMessage = async (audioBlob: Blob, durationSeconds: number, waveformSamples: number[]) => {
     setUploading(true);
     try {
-      const file = new File([audioBlob], `voice_${Date.now()}.webm`, { type: 'audio/webm' });
+      // Use the blob's *actual* recorded type (webm/mp4/ogg, whichever the
+      // browser negotiated — e.g. Safari/iOS records audio/mp4, not webm)
+      // instead of a hardcoded one, otherwise the file is uploaded with a
+      // mismatched extension/Content-Type and silently fails to play back.
+      const actualType = audioBlob.type || 'audio/webm';
+      const extension = actualType.includes('mp4')
+        ? 'm4a'
+        : actualType.includes('ogg')
+          ? 'ogg'
+          : actualType.includes('wav')
+            ? 'wav'
+            : 'webm';
+      const file = new File([audioBlob], `voice_${Date.now()}.${extension}`, { type: actualType });
       const result = await mediaService.uploadMedia(file, currentUser.id);
 
       if (result.success && result.url) {
@@ -859,7 +913,9 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           senderId: currentUser.id,
           receiverId: contact.user_id,
           content: result.url,
-          type: 'voice'
+          type: 'voice',
+          duration: durationSeconds,
+          waveform: downsampleWaveform(waveformSamples)
         });
       }
     } catch (error) {
@@ -1041,30 +1097,41 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     const [playbackProgress, setPlaybackProgress] = useState(0);
     const [currentTime, setCurrentTime] = useState(0);
     const [duration, setDuration] = useState(0);
-    const bars = 35;
+    const bars = VOICE_WAVEFORM_BARS;
     const isPlaying = playingAudio === message.id;
     const audioUrl = message.media_url || message.content;
 
-    // Generate a deterministic waveform pattern based on messageId
+    // Voice messages sent after this fix carry their *real* recorded
+    // amplitude in thumbnail_url (reusing that otherwise-unused column, see
+    // chatService's `waveform` param). Older messages sent before the fix
+    // don't have it, so fall back to a deterministic placeholder pattern
+    // based on the message id, rather than showing nothing.
     useEffect(() => {
-      const generateWaveform = () => {
-        const data: number[] = [];
-        let hash = 0;
-        for (let i = 0; i < message.id.length; i++) {
-          hash = ((hash << 5) - hash) + message.id.charCodeAt(i);
-          hash |= 0;
-        }
+      const real = (message.thumbnail_url ?? '')
+        .split(',')
+        .map((n) => parseFloat(n))
+        .filter((n) => !isNaN(n) && isFinite(n));
 
-        for (let i = 0; i < bars; i++) {
-          const seed = Math.abs(Math.sin(hash * (i + 1) * 0.1)) * 0.6;
-          const variation = Math.abs(Math.sin(i * 0.4)) * 0.3;
-          const noise = Math.abs(Math.cos(hash * i * 0.05)) * 0.1;
-          data.push(0.2 + seed + variation + noise);
-        }
-        setWaveformData(data);
-      };
-      generateWaveform();
-    }, [message.id]);
+      if (real.length > 0) {
+        setWaveformData(real);
+        return;
+      }
+
+      const data: number[] = [];
+      let hash = 0;
+      for (let i = 0; i < message.id.length; i++) {
+        hash = ((hash << 5) - hash) + message.id.charCodeAt(i);
+        hash |= 0;
+      }
+
+      for (let i = 0; i < bars; i++) {
+        const seed = Math.abs(Math.sin(hash * (i + 1) * 0.1)) * 0.6;
+        const variation = Math.abs(Math.sin(i * 0.4)) * 0.3;
+        const noise = Math.abs(Math.cos(hash * i * 0.05)) * 0.1;
+        data.push(0.2 + seed + variation + noise);
+      }
+      setWaveformData(data);
+    }, [message.id, message.thumbnail_url, bars]);
 
     // Track playback progress and duration
     useEffect(() => {
