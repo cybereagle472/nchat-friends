@@ -1706,9 +1706,39 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         </div>
       )}
 
+      {/* TEMP DEBUG — remove once the slide-to-cancel/lock gesture is
+          confirmed fixed. Shows live numbers so we can tell from a
+          screenshot whether touchmove is even reaching our handlers (the
+          numbers should change the instant you start dragging), instead of
+          guessing from how the overlay looks. */}
+      {voiceState.isRecording && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 'max(6px, env(safe-area-inset-top))',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 9999,
+            background: 'rgba(0,0,0,0.85)',
+            color: '#0f0',
+            fontFamily: 'monospace',
+            fontSize: '11px',
+            padding: '4px 8px',
+            borderRadius: '6px',
+            whiteSpace: 'nowrap',
+            pointerEvents: 'none'
+          }}
+        >
+          dx:{Math.round(voiceState.startX - voiceState.currentX)} lockProg:{voiceState.lockProgress.toFixed(2)} locked:{String(voiceState.isLocked)} cancel:{String(voiceState.isCancelling)} dur:{voiceState.duration}
+        </div>
+      )}
+
       {/* Voice Recording UI - WhatsApp Style */}
       {voiceState.isRecording && (
-        <div className="absolute bottom-0 left-0 right-0 z-30 bg-white border-t border-slate-200">
+        <div
+          className="absolute bottom-0 left-0 right-0 z-30 bg-white border-t border-slate-200"
+          style={{ touchAction: 'none', overscrollBehavior: 'none' }}
+        >
           {voiceState.isLocked ? (
             // Locked Recording Mode
             <div className="px-4 py-3">
