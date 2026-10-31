@@ -22,7 +22,11 @@ const debounce = <T extends (...args: Parameters<T>) => void>(fn: T, delay: numb
 // Number of bars drawn in a voice message's waveform (both when recording it
 // into a storable string and when rendering it back in the bubble) — a
 // single shared constant keeps the two sides in sync.
-const VOICE_WAVEFORM_BARS = 35;
+// Fewer, slightly taller/bolder bars read as a much more deliberate,
+// "designed" waveform at typical bubble widths than a dense row of 35 thin
+// slivers does — the latter is what made sent voice messages look like a
+// flat dotted line rather than a proper waveform.
+const VOICE_WAVEFORM_BARS = 27;
 
 // Collapse the real amplitude samples captured during a recording (one per
 // animation frame, so potentially thousands for a long message) down to a
@@ -162,8 +166,16 @@ const MessageBubble = memo(function MessageBubble({
           onTouchEnd={handleTouchEnd}
           onContextMenu={handleContextMenu}
         >
+          {/* This inner bubble used to also be `max-w-[80%]`, but its
+              parent (.message-bubble-wrapper, right above) is ALREADY
+              capped at `max-width: 80%` of the message row. Two nested
+              80% caps compound multiplicatively — the bubble could only
+              ever reach 80% * 80% = 64% of the row's width, so text wrapped
+              far earlier than it needed to and short messages looked
+              disproportionately tall/narrow. The wrapper's limit is the
+              only one that should apply; this one just fills it. */}
           <div
-            className={`max-w-[80%] rounded-2xl px-3 py-2 select-none ${
+            className={`max-w-full rounded-2xl px-3 py-2 select-none ${
               isOwn
                 ? 'bg-gradient-to-r from-violet-500 to-purple-500 text-white rounded-br-md'
                 : 'bg-white text-slate-800 rounded-bl-md shadow-sm'
@@ -239,6 +251,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   const [inputMessage, setInputMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
+  const [isContactRecording, setIsContactRecording] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [showMediaOptions, setShowMediaOptions] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(
@@ -480,10 +493,21 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
       }
     );
 
+    const recordingSubscription = typingService.subscribeToRecording(
+      currentUser.id,
+      contact.user_id,
+      (userId, recording) => {
+        if (userId === contact.user_id) {
+          setIsContactRecording(recording);
+        }
+      }
+    );
+
     return () => {
       subscription.unsubscribe();
       readReceiptSubscription.unsubscribe();
       typingSubscription.unsubscribe();
+      recordingSubscription.unsubscribe();
     };
   }, [currentUser.id, contact.user_id, loadMessages]);
 
@@ -899,6 +923,12 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
       updateWaveform();
       startDurationTimer();
 
+      // Let the contact know a voice message is being recorded — same
+      // realtime mechanism as the typing indicator, just its own event type
+      // so their header/list can show "recording audio..." instead of
+      // typing dots (WhatsApp makes the same distinction).
+      typingService.sendRecording(currentUser.id, contact.user_id);
+
     } catch (error) {
       console.error('Error starting recording:', error);
       alert('Could not access microphone. Please allow microphone access and try again.');
@@ -919,10 +949,24 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   const stopRecording = (cancel: boolean = false) => {
     console.log('Stopping recording, cancel:', cancel);
 
+    // Tell the contact recording has ended, whether it's being sent or
+    // cancelled — their "recording audio..." indicator shouldn't outlive
+    // the actual recording (it also auto-expires after a few seconds on
+    // their end as a safety net, but this makes it disappear instantly).
+    typingService.sendStoppedRecording(currentUser.id, contact.user_id);
+
     // Snapshot the final duration/waveform now, while voiceState still has
     // them — onstop (below) fires asynchronously and runs after voiceState
     // has already been reset to 0/empty by the setVoiceState call below.
-    lastRecordingRef.current = { duration: voiceState.duration, waveform: fullWaveformRef.current };
+    // `voiceState.duration` only increments once per *completed* second
+    // (see startDurationTimer), so any recording released before its first
+    // full second elapsed — anywhere from the ~300ms minimum hold up to
+    // just under 1s — reports 0 even though real audio was captured. A
+    // sent voice message is never actually silent/instant (the accidental-
+    // tap guard above already filters those out), so floor the displayed/
+    // stored duration at 1 second, matching WhatsApp's own convention of
+    // never showing a voice note as "0:00".
+    lastRecordingRef.current = { duration: Math.max(1, voiceState.duration), waveform: fullWaveformRef.current };
 
     if (recordingIntervalRef.current) {
       clearInterval(recordingIntervalRef.current);
@@ -1277,7 +1321,12 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
       return `${mins}:${secs.toString().padStart(2, '0')}`;
     };
 
-    const displayTime = isPlaying ? formatAudioTime(currentTime) : formatAudioTime(duration || parseFloat(message.duration || '0'));
+    // Floor at 1s for the same reason the recorder now floors it when
+    // saving (see stopRecording) — covers any voice message sent before
+    // that fix which may still have a stored duration of exactly 0.
+    const displayTime = isPlaying
+      ? formatAudioTime(currentTime)
+      : formatAudioTime(Math.max(1, duration || parseFloat(message.duration || '0')));
 
     return (
       <div className={`voice-message-bubble ${isOwn ? 'own' : 'received'}`}>
@@ -1301,14 +1350,21 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
             {waveformData.map((value, i) => {
               const isPlayed = i < playedBars;
               const isPlayhead = isPlaying && i === playedBars;
+              // Real recorded amplitude tends to cluster low (most speech
+              // only lights up a fraction of the frequency bins an average
+              // is taken over), so a plain linear scale plus a small floor
+              // still rendered as a near-flat row of dots. A gamma curve
+              // (sqrt-ish) lifts quieter bars more than loud ones, and a
+              // higher floor guarantees every bar reads as a real bar —
+              // together these make even a quiet recording look like an
+              // actual waveform instead of a dotted line.
+              const clamped = Math.max(0, Math.min(1, value));
+              const visualHeight = Math.max(0.3, Math.pow(clamped, 0.55));
               return (
                 <div
                   key={i}
                   className={`voice-waveform-bar ${isOwn ? 'own' : 'received'} ${isPlayed ? 'played' : ''} ${isPlayhead ? 'playhead' : ''}`}
-                  // Floor the height so a quiet/near-silent recording still
-                  // reads as a real waveform instead of looking like a flat
-                  // dotted line — always show at least ~22% of the track.
-                  style={{ height: `${Math.max(0.22, value) * 100}%` }}
+                  style={{ height: `${visualHeight * 100}%` }}
                 />
               );
             })}
@@ -1552,8 +1608,21 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
           <div className="flex-1 min-w-0">
             <h2 className="text-base font-semibold truncate">{contact.profile.full_name}</h2>
-            <p key={isTyping ? 'typing' : 'status'} className="text-xs text-white/80 h-4 flex items-center animate-fade-in">
-              {isTyping ? (
+            <p
+              key={isContactRecording ? 'recording' : isTyping ? 'typing' : 'status'}
+              className="text-xs text-white/80 h-4 flex items-center animate-fade-in"
+            >
+              {isContactRecording ? (
+                <span className="flex items-center gap-1.5 text-green-300 font-medium">
+                  <Mic className="w-3 h-3 recording-indicator-mic" strokeWidth={2.5} />
+                  recording audio
+                  <span className="flex items-end gap-0.5 h-2">
+                    <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '0ms' }} />
+                    <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '150ms' }} />
+                    <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '300ms' }} />
+                  </span>
+                </span>
+              ) : isTyping ? (
                 <span className="flex items-center gap-1.5 text-green-300 font-medium">
                   typing
                   <span className="flex items-end gap-0.5 h-2">
@@ -2478,20 +2547,20 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           display: flex;
           align-items: center;
           justify-content: space-between;
-          gap: 2px;
-          height: 26px;
+          gap: 2.5px;
+          height: 30px;
         }
 
         .voice-waveform-bar {
           width: 3px;
           flex-shrink: 0;
-          border-radius: 3px;
+          border-radius: 2px;
           transition: height 0.1s ease, background 0.15s ease, transform 0.15s ease;
-          min-height: 4px;
+          min-height: 6px;
         }
 
         .voice-waveform-bar.own {
-          background: rgba(255, 255, 255, 0.4);
+          background: rgba(255, 255, 255, 0.45);
         }
 
         .voice-waveform-bar.own.played {

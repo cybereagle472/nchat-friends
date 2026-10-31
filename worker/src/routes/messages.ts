@@ -295,4 +295,22 @@ messages.post('/typing', async (c) => {
   return c.json({ success: true });
 });
 
+// POST /messages/recording — ephemeral "recording a voice message"
+// indicator. Mirrors /messages/typing exactly but as its own event type, so
+// a client can show a distinct "recording audio..." state (with a mic icon)
+// instead of the plain typing dots — same as WhatsApp distinguishes the two.
+messages.post('/recording', async (c) => {
+  const userId = c.get('userId');
+  const { receiver_id, is_recording } = await c.req.json().catch(() => ({}));
+  if (!receiver_id) return c.json({ error: 'receiver_id is required' }, 400);
+
+  await broadcastToUser(c.env, receiver_id, {
+    type: 'recording',
+    sender_id: userId,
+    is_recording: !!is_recording,
+  });
+
+  return c.json({ success: true });
+});
+
 export default messages;

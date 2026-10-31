@@ -179,6 +179,21 @@
   animation: typingDotBounce 1.4s ease-in-out infinite;
 }
 
+@keyframes recordingMicPulse {
+  0%, 100% {
+    opacity: 0.6;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+.recording-indicator-mic {
+  animation: recordingMicPulse 1s ease-in-out infinite;
+}
+
 @keyframes scaleIn {
   from {
     transform: scale(0.92);

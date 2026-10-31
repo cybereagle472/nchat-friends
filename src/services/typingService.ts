@@ -1,11 +1,17 @@
 /**
- * Typing Service — Real-time typing indicators
+ * Typing Service — Real-time typing & voice-recording indicators
  *
  * Purely ephemeral: nothing is persisted to a database. A "typing" event is
  * sent as a tiny POST to the Worker (see worker/src/routes/messages.ts
  * POST /messages/typing), which immediately fans it out into the other
  * user's personal realtime room over the shared WebSocket
  * (src/lib/realtimeClient.ts) — no Supabase Realtime channel needed.
+ *
+ * The "recording a voice message" indicator (POST /messages/recording)
+ * works identically — same debounce/auto-expire/subscribe shape, just a
+ * distinct event type — so a chat can show "recording audio..." instead of
+ * plain typing dots while the other person is holding the mic button, the
+ * same way WhatsApp distinguishes the two.
  *
  * Group typing isn't wired up yet (group conversations don't have a
  * realtime room the client subscribes to at all currently), so those
@@ -15,7 +21,8 @@ import { apiFetch } from '../lib/apiClient';
 import { realtimeClient } from '../lib/realtimeClient';
 import { log } from '../utils/logger';
 
-// Typing state expires after this duration (ms) if no further event arrives
+// Typing/recording state expires after this duration (ms) if no further
+// event arrives (e.g. the other tab/app closed mid-keystroke or mid-hold).
 const TYPING_TIMEOUT = 3000;
 
 // Debounce outgoing "is typing" events (ms) — "stopped typing" always sends immediately
@@ -34,6 +41,7 @@ export interface TypingSubscription {
 class TypingService {
   private typingTimeouts: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private lastTypingEvent: Map<string, number> = new Map();
+  private recordingTimeouts: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
   private async sendTypingEvent(receiverId: string, isTyping: boolean): Promise<void> {
     try {
@@ -44,6 +52,80 @@ class TypingService {
     } catch (error) {
       log.error('Failed to send typing indicator', error, 'typingService');
     }
+  }
+
+  private async sendRecordingEvent(receiverId: string, isRecording: boolean): Promise<void> {
+    try {
+      await apiFetch('/messages/recording', {
+        method: 'POST',
+        body: JSON.stringify({ receiver_id: receiverId, is_recording: isRecording })
+      });
+    } catch (error) {
+      log.error('Failed to send recording indicator', error, 'typingService');
+    }
+  }
+
+  /**
+   * Tell a contact "I'm recording a voice message" / "I stopped". Unlike
+   * sendTyping, this isn't debounced on the way out — holding the mic button
+   * is a single discrete start/stop, not a stream of keystrokes, so there's
+   * no flood of calls to coalesce.
+   */
+  async sendRecording(_senderId: string, receiverId: string): Promise<void> {
+    await this.sendRecordingEvent(receiverId, true);
+  }
+
+  /** Send "stopped recording" (release, send, cancel, or unmount — always sent immediately) */
+  async sendStoppedRecording(_senderId: string, receiverId: string): Promise<void> {
+    await this.sendRecordingEvent(receiverId, false);
+  }
+
+  /**
+   * Subscribe to "recording a voice message" indicators from one specific
+   * contact. Same shape as subscribeToTyping (see below) — one handler per
+   * friend, all sharing the single underlying WebSocket.
+   */
+  subscribeToRecording(
+    currentUserId: string,
+    otherUserId: string,
+    onRecordingChange: (userId: string, isRecording: boolean) => void
+  ): TypingSubscription {
+    const timeoutKey = `${currentUserId}:${otherUserId}`;
+
+    const sub = realtimeClient.on('recording', (payload) => {
+      if (payload?.sender_id !== otherUserId) return;
+
+      const existingTimeout = this.recordingTimeouts.get(timeoutKey);
+      if (existingTimeout) {
+        clearTimeout(existingTimeout);
+        this.recordingTimeouts.delete(timeoutKey);
+      }
+
+      if (payload.is_recording) {
+        onRecordingChange(otherUserId, true);
+
+        // Auto-expire in case a "stopped recording" event never arrives
+        // (e.g. the other device lost its connection mid-hold).
+        const timeout = setTimeout(() => {
+          onRecordingChange(otherUserId, false);
+          this.recordingTimeouts.delete(timeoutKey);
+        }, TYPING_TIMEOUT);
+        this.recordingTimeouts.set(timeoutKey, timeout);
+      } else {
+        onRecordingChange(otherUserId, false);
+      }
+    });
+
+    return {
+      unsubscribe: () => {
+        sub.unsubscribe();
+        const existingTimeout = this.recordingTimeouts.get(timeoutKey);
+        if (existingTimeout) {
+          clearTimeout(existingTimeout);
+          this.recordingTimeouts.delete(timeoutKey);
+        }
+      }
+    };
   }
 
   /** Send typing indicator for a direct chat (debounced) */
@@ -134,6 +216,8 @@ class TypingService {
     this.typingTimeouts.forEach((timeout) => clearTimeout(timeout));
     this.typingTimeouts.clear();
     this.lastTypingEvent.clear();
+    this.recordingTimeouts.forEach((timeout) => clearTimeout(timeout));
+    this.recordingTimeouts.clear();
   }
 }
 

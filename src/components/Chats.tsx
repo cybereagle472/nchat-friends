@@ -18,7 +18,9 @@ interface ChatsProps {
 export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenSettings }: ChatsProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
+  const [recordingUsers, setRecordingUsers] = useState<Set<string>>(new Set());
   const typingSubscriptionsRef = useRef<Map<string, { unsubscribe: () => void }>>(new Map());
+  const recordingSubscriptionsRef = useRef<Map<string, { unsubscribe: () => void }>>(new Map());
 
   // Unread counts and "seen" ticks come straight from the `chats` prop now —
   // it's kept live and instant by useAppData's realtime message/read-receipt
@@ -79,6 +81,44 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
     // above, and the unmount-only effect below handles final teardown.
   }, [currentUser.id, friendIdsKey]);
 
+  // Same reconciliation pattern as typing, for the "recording a voice
+  // message" indicator — kept as its own effect/ref-map pair so a bug in
+  // one can never affect the other, but following the exact same
+  // diff-instead-of-rebuild approach that fixed the typing churn bug.
+  useEffect(() => {
+    const friendIds = friendIdsKey ? friendIdsKey.split(',') : [];
+    const friendIdSet = new Set(friendIds);
+    const subscriptions = recordingSubscriptionsRef.current;
+
+    subscriptions.forEach((sub, friendId) => {
+      if (!friendIdSet.has(friendId)) {
+        sub.unsubscribe();
+        subscriptions.delete(friendId);
+      }
+    });
+
+    friendIds.forEach(friendId => {
+      if (!subscriptions.has(friendId)) {
+        const subscription = typingService.subscribeToRecording(
+          currentUser.id,
+          friendId,
+          (userId, isRecording) => {
+            setRecordingUsers(prev => {
+              const newSet = new Set(prev);
+              if (isRecording) {
+                newSet.add(userId);
+              } else {
+                newSet.delete(userId);
+              }
+              return newSet;
+            });
+          }
+        );
+        subscriptions.set(friendId, subscription);
+      }
+    });
+  }, [currentUser.id, friendIdsKey]);
+
   // Unmount-only cleanup — intentionally NOT tied to `chats`/currentUser.id,
   // otherwise this would tear down every subscription on every list
   // refresh, which is exactly the churn the effect above was just fixed
@@ -87,6 +127,8 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
     return () => {
       typingSubscriptionsRef.current.forEach(sub => sub.unsubscribe());
       typingSubscriptionsRef.current.clear();
+      recordingSubscriptionsRef.current.forEach(sub => sub.unsubscribe());
+      recordingSubscriptionsRef.current.clear();
     };
   }, []);
 
@@ -131,7 +173,7 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
   };
 
   const getMessagePreview = (chat: Contact) => {
-    if (typingUsers.has(chat.user_id)) {
+    if (recordingUsers.has(chat.user_id) || typingUsers.has(chat.user_id)) {
       return null;
     }
 
@@ -216,7 +258,8 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
         ) : (
           <div className="chat-list-items">
             {filteredChats.map((chat) => {
-              const isTyping = typingUsers.has(chat.user_id);
+              const isRecording = recordingUsers.has(chat.user_id);
+              const isTyping = !isRecording && typingUsers.has(chat.user_id);
               const messagePreview = getMessagePreview(chat);
               const unreadCount = chat.unreadCount || 0;
               const hasUnread = unreadCount > 0;
@@ -253,7 +296,17 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
                       </span>
                     </div>
                     <div className="chat-list-info-bottom">
-                      {isTyping ? (
+                      {isRecording ? (
+                        <div className="chat-list-typing">
+                          <Mic className="w-3 h-3 recording-indicator-mic" strokeWidth={2.5} />
+                          <span>recording audio</span>
+                          <div className="chat-list-typing-dots">
+                            <span style={{ animationDelay: '0ms' }} />
+                            <span style={{ animationDelay: '150ms' }} />
+                            <span style={{ animationDelay: '300ms' }} />
+                          </div>
+                        </div>
+                      ) : isTyping ? (
                         <div className="chat-list-typing">
                           <span>typing</span>
                           <div className="chat-list-typing-dots">
