@@ -218,8 +218,9 @@ export function ProfileView({ currentUser, userId, initialProfile, onClose, onMe
   return (
     <div className="fixed inset-0 z-50 bg-white flex flex-col h-full animate-fade-in">
       <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Header */}
-        <div className="relative bg-gradient-to-r from-violet-500 via-purple-500 to-fuchsia-500 px-4 pb-9 pt-[max(0.625rem,env(safe-area-inset-top))] flex items-center justify-between flex-shrink-0">
+        {/* Header — flat bar, same height/style as the rest of the app's
+            screen headers (no overlapping avatar trick). */}
+        <div className="relative z-10 bg-gradient-to-r from-violet-500 via-purple-500 to-fuchsia-500 text-white px-3 py-2.5 shadow-lg pt-[max(0.625rem,env(safe-area-inset-top))] flex items-center justify-between flex-shrink-0">
           <button
             onClick={onClose}
             className="p-2 -ml-1 rounded-full hover:bg-white/20 active:bg-white/30 transition-all text-white"
@@ -286,9 +287,9 @@ export function ProfileView({ currentUser, userId, initialProfile, onClose, onMe
           )}
         </div>
 
-        {/* Avatar — overlapping the header, WhatsApp/Instagram style */}
-        <div className="flex justify-center -mt-8 flex-shrink-0">
-          <div className="w-20 h-20 rounded-full ring-4 ring-white bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-3xl overflow-hidden shadow-lg">
+        {/* Avatar — sits cleanly below the header, no overlap */}
+        <div className="flex justify-center pt-6 flex-shrink-0">
+          <div className="w-24 h-24 rounded-full ring-4 ring-violet-100 bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-3xl overflow-hidden shadow-lg">
             {avatarUrl ? (
               <img src={avatarUrl} alt={displayName} className="w-full h-full object-cover" />
             ) : (
