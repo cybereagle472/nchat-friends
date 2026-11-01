@@ -1,15 +1,19 @@
 /**
- * Call Service - WebRTC Signaling Implementation
+ * Call Service — WebRTC Signaling (Cloudflare Worker backend)
  *
- * Features:
- * - Voice and video call initiation
- * - WebRTC signaling over Supabase Realtime
- * - ICE candidate exchange
- * - Call state management
- * - Call history tracking
+ * Mirrors groupService.ts's shape and conventions: apiFetch against the
+ * Worker's /calls routes (worker/src/routes/calls.ts) for creating calls,
+ * answering, forwarding ICE candidates and ending calls, with signaling
+ * events delivered over the single shared per-user WebSocket
+ * (src/lib/realtimeClient.ts) instead of polling a database table.
+ *
+ * The actual WebRTC plumbing (getUserMedia, RTCPeerConnection) is pure
+ * browser API and unaffected by the backend — only the signaling
+ * transport changed.
  */
 
-import { supabase } from '../supabaseClient';
+import { apiFetch, getCurrentUserId } from '../lib/apiClient';
+import { realtimeClient } from '../lib/realtimeClient';
 import { CallHistory, UserProfile } from '../types';
 
 export interface CallSession {
@@ -21,6 +25,8 @@ export interface CallSession {
   startedAt: string;
   endedAt?: string;
   duration?: number;
+  offerSdp?: RTCSessionDescriptionInit;
+  callerProfile?: UserProfile;
 }
 
 export interface ServiceResult<T = void> {
@@ -64,15 +70,12 @@ const getIceServers = (): RTCConfiguration => {
         credential: turnCredential
       });
     }
-  } else {
+  } else if (import.meta.env.DEV) {
     // Warn in development if TURN not configured
-    if (import.meta.env.DEV) {
-      console.warn('⚠️ No TURN server configured. Calls may fail behind NAT/firewalls. Set VITE_TURN_SERVER_URL, VITE_TURN_SERVER_USERNAME, and VITE_TURN_SERVER_CREDENTIAL in .env');
-    }
+    console.warn('⚠️ No TURN server configured. Calls may fail behind NAT/firewalls. Set VITE_TURN_SERVER_URL, VITE_TURN_SERVER_USERNAME, and VITE_TURN_SERVER_CREDENTIAL in .env');
   }
 
   // Free TURN servers for testing (not for production - limited bandwidth)
-  // Uncomment these for testing if you don't have your own TURN server
   iceServers.push({
     urls: 'turn:openrelay.metered.ca:80',
     username: 'openrelayproject',
@@ -97,257 +100,127 @@ const getIceServers = (): RTCConfiguration => {
 
 const ICE_SERVERS: RTCConfiguration = getIceServers();
 
+// Wire shape returned by GET /calls/history (see worker/src/routes/calls.ts).
+interface WireCallHistoryRow {
+  id: string;
+  caller_id: string;
+  receiver_id: string;
+  call_type: 'audio' | 'video';
+  status: string;
+  duration: number | null;
+  created_at: string;
+  ended_at: string | null;
+  other_profile?: UserProfile;
+}
+
 export const callService = {
   /**
-   * Initiate a call
+   * Initiate a call. The offer must already be created (createPeerConnection
+   * + createOffer) before calling this, so the whole thing is a single
+   * request — the callee's incoming-call event arrives with the offer
+   * already attached, no separate "store the offer" round trip needed.
    */
   async initiateCall(
-    callerId: string,
     receiverId: string,
-    callType: 'audio' | 'video'
+    callType: 'audio' | 'video',
+    offerSdp: RTCSessionDescriptionInit
   ): Promise<ServiceResult<CallSession>> {
     try {
-      const { data, error } = await supabase
-        .from('calls')
-        .insert({
-          caller_id: callerId,
-          receiver_id: receiverId,
-          call_type: callType,
-          status: 'initiated'
-        })
-        .select()
-        .single();
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      supabase.from('notifications').insert({
-        user_id: receiverId,
-        actor_id: callerId,
-        type: 'incoming_call',
-        payload: { call_id: data.id, call_type: callType }
-      }).then(() => {});
-
+      const { call } = await apiFetch<{ call: { id: string; caller_id: string; receiver_id: string; call_type: string; status: string; created_at: string } }>(
+        '/calls',
+        {
+          method: 'POST',
+          body: JSON.stringify({ receiver_id: receiverId, call_type: callType, offer_sdp: offerSdp }),
+        }
+      );
       return {
         success: true,
         data: {
-          id: data.id,
-          callerId: data.caller_id,
-          receiverId: data.receiver_id,
-          callType: data.call_type,
-          status: data.status,
-          startedAt: data.created_at
-        }
+          id: call.id,
+          callerId: call.caller_id,
+          receiverId: call.receiver_id,
+          callType: call.call_type as 'audio' | 'video',
+          status: call.status as CallSession['status'],
+          startedAt: call.created_at,
+        },
       };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to start call' };
     }
   },
 
-  /**
-   * Update call status
-   */
-  async updateCallStatus(
-    callId: string,
-    status: CallSession['status'],
-    duration?: number
-  ): Promise<ServiceResult> {
+  /** Callee answers: send our SDP answer back to the caller. */
+  async answerCall(callId: string, answerSdp: RTCSessionDescriptionInit): Promise<ServiceResult> {
     try {
-      const updateData: any = { status };
-
-      if (status === 'ended' || status === 'missed' || status === 'declined') {
-        updateData.ended_at = new Date().toISOString();
-        if (duration !== undefined) {
-          updateData.duration = duration;
-        }
-      }
-
-      const { error } = await supabase
-        .from('calls')
-        .update(updateData)
-        .eq('id', callId);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
-    }
-  },
-
-  /**
-   * Store WebRTC offer SDP
-   */
-  async storeOffer(callId: string, offerSdp: RTCSessionDescriptionInit): Promise<ServiceResult> {
-    try {
-      const { error } = await supabase
-        .from('calls')
-        .update({ offer_sdp: offerSdp, status: 'ringing' })
-        .eq('id', callId);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
-    }
-  },
-
-  /**
-   * Store WebRTC answer SDP
-   */
-  async storeAnswer(callId: string, answerSdp: RTCSessionDescriptionInit): Promise<ServiceResult> {
-    try {
-      const { error } = await supabase
-        .from('calls')
-        .update({ answer_sdp: answerSdp, status: 'answered' })
-        .eq('id', callId);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
-    }
-  },
-
-  /**
-   * Store ICE candidate
-   */
-  async storeIceCandidate(
-    callId: string,
-    fromUserId: string,
-    candidate: RTCIceCandidateInit
-  ): Promise<ServiceResult> {
-    try {
-      const { error } = await supabase
-        .from('call_candidates')
-        .insert({
-          call_id: callId,
-          from_user_id: fromUserId,
-          candidate: candidate
-        });
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
-    }
-  },
-
-  /**
-   * Get call by ID
-   */
-  async getCall(callId: string): Promise<ServiceResult<CallSession>> {
-    try {
-      const { data, error } = await supabase
-        .from('calls')
-        .select('*')
-        .eq('id', callId)
-        .single();
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return {
-        success: true,
-        data: {
-          id: data.id,
-          callerId: data.caller_id,
-          receiverId: data.receiver_id,
-          callType: data.call_type,
-          status: data.status,
-          startedAt: data.created_at,
-          endedAt: data.ended_at,
-          duration: data.duration
-        }
-      };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
-    }
-  },
-
-  /**
-   * Get call history for a user
-   */
-  async getCallHistory(
-    userId: string,
-    limit = 50
-  ): Promise<ServiceResult<CallHistory[]>> {
-    try {
-      const { data: calls, error } = await supabase
-        .from('calls')
-        .select('*')
-        .or(`caller_id.eq.${userId},receiver_id.eq.${userId}`)
-        .order('created_at', { ascending: false })
-        .limit(limit);
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      if (!calls || calls.length === 0) {
-        return { success: true, data: [] };
-      }
-
-      const userIds = new Set<string>();
-      calls.forEach(call => {
-        userIds.add(call.caller_id);
-        userIds.add(call.receiver_id);
+      await apiFetch(`/calls/${callId}/answer`, {
+        method: 'POST',
+        body: JSON.stringify({ answer_sdp: answerSdp }),
       });
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to answer call' };
+    }
+  },
 
-      const { data: profiles } = await supabase
-        .from('profiles')
-        .select('*')
-        .in('id', Array.from(userIds));
+  /** Forward an ICE candidate (or any other signal) to the other participant. */
+  async sendIceCandidate(callId: string, candidate: RTCIceCandidateInit): Promise<ServiceResult> {
+    try {
+      await apiFetch(`/calls/${callId}/signal`, {
+        method: 'POST',
+        body: JSON.stringify({ candidate }),
+      });
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to send signal' };
+    }
+  },
 
-      const profileMap = new Map((profiles || []).map(p => [p.id, p as UserProfile]));
+  /** End, decline, or mark a call missed — status is one of 'ended' | 'declined' | 'missed'. */
+  async endCall(callId: string, status: 'ended' | 'declined' | 'missed' = 'ended', duration?: number): Promise<ServiceResult> {
+    try {
+      await apiFetch(`/calls/${callId}/end`, {
+        method: 'POST',
+        body: JSON.stringify({ status, duration }),
+      });
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to end call' };
+    }
+  },
 
-      const history: CallHistory[] = calls.map(call => {
-        const isCaller = call.caller_id === userId;
-
+  /** Get call history for the current user. */
+  async getCallHistory(limit = 50): Promise<ServiceResult<CallHistory[]>> {
+    try {
+      const { history } = await apiFetch<{ history: WireCallHistoryRow[] }>(`/calls/history?limit=${limit}`);
+      const myId = getCurrentUserId();
+      const data: CallHistory[] = history.map((call) => {
         let status: CallHistory['status'] = 'answered';
-        if (call.status === 'missed' || (call.status === 'ended' && !call.duration)) {
-          status = isCaller ? 'missed' : 'missed';
-        } else if (call.status === 'declined') {
-          status = 'declined';
-        }
+        if (call.status === 'declined') status = 'declined';
+        else if (call.status === 'missed' || (call.status === 'ended' && !call.duration)) status = 'missed';
+
+        // other_profile is always "the other participant" — map it onto
+        // whichever side of caller/callee that actually is for this row.
+        const isCaller = call.caller_id === myId;
 
         return {
           id: call.id,
           caller_id: call.caller_id,
           callee_id: call.receiver_id,
-          call_type: call.call_type,
+          // CallHistory/HistoryItem use 'voice', while the signaling layer
+          // (and the DB column) uses 'audio' — normalize here so filters
+          // and icons downstream (History.tsx) match correctly.
+          call_type: call.call_type === 'audio' ? 'voice' : 'video',
           status,
-          duration: call.duration,
+          duration: call.duration ?? undefined,
           started_at: call.created_at,
-          ended_at: call.ended_at,
-          caller_profile: profileMap.get(call.caller_id),
-          callee_profile: profileMap.get(call.receiver_id)
+          ended_at: call.ended_at ?? undefined,
+          caller_profile: isCaller ? undefined : call.other_profile,
+          callee_profile: isCaller ? call.other_profile : undefined,
         };
       });
-
-      return { success: true, data: history };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'An error occurred';
-      return { success: false, error: message };
+      return { success: true, data };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to load call history' };
     }
   },
 
@@ -412,135 +285,48 @@ export const callService = {
   },
 
   /**
-   * Subscribe to incoming calls (simplified interface for App.tsx)
+   * Subscribe to incoming calls (simplified interface for App.tsx). Returns
+   * an unsubscribe function.
    */
   subscribeToIncomingCalls(
-    userId: string,
-    onIncomingCall: (call: CallSession & { offerSdp?: RTCSessionDescriptionInit }) => void
+    onIncomingCall: (call: CallSession) => void
   ): () => void {
-    const subscription = this.subscribeToCallEvents(userId, {
-      onIncomingCall
+    const subscription = realtimeClient.on('call:incoming', (payload) => {
+      const call = payload?.call;
+      if (!call) return;
+      onIncomingCall({
+        id: call.id,
+        callerId: call.caller_id,
+        receiverId: call.receiver_id,
+        callType: call.call_type,
+        status: call.status,
+        startedAt: call.created_at,
+        offerSdp: call.offer_sdp,
+        callerProfile: call.caller_profile,
+      });
     });
     return subscription.unsubscribe;
   },
 
   /**
-   * Subscribe to call signaling events
+   * Subscribe to signaling events for a specific call in progress.
    */
-  subscribeToCallEvents(
-    userId: string,
-    callbacks: {
-      onIncomingCall?: (call: CallSession & { offerSdp?: RTCSessionDescriptionInit }) => void;
-      onCallAnswered?: (callId: string, answerSdp: RTCSessionDescriptionInit) => void;
-      onCallEnded?: (callId: string) => void;
-      onIceCandidate?: (callId: string, candidate: RTCIceCandidateInit) => void;
-    }
-  ) {
-    const callChannel = supabase.channel(`calls_${userId}`);
-
-    callChannel
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'calls',
-          filter: `receiver_id=eq.${userId}`
-        },
-        (payload) => {
-          const call = payload.new;
-          callbacks.onIncomingCall?.({
-            id: call.id,
-            callerId: call.caller_id,
-            receiverId: call.receiver_id,
-            callType: call.call_type,
-            status: call.status,
-            startedAt: call.created_at,
-            offerSdp: call.offer_sdp
-          });
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'calls',
-          filter: `caller_id=eq.${userId}`
-        },
-        (payload) => {
-          const call = payload.new;
-
-          if (call.status === 'answered' && call.answer_sdp) {
-            callbacks.onCallAnswered?.(call.id, call.answer_sdp);
-          } else if (call.status === 'ended' || call.status === 'declined' || call.status === 'missed') {
-            callbacks.onCallEnded?.(call.id);
-          }
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'calls',
-          filter: `receiver_id=eq.${userId}`
-        },
-        (payload) => {
-          const call = payload.new;
-
-          if (call.offer_sdp && call.status === 'ringing') {
-            callbacks.onIncomingCall?.({
-              id: call.id,
-              callerId: call.caller_id,
-              receiverId: call.receiver_id,
-              callType: call.call_type,
-              status: call.status,
-              startedAt: call.created_at,
-              offerSdp: call.offer_sdp
-            });
-          } else if (call.status === 'ended' || call.status === 'declined') {
-            callbacks.onCallEnded?.(call.id);
-          }
-        }
-      )
-      .subscribe();
-
-    const candidateChannel = supabase.channel(`call_candidates_${userId}`);
-
-    candidateChannel
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'call_candidates'
-        },
-        async (payload) => {
-          const candidate = payload.new;
-
-          if (candidate.from_user_id !== userId) {
-            const { data: call } = await supabase
-              .from('calls')
-              .select('caller_id, receiver_id')
-              .eq('id', candidate.call_id)
-              .single();
-
-            if (call && (call.caller_id === userId || call.receiver_id === userId)) {
-              callbacks.onIceCandidate?.(candidate.call_id, candidate.candidate);
-            }
-          }
-        }
-      )
-      .subscribe();
-
-    return {
-      callChannel,
-      candidateChannel,
-      unsubscribe: () => {
-        supabase.removeChannel(callChannel);
-        supabase.removeChannel(candidateChannel);
-      }
-    };
+  subscribeToCallEvents(callbacks: {
+    onCallAnswered?: (callId: string, answerSdp: RTCSessionDescriptionInit) => void;
+    onCallEnded?: (callId: string, status: string) => void;
+    onIceCandidate?: (callId: string, candidate: RTCIceCandidateInit) => void;
+  }): { unsubscribe: () => void } {
+    const subs = [
+      realtimeClient.on('call:answered', (payload) => {
+        if (payload?.callId && payload?.answer_sdp) callbacks.onCallAnswered?.(payload.callId, payload.answer_sdp);
+      }),
+      realtimeClient.on('call:signal', (payload) => {
+        if (payload?.callId && payload?.candidate) callbacks.onIceCandidate?.(payload.callId, payload.candidate);
+      }),
+      realtimeClient.on('call:ended', (payload) => {
+        if (payload?.callId) callbacks.onCallEnded?.(payload.callId, payload.status);
+      }),
+    ];
+    return { unsubscribe: () => subs.forEach((s) => s.unsubscribe()) };
   }
 };

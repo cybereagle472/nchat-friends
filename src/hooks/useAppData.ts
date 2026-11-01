@@ -258,7 +258,7 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
         groupService.getUserGroups(userId),
         friendService.getRequests(userId),
         profileService.getAllProfiles(),
-        callService.getCallHistory(userId)
+        callService.getCallHistory()
       ]);
 
       // Process friends
@@ -560,7 +560,7 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
 
 
   const refreshCallHistory = useCallback(async () => {
-    const result = await callService.getCallHistory(userId);
+    const result = await callService.getCallHistory();
     if (result.success && result.data) {
       const historyItems: HistoryItem[] = result.data.map((call: CallHistory) => {
         const isOutgoing = call.caller_id === userId;
@@ -708,11 +708,16 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
       groupMessageSub
     );
 
-    // Call history: no realtime event of its own yet, still polled.
-    // Groups now update live above — this interval is just a safety net
-    // in case a realtime event is ever missed (e.g. a brief reconnect gap).
+    // Call history: a call landing in the History tab the moment it ends
+    // (rather than up to 30s later) matters since that's also how a missed
+    // call notification would be noticed.
+    const callEndedSub = realtimeClient.on('call:ended', () => debouncedRefreshCallHistory());
+    subscriptionsRef.current.push(callEndedSub);
+
+    // These intervals are now just a safety net in case a realtime event is
+    // ever missed (e.g. a brief reconnect gap) — both are kept live above.
     const groupsInterval = setInterval(() => debouncedRefreshGroups(), 45000);
-    const callsInterval = setInterval(() => debouncedRefreshCallHistory(), 30000);
+    const callsInterval = setInterval(() => debouncedRefreshCallHistory(), 45000);
 
     // Online/offline status has no realtime push of its own (it's a simple
     // heartbeat timestamp in D1, see profileService.updateLastSeen) — poll

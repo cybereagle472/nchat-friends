@@ -242,9 +242,17 @@ function App() {
   useEffect(() => {
     if (!currentUser?.id) return;
 
-    const unsubscribe = callService.subscribeToIncomingCalls(currentUser.id, (callSession) => {
-      if (callSession.status === 'initiated' || callSession.status === 'ringing') {
-        // Convert CallSession to Call type for the modal
+    const unsubscribe = callService.subscribeToIncomingCalls((callSession) => {
+      if (callSession.status !== 'initiated' && callSession.status !== 'ringing') return;
+
+      // No call-waiting support: if we're already on a call, automatically
+      // decline the new one instead of silently dropping it (which would
+      // otherwise leave the second caller ringing forever with no feedback).
+      setCallState((prev) => {
+        if (prev.active) {
+          callService.endCall(callSession.id, 'declined');
+          return prev;
+        }
         const incomingCall: Call = {
           id: callSession.id,
           caller_id: callSession.callerId,
@@ -252,14 +260,15 @@ function App() {
           call_type: callSession.callType,
           status: callSession.status,
           created_at: callSession.startedAt,
-          offer_sdp: callSession.offerSdp
+          offer_sdp: callSession.offerSdp,
+          caller_profile: callSession.callerProfile
         };
-        setCallState({
+        return {
           active: true,
           callType: callSession.callType,
           incomingCall
-        });
-      }
+        };
+      });
     });
 
     return () => {

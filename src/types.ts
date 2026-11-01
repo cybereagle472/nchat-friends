@@ -123,6 +123,9 @@ export interface Call {
   ended_at?: string;
   offer_sdp?: RTCSessionDescriptionInit;
   answer_sdp?: RTCSessionDescriptionInit;
+  /** Sent along with the incoming-call event so the ringing screen can show
+   *  a name/avatar immediately, without waiting on a separate profile fetch. */
+  caller_profile?: UserProfile;
 }
 
 export interface CallHistory {

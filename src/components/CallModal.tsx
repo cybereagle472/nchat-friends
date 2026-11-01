@@ -12,8 +12,12 @@ interface CallModalProps {
   onClose: () => void;
 }
 
-export function CallModal({ currentUser, calleeId, callType, incomingCall, onClose }: CallModalProps) {
-  const [callState, setCallState] = useState<'initiating' | 'ringing' | 'connecting' | 'connected' | 'ended'>('initiating');
+// No one answers within this long → treat it as a missed call rather than
+// ringing forever.
+const RING_TIMEOUT_MS = 45_000;
+
+export function CallModal({ calleeId, callType, incomingCall, onClose }: CallModalProps) {
+  const [callState, setCallState] = useState<'initiating' | 'ringing' | 'connecting' | 'connected' | 'ended' | 'declined' | 'missed'>('initiating');
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(callType === 'audio');
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
@@ -27,6 +31,17 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
   const localStreamRef = useRef<MediaStream | null>(null);
   const callIdRef = useRef<string | null>(null);
   const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const ringTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const eventSubRef = useRef<{ unsubscribe: () => void } | null>(null);
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const endedRef = useRef(false);
+
+  const clearRingTimeout = useCallback(() => {
+    if (ringTimeoutRef.current) {
+      clearTimeout(ringTimeoutRef.current);
+      ringTimeoutRef.current = null;
+    }
+  }, []);
 
   const cleanupCall = useCallback(() => {
     if (localStreamRef.current) {
@@ -43,14 +58,27 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
       clearInterval(durationIntervalRef.current);
       durationIntervalRef.current = null;
     }
-  }, []);
 
-  const endCall = useCallback(async () => {
+    clearRingTimeout();
+
+    if (eventSubRef.current) {
+      eventSubRef.current.unsubscribe();
+      eventSubRef.current = null;
+    }
+
+    pendingCandidatesRef.current = [];
+  }, [clearRingTimeout]);
+
+  // status defaults to 'ended' (a normal hangup); pass 'missed' for an
+  // unanswered outgoing call or 'declined' when actively rejecting one.
+  const endCall = useCallback(async (status: 'ended' | 'missed' | 'declined' = 'ended') => {
+    if (endedRef.current) return;
+    endedRef.current = true;
     if (callIdRef.current) {
-      await callService.updateCallStatus(callIdRef.current, 'ended', callDuration);
+      await callService.endCall(callIdRef.current, status, callDuration);
     }
     cleanupCall();
-    setCallState('ended');
+    setCallState(status);
     setTimeout(onClose, 1500);
   }, [callDuration, cleanupCall, onClose]);
 
@@ -71,9 +99,16 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
 
   const createPeerConnection = useCallback(() => {
     const pc = callService.createPeerConnection(
-      async (candidate) => {
+      (candidate) => {
+        const json = candidate.toJSON();
         if (callIdRef.current) {
-          await callService.storeIceCandidate(callIdRef.current, currentUser.id, candidate.toJSON());
+          callService.sendIceCandidate(callIdRef.current, json);
+        } else {
+          // The offer/answer round trip hasn't finished yet (we don't have
+          // a call id back from the server), so queue it instead of
+          // silently dropping it — connectivity can otherwise fail
+          // intermittently depending on how fast ICE gathering runs.
+          pendingCandidatesRef.current.push(json);
         }
       },
       (stream) => {
@@ -83,12 +118,15 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
       },
       (state) => {
         if (state === 'connected') {
+          clearRingTimeout();
           setCallState('connected');
-          durationIntervalRef.current = setInterval(() => {
-            setCallDuration((prev) => prev + 1);
-          }, 1000);
+          if (!durationIntervalRef.current) {
+            durationIntervalRef.current = setInterval(() => {
+              setCallDuration((prev) => prev + 1);
+            }, 1000);
+          }
         } else if (state === 'failed' || state === 'disconnected') {
-          endCall();
+          endCall('ended');
         }
       }
     );
@@ -102,7 +140,35 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
 
     peerConnectionRef.current = pc;
     return pc;
-  }, [currentUser.id, endCall]);
+  }, [clearRingTimeout, endCall]);
+
+  // Subscribed once per call id, for both the caller and callee sides.
+  const subscribeToSignaling = useCallback((pc: RTCPeerConnection, callId: string) => {
+    eventSubRef.current?.unsubscribe();
+    eventSubRef.current = callService.subscribeToCallEvents({
+      onCallAnswered: async (id, answerSdp) => {
+        if (id !== callId) return;
+        await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
+        setCallState('connecting');
+      },
+      onCallEnded: (id, status) => {
+        if (id !== callId || endedRef.current) return;
+        endedRef.current = true;
+        cleanupCall();
+        setCallState(status === 'declined' || status === 'missed' ? status : 'ended');
+        setTimeout(onClose, 1500);
+      },
+      onIceCandidate: async (id, candidate) => {
+        if (id !== callId) return;
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch {
+          // A candidate can legitimately arrive before setRemoteDescription
+          // has run (ICE and SDP exchange race); safe to ignore.
+        }
+      },
+    });
+  }, [cleanupCall, onClose]);
 
   const initiateCall = useCallback(async () => {
     if (!calleeId) return;
@@ -112,47 +178,52 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
       setRemoteUser(profile);
 
       await initializeMedia();
-
-      const result = await callService.initiateCall(currentUser.id, calleeId, callType);
-      if (!result.success || !result.data) {
-        setError(result.error || 'Failed to initiate call');
-        return;
-      }
-
-      callIdRef.current = result.data.id;
       const pc = createPeerConnection();
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await callService.storeOffer(result.data.id, offer);
+
+      const result = await callService.initiateCall(calleeId, callType, offer);
+      if (!result.success || !result.data) {
+        setError(result.error || 'Failed to initiate call');
+        cleanupCall();
+        setTimeout(onClose, 2000);
+        return;
+      }
+
+      // The user may have already hit "cancel" while that request was in
+      // flight (closing the local UI and the peer connection along with
+      // it) — in that case the call row that just got created server-side,
+      // and the person we were calling, both need to be told it's over
+      // too, instead of ringing with no way to stop it.
+      if (endedRef.current) {
+        await callService.endCall(result.data.id, 'ended');
+        return;
+      }
+
+      callIdRef.current = result.data.id;
+      // Flush any ICE candidates that were gathered before we had a call id.
+      if (pendingCandidatesRef.current.length > 0) {
+        pendingCandidatesRef.current.forEach((c) => callService.sendIceCandidate(result.data!.id, c));
+        pendingCandidatesRef.current = [];
+      }
 
       setCallState('ringing');
+      subscribeToSignaling(pc, result.data.id);
 
-      // Subscribe to call events
-      callService.subscribeToCallEvents(currentUser.id, {
-        onCallAnswered: async (callId, answerSdp) => {
-          if (callId === callIdRef.current) {
-            await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
-            setCallState('connecting');
-          }
-        },
-        onCallEnded: (callId) => {
-          if (callId === callIdRef.current) {
-            endCall();
-          }
-        },
-        onIceCandidate: async (callId, candidate) => {
-          if (callId === callIdRef.current) {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          }
-        }
-      });
+      // No call-waiting / voicemail — if nobody answers in time, give up
+      // and record it as missed rather than ringing forever.
+      ringTimeoutRef.current = setTimeout(() => endCall('missed'), RING_TIMEOUT_MS);
     } catch (err: any) {
       console.error('Error initiating call:', err);
       setError('Failed to initiate call');
+      // We may or may not have created the call row yet — either way, make
+      // sure the callee isn't left ringing with no way to know we gave up.
+      if (callIdRef.current) await callService.endCall(callIdRef.current, 'ended');
+      cleanupCall();
       setTimeout(onClose, 2000);
     }
-  }, [calleeId, callType, createPeerConnection, currentUser.id, endCall, initializeMedia, onClose]);
+  }, [calleeId, callType, cleanupCall, createPeerConnection, endCall, initializeMedia, onClose, subscribeToSignaling]);
 
   const answerCall = useCallback(async () => {
     if (!incomingCall) return;
@@ -160,8 +231,12 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
     try {
       callIdRef.current = incomingCall.id;
 
-      const profile = await profileService.getProfile(incomingCall.caller_id);
-      setRemoteUser(profile);
+      // remoteUser was already set from the incoming-call event (or a
+      // fallback fetch) as soon as the ringing screen appeared.
+      if (!remoteUser) {
+        const profile = await profileService.getProfile(incomingCall.caller_id);
+        setRemoteUser(profile);
+      }
 
       await initializeMedia();
 
@@ -173,42 +248,53 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await callService.storeAnswer(incomingCall.id, answer);
+      await callService.answerCall(incomingCall.id, answer);
 
       setCallState('connecting');
-
-      // Subscribe to ICE candidates
-      callService.subscribeToCallEvents(currentUser.id, {
-        onIceCandidate: async (callId, candidate) => {
-          if (callId === incomingCall.id) {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          }
-        },
-        onCallEnded: (callId) => {
-          if (callId === incomingCall.id) {
-            endCall();
-          }
-        }
-      });
+      subscribeToSignaling(pc, incomingCall.id);
     } catch (err: any) {
       console.error('Error answering call:', err);
       setError('Failed to answer call');
+      // Let the caller know we couldn't actually pick up, instead of
+      // leaving them stuck on "ringing" indefinitely.
+      await callService.endCall(incomingCall.id, 'declined');
+      cleanupCall();
       setTimeout(onClose, 2000);
     }
-  }, [createPeerConnection, currentUser.id, endCall, incomingCall, initializeMedia, onClose]);
+  }, [cleanupCall, createPeerConnection, incomingCall, initializeMedia, onClose, remoteUser, subscribeToSignaling]);
 
   const declineCall = useCallback(async () => {
     if (incomingCall) {
-      await callService.updateCallStatus(incomingCall.id, 'declined');
+      endedRef.current = true;
+      await callService.endCall(incomingCall.id, 'declined');
     }
     cleanupCall();
     onClose();
   }, [cleanupCall, incomingCall, onClose]);
 
+  // The X / close button means different things depending on where we are
+  // in the call lifecycle — always treat it as *some* explicit hangup
+  // action instead of just closing the local modal and leaving the other
+  // side hanging.
+  const handleCloseButton = useCallback(() => {
+    if (incomingCall && callState === 'ringing') {
+      declineCall();
+    } else {
+      endCall('ended');
+    }
+  }, [callState, declineCall, endCall, incomingCall]);
+
   useEffect(() => {
     if (incomingCall) {
       setCallState('ringing');
-      profileService.getProfile(incomingCall.caller_id).then(setRemoteUser);
+      // Show the embedded caller profile immediately (no network round
+      // trip needed for the ringing screen to have a name/avatar); only
+      // fall back to fetching it if it wasn't included for some reason.
+      if (incomingCall.caller_profile) {
+        setRemoteUser(incomingCall.caller_profile);
+      } else {
+        profileService.getProfile(incomingCall.caller_id).then(setRemoteUser);
+      }
     } else if (calleeId) {
       initiateCall();
     }
@@ -216,7 +302,8 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
     return () => {
       cleanupCall();
     };
-  }, [calleeId, cleanupCall, incomingCall, initiateCall]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [calleeId, incomingCall]);
 
   const toggleMute = () => {
     if (localStreamRef.current) {
@@ -257,6 +344,8 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
       case 'connecting': return 'Connecting...';
       case 'connected': return formatDuration(callDuration);
       case 'ended': return 'Call ended';
+      case 'declined': return incomingCall ? 'Call declined' : `${remoteUser?.full_name || 'They'} declined`;
+      case 'missed': return 'No answer';
       default: return '';
     }
   };
@@ -297,7 +386,7 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
           <div className="absolute top-0 left-0 right-0 p-4 safe-area-inset-top">
             <div className="flex items-center justify-between">
               <button
-                onClick={onClose}
+                onClick={handleCloseButton}
                 className="w-10 h-10 rounded-full bg-white/10 backdrop-blur-sm flex items-center justify-center text-white"
               >
                 <X className="w-5 h-5" />
@@ -314,13 +403,13 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
           <div className="absolute bottom-0 left-0 right-0 p-6 pb-10 safe-area-inset-bottom">
             {incomingCall && callState === 'ringing' ? (
               <IncomingCallControls onDecline={declineCall} onAnswer={answerCall} />
-            ) : (
+            ) : callState === 'ended' || callState === 'declined' || callState === 'missed' ? null : (
               <VideoCallControls
                 isMuted={isMuted}
                 isVideoOff={isVideoOff}
                 onToggleMute={toggleMute}
                 onToggleVideo={toggleVideo}
-                onEndCall={endCall}
+                onEndCall={() => endCall('ended')}
                 onFlipCamera={() => {}}
               />
             )}
@@ -338,7 +427,7 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
           {/* Close Button */}
           <div className="absolute top-4 left-4 z-10 safe-area-inset-top">
             <button
-              onClick={onClose}
+              onClick={handleCloseButton}
               className="w-10 h-10 rounded-full bg-white/10 backdrop-blur-sm flex items-center justify-center text-white hover:bg-white/20 transition-colors"
             >
               <X className="w-5 h-5" />
@@ -405,13 +494,13 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
           <div className="px-6 pb-12 safe-area-inset-bottom relative z-10">
             {incomingCall && callState === 'ringing' ? (
               <IncomingCallControls onDecline={declineCall} onAnswer={answerCall} />
-            ) : (
+            ) : callState === 'ended' || callState === 'declined' || callState === 'missed' ? null : (
               <AudioCallControls
                 isMuted={isMuted}
                 isSpeakerOn={isSpeakerOn}
                 onToggleMute={toggleMute}
                 onToggleSpeaker={toggleSpeaker}
-                onEndCall={endCall}
+                onEndCall={() => endCall('ended')}
               />
             )}
           </div>
