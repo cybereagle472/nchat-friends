@@ -6,6 +6,8 @@ import {
   getCurrentUserId as getStoredUserId,
   getStoredAuth,
   onAuthStateChange,
+  markProfileComplete,
+  wasProfileEverComplete,
 } from '../lib/apiClient';
 import { profileService } from './profileService';
 import { UserProfile } from '../types';
@@ -61,11 +63,36 @@ export const authService = {
   // shared by checkSession, login, and the app's onAuthChange handler so all
   // three bootstrap paths treat errors the same, safe way.
   async resolveProfileState(userId: string): Promise<ProfileResolution> {
+    // If this exact user has already finished Profile Setup on this device
+    // before, a lookup that now looks incomplete (or even a flat 404) is
+    // far more likely to be a transient hiccup — e.g. the very first
+    // request right after the app resumes from being backgrounded,
+    // landing on a cold Worker/DB connection or a mobile network that's
+    // still reconnecting — than their profile having actually vanished.
+    // Never let that alone send a returning, already-set-up user back
+    // through onboarding; retry it like any other error and fall back to
+    // the safe "try again" screen instead of onboarding if it still looks
+    // incomplete afterwards.
+    const everComplete = wasProfileEverComplete(userId);
+
     for (let attempt = 0; attempt <= PROFILE_FETCH_RETRIES; attempt++) {
       try {
         const profile = await profileService.getProfileOrThrow(userId);
         if (isProfileComplete(profile)) {
+          markProfileComplete(userId);
           return { user: profile, needsProfileSetup: false };
+        }
+        if (everComplete) {
+          if (attempt < PROFILE_FETCH_RETRIES) {
+            await sleep(350 * (attempt + 1));
+            continue;
+          }
+          log.error(
+            'Profile looked incomplete for a previously-complete user after retries — treating as a hiccup, not onboarding',
+            undefined,
+            'authService'
+          );
+          return { user: null, needsProfileSetup: false, sessionError: true };
         }
         return { user: null, needsProfileSetup: true };
       } catch (err) {

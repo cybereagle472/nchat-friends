@@ -15,6 +15,7 @@ import { Settings } from './components/Settings';
 import { CallModal } from './components/CallModal';
 import { authService } from './services/authService';
 import { profileService } from './services/profileService';
+import { markProfileComplete } from './lib/apiClient';
 import { callService } from './services/callService';
 import { GroupWithMembers } from './services/groupService';
 import { UserProfile, Contact, Call } from './types';
@@ -212,6 +213,11 @@ function App() {
   }, []);
 
   const handleProfileComplete = useCallback((profile: UserProfile) => {
+    // Record it right away (not just on the next bootstrap's
+    // resolveProfileState call) so the "never send an already-set-up user
+    // back through onboarding" safety net in authService is active from
+    // this moment on, even if the app gets backgrounded immediately after.
+    if (profile.id) markProfileComplete(profile.id);
     setCurrentUser(profile);
     setNeedsProfileSetup(false);
   }, []);

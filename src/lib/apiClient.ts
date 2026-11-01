@@ -159,6 +159,43 @@ export function getCurrentUserId(): string | null {
   return readAuth()?.user?.id ?? null;
 }
 
+// --- "Has this user ever finished Profile Setup on this device?" ------
+//
+// Used to make resolveProfileState (authService) resilient to a transient
+// false-negative profile lookup — e.g. right after the app resumes from
+// being backgrounded for a while, when the very first request can land on
+// a cold Worker/DB connection or flaky just-reconnected mobile network and
+// come back looking like "no profile" even though nothing ever changed.
+// Without this, that one bad read was enough to send a fully set-up,
+// returning user back through onboarding. Keyed per user id (not just a
+// single flag) so switching accounts on the same device, or a genuinely
+// brand-new signup, is unaffected.
+const PROFILE_COMPLETE_KEY = 'nchat_profile_complete_v1';
+
+function readProfileCompleteMap(): Record<string, true> {
+  try {
+    const raw = localStorage.getItem(PROFILE_COMPLETE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, true>) : {};
+  } catch {
+    return {};
+  }
+}
+
+export function markProfileComplete(userId: string) {
+  try {
+    const map = readProfileCompleteMap();
+    if (map[userId]) return;
+    map[userId] = true;
+    localStorage.setItem(PROFILE_COMPLETE_KEY, JSON.stringify(map));
+  } catch {
+    /* best-effort — worst case we just lose the resilience, not correctness */
+  }
+}
+
+export function wasProfileEverComplete(userId: string): boolean {
+  return !!readProfileCompleteMap()[userId];
+}
+
 export function getAccessToken(): string | null {
   return readAuth()?.access_token ?? null;
 }
