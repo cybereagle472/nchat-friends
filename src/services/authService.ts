@@ -64,29 +64,35 @@ export const authService = {
   // three bootstrap paths treat errors the same, safe way.
   async resolveProfileState(userId: string): Promise<ProfileResolution> {
     // If this exact user has already finished Profile Setup on this device
-    // before, a lookup that now looks incomplete (or even a flat 404) is
-    // far more likely to be a transient hiccup — e.g. the very first
-    // request right after the app resumes from being backgrounded,
-    // landing on a cold Worker/DB connection or a mobile network that's
-    // still reconnecting — than their profile having actually vanished.
-    // Never let that alone send a returning, already-set-up user back
-    // through onboarding; retry it like any other error and fall back to
-    // the safe "try again" screen instead of onboarding if it still looks
-    // incomplete afterwards.
+    // before, we never want to trust an apparent-incomplete/404 result
+    // enough to undo that — after retrying (below) it still falls back to
+    // the safe "try again" screen instead of onboarding for them, while a
+    // genuinely brand-new signup (no flag yet) still correctly lands in
+    // onboarding once retries are exhausted.
     const everComplete = wasProfileEverComplete(userId);
 
     for (let attempt = 0; attempt <= PROFILE_FETCH_RETRIES; attempt++) {
       try {
-        const profile = await profileService.getProfileOrThrow(userId);
+        // /users/me, not /users/:id — it derives "who am I" purely from the
+        // verified access token (server-side), so it can never spuriously
+        // 404 just because some client-cached id was momentarily stale
+        // (e.g. mid access-token refresh), unlike looking yourself up by a
+        // client-supplied id would.
+        const profile = await profileService.getMyProfileOrThrow();
         if (isProfileComplete(profile)) {
           markProfileComplete(userId);
           return { user: profile, needsProfileSetup: false };
         }
+        // Apparent incompleteness (including a flat 404) is always worth
+        // retrying before trusting it, the same as a network error would
+        // be — a slow/failed access-token refresh that just happened, or a
+        // dropped request right as the app wakes back up, can both look
+        // exactly like this for a moment.
+        if (attempt < PROFILE_FETCH_RETRIES) {
+          await sleep(350 * (attempt + 1));
+          continue;
+        }
         if (everComplete) {
-          if (attempt < PROFILE_FETCH_RETRIES) {
-            await sleep(350 * (attempt + 1));
-            continue;
-          }
           log.error(
             'Profile looked incomplete for a previously-complete user after retries — treating as a hiccup, not onboarding',
             undefined,

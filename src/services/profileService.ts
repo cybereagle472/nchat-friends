@@ -32,6 +32,24 @@ export const profileService = {
     }
   },
 
+  // Self-check variant of the above, used by authService.resolveProfileState
+  // for "is *my own* profile complete?" — hits /users/me, which derives the
+  // id to look up purely from the verified access token (c.get('userId') on
+  // the server), not from any client-supplied id. getProfileOrThrow(userId)
+  // depends on the id passed in matching whatever the client currently has
+  // cached for "who am I", which is one more thing that could theoretically
+  // be stale/out of sync (e.g. across a token refresh) and turn into a
+  // spurious 404 — /me can't have that failure mode at all.
+  async getMyProfileOrThrow(): Promise<UserProfile | null> {
+    try {
+      const { profile } = await apiFetch<ProfileResponse>('/users/me');
+      return profile;
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return null;
+      throw err;
+    }
+  },
+
   // Get all profiles (for discover/find friends)
   async getAllProfiles(): Promise<UserProfile[]> {
     try {
