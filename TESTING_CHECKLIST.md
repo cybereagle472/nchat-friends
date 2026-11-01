@@ -25,12 +25,20 @@ _(Quick check before anything else — the auth bootstrap was rebuilt.)_
       group appears in the Groups tab immediately.
 - [ ] **Send a message** in the group → it arrives for the other
       member(s) in real time (no refresh needed).
-- [ ] **Group info screen**: open it from the group chat (⋮ menu → Group
-      Settings / View Members) — see the member list, your own role.
+- [ ] **Group info screen**: tap the group's name/avatar in the chat
+      header (no more ⋮ menu) → opens the full Group Info page, see the
+      member list, your own role.
+- [ ] **Mute/unmute the group** from Group Info → the toggle switch flips
+      instantly on tap, no multi-second delay.
 - [ ] **Add a member** to an existing group → they get added instantly on
       their end too.
 - [ ] **Promote a member to admin**, then **demote** them (as the group
       creator/admin) → role badge updates for everyone live.
+- [ ] **Tap a member's "⋮" button** (as admin) → the button clearly shows
+      a pressed/active state, and the promote/demote/remove menu opens
+      anchored right under that button (not in the top-left corner),
+      fully visible and compact — try this on a member near the bottom of
+      a long list too.
 - [ ] **Remove a member** (as admin) → that person is immediately kicked
       out of the group on their device (shows "You are no longer in this
       group" and backs them out automatically).
@@ -122,13 +130,10 @@ _(No crashes, right info, right buttons for the relationship.)_
       request → profile opens with Accept/Decline inline.
 - [ ] **Send a friend request from the profile screen** → it updates to
       "Request sent · Cancel" without closing the screen.
-- [ ] **Open a group → View Members (or Group Settings)**: tap a member
-      (not yourself) → their profile opens; tapping **yourself** in the
-      list does nothing (expected — no "view your own profile" from
-      there).
-- [ ] **Inside an open group chat**, tap "View Members" to get the
-      horizontal avatar strip → tapping a member's avatar there also
-      opens their profile.
+- [ ] **Open a group → Group Info** (tap the chat header): tap a member's
+      name/avatar (not yourself) → their profile opens; tapping
+      **yourself** in the list does nothing (expected — no "view your own
+      profile" from there).
 - [ ] **From Call History**: tap a call entry's name/photo → profile
       opens for that person.
 - [ ] **From inside the profile screen's "⋮" menu**: Remove friend, and
