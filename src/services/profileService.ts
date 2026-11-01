@@ -16,30 +16,17 @@ export const profileService = {
     }
   },
 
-  // Same as getProfile, but used anywhere a caller needs to tell "this user
-  // genuinely has no profile" apart from "the request failed" (expired/invalid
-  // session, network blip, server hiccup, ...). Session bootstrapping
-  // (checkSession/login) relies on this distinction — silently swallowing a
-  // transient error there would wrongly look like a brand-new user and send
-  // a fully set-up, returning user back through onboarding.
-  async getProfileOrThrow(userId: string): Promise<UserProfile | null> {
-    try {
-      const { profile } = await apiFetch<ProfileResponse>(`/users/${userId}`);
-      return profile;
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 404) return null;
-      throw err;
-    }
-  },
-
-  // Self-check variant of the above, used by authService.resolveProfileState
-  // for "is *my own* profile complete?" — hits /users/me, which derives the
-  // id to look up purely from the verified access token (c.get('userId') on
-  // the server), not from any client-supplied id. getProfileOrThrow(userId)
-  // depends on the id passed in matching whatever the client currently has
-  // cached for "who am I", which is one more thing that could theoretically
-  // be stale/out of sync (e.g. across a token refresh) and turn into a
-  // spurious 404 — /me can't have that failure mode at all.
+  // Used by authService.resolveProfileState for "is *my own* profile
+  // complete?" — hits /users/me, which derives the id to look up purely
+  // from the verified access token (c.get('userId') on the server), not
+  // from any client-supplied id, so there's no way for a momentarily-stale
+  // cached id (e.g. mid access-token refresh) to turn into a spurious 404
+  // for your own, perfectly real profile. Distinguishes "no profile" (404)
+  // from "the request failed" (expired/invalid session, network blip,
+  // server hiccup, ...) — session bootstrapping relies on that distinction,
+  // since silently swallowing a transient error would wrongly look like a
+  // brand-new user and send a fully set-up, returning user back through
+  // onboarding.
   async getMyProfileOrThrow(): Promise<UserProfile | null> {
     try {
       const { profile } = await apiFetch<ProfileResponse>('/users/me');

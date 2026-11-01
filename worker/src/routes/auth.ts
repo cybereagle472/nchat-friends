@@ -24,12 +24,36 @@ function userPublic(row: any) {
   };
 }
 
+// Refresh tokens rotate on every use (see /refresh below), and the access
+// token they back is refreshed proactively every ~14 minutes while the app
+// is open (see lib/apiClient.ts's scheduleProactiveRefresh) — so a single
+// long-lived session can otherwise generate dozens of session rows a day,
+// forever, with nothing ever deleting them. There's no Cron Trigger wired
+// up for a scheduled sweep, so instead this piggybacks a cheap, bounded
+// cleanup onto every token issuance (signup/login/refresh all call this):
+// delete any session row that's actually expired. Combined with /refresh
+// and /logout now deleting the row they're replacing/ending outright
+// (instead of just flagging it revoked_at forever), the table naturally
+// stays sized to roughly "one row per currently-active session" rather
+// than accumulating every session anyone has ever had.
+async function sweepExpiredSessions(env: Env): Promise<void> {
+  try {
+    await env.DB.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')").run();
+  } catch {
+    /* best-effort housekeeping — never let this block an actual auth call */
+  }
+}
+
 async function issueTokens(env: Env, userId: string) {
   const sid = newId();
   const expiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 86400 * 1000).toISOString();
   await env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
     .bind(sid, userId, expiresAt)
     .run();
+  // Awaited (not fire-and-forget): Workers can tear down the execution
+  // context as soon as the response is sent, which would silently cancel
+  // a detached promise here.
+  await sweepExpiredSessions(env);
   const access_token = await signJWT({ sub: userId }, env.JWT_SECRET, ACCESS_TTL_SECONDS);
   const refresh_token = await signJWT({ sub: userId, sid }, env.JWT_SECRET, REFRESH_TTL_DAYS * 86400);
   return { access_token, refresh_token, expires_in: ACCESS_TTL_SECONDS };
@@ -109,14 +133,22 @@ auth.post('/refresh', async (c) => {
   const payload = await verifyJWT<{ sub: string; sid: string }>(refresh_token, c.env.JWT_SECRET);
   if (!payload) return c.json({ error: 'Invalid or expired refresh token' }, 401);
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const session = await c.env.DB.prepare('SELECT * FROM sessions WHERE id = ? AND user_id = ?')
+  // Rotate: the used refresh token is single-use, so there's nothing worth
+  // keeping its row around for — delete it outright rather than just
+  // flagging it revoked_at forever, which otherwise means the sessions
+  // table grows by one permanent row on every single refresh (happening
+  // every ~14 minutes for as long as anyone keeps the app open). Folding
+  // the old "look it up, then separately delete it" into one atomic
+  // DELETE also closes a small race: if this same (single-use) refresh
+  // token were ever replayed twice at nearly the same instant, checking
+  // `changes` here guarantees at most one of the two calls can ever
+  // succeed, instead of both reading "still valid" before either delete
+  // lands and both going on to mint their own session.
+  const result = await c.env.DB.prepare('DELETE FROM sessions WHERE id = ? AND user_id = ?')
     .bind(payload.sid, payload.sub)
-    .first<any>();
-  if (!session || session.revoked_at) return c.json({ error: 'Session has been revoked' }, 401);
+    .run();
+  if (!result.meta.changes) return c.json({ error: 'Session has been revoked' }, 401);
 
-  // Rotate: revoke the used refresh token, issue a fresh pair.
-  await c.env.DB.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE id = ?").bind(payload.sid).run();
   const tokens = await issueTokens(c.env, payload.sub);
   return c.json(tokens);
 });
@@ -126,9 +158,9 @@ auth.post('/logout', async (c) => {
   if (refresh_token) {
     const payload = await verifyJWT<{ sid: string }>(refresh_token, c.env.JWT_SECRET);
     if (payload?.sid) {
-      await c.env.DB.prepare("UPDATE sessions SET revoked_at = datetime('now') WHERE id = ?")
-        .bind(payload.sid)
-        .run();
+      // An explicit sign-out ends this session for good — delete its row
+      // rather than leaving a revoked one behind forever.
+      await c.env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(payload.sid).run();
     }
   }
   return c.json({ success: true });
