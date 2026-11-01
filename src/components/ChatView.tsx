@@ -240,21 +240,21 @@ const MessageBubble = memo(function MessageBubble({
 interface VoiceMessageBubbleProps {
   message: Message;
   isOwn: boolean;
-  isPlaying: boolean;
   audioRefs: { current: Record<string, HTMLAudioElement> };
-  onTogglePlayback: (messageId: string, audioUrl: string) => void;
-  onSeek: (messageId: string, audioUrl: string, ratio: number) => void;
+  // Called right before this bubble starts playing, so the parent can pause
+  // whatever *other* voice message is currently playing — the only thing
+  // that genuinely needs to be coordinated across bubbles.
+  onRequestExclusivePlayback: (messageId: string) => void;
 }
 
 const VoiceMessageBubble = memo(function VoiceMessageBubble({
   message,
   isOwn,
-  isPlaying,
   audioRefs,
-  onTogglePlayback,
-  onSeek
+  onRequestExclusivePlayback
 }: VoiceMessageBubbleProps) {
   const [waveformData, setWaveformData] = useState<number[]>([]);
+  const [isPlaying, setIsPlaying] = useState(false);
   const [playbackProgress, setPlaybackProgress] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -295,11 +295,43 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     setWaveformData(data);
   }, [message.id, message.thumbnail_url, bars]);
 
-  // Track playback progress and duration
+  // This bubble owns its <audio> element outright: it creates it (if it
+  // doesn't already exist — e.g. a previous mount of this exact message
+  // already created and is still playing it) as soon as it mounts, and
+  // drives every bit of its own UI (play/pause icon, progress, duration)
+  // purely from that element's *native* play/pause/timeupdate/ended events.
+  //
+  // This used to instead receive `isPlaying` as a prop computed by the
+  // parent from a `playingAudio` state value. That silently broke, because
+  // the message-list item wrapping this bubble is wrapped in React.memo
+  // with a *custom* comparator that only looks at a few message fields
+  // (id/is_read/content/edited/deleted/reactions) — it has no idea
+  // `playingAudio` even exists, so clicking play updated state in the
+  // parent that this already-mounted, memo-blocked bubble was never told
+  // about. The icon looked "static and idle", the waveform never filled in
+  // (because the progress-tracking effect's dependency on the stale
+  // `isPlaying` prop meant it was attached once and never revisited), and
+  // a seek looked like it snapped straight back (dragRatio reset to null
+  // on release, falling back to a playbackProgress value that had never
+  // actually been updated). Driving everything off the audio element's own
+  // events sidesteps all of that: this component's *own* state updates
+  // always cause *this* component to re-render, regardless of whether its
+  // parent ever does.
   useEffect(() => {
+    if (!audioRefs.current[message.id]) {
+      const audioEl = new Audio(audioUrl);
+      // Don't eagerly fetch anything just because the bubble scrolled into
+      // view — every voice message in the chat mounts one of these. We
+      // already have message.duration to show before first play, so there's
+      // nothing to gain from preloading, only bandwidth to waste.
+      audioEl.preload = 'none';
+      audioRefs.current[message.id] = audioEl;
+    }
     const audio = audioRefs.current[message.id];
-    if (!audio) return;
 
+    const onPlay = () => setIsPlaying(true);
+    const onPause = () => setIsPlaying(false);
+    const onEnded = () => setIsPlaying(false);
     const updateProgress = () => {
       if (audio.duration) {
         setPlaybackProgress(audio.currentTime / audio.duration);
@@ -307,22 +339,27 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
         setDuration(audio.duration);
       }
     };
+    const onLoadedMetadata = () => setDuration(audio.duration);
 
-    const onLoadedMetadata = () => {
-      setDuration(audio.duration);
-    };
-
+    audio.addEventListener('play', onPlay);
+    audio.addEventListener('pause', onPause);
+    audio.addEventListener('ended', onEnded);
     audio.addEventListener('timeupdate', updateProgress);
     audio.addEventListener('loadedmetadata', onLoadedMetadata);
-    // Covers the case where metadata already loaded before this effect
-    // attached (e.g. audio was created earlier via a seek before playing).
+
+    // Sync immediately in case the element already existed with state this
+    // fresh instance doesn't know about yet (e.g. it's already playing).
+    setIsPlaying(!audio.paused);
     if (audio.readyState >= 1) updateProgress();
 
     return () => {
+      audio.removeEventListener('play', onPlay);
+      audio.removeEventListener('pause', onPause);
+      audio.removeEventListener('ended', onEnded);
       audio.removeEventListener('timeupdate', updateProgress);
       audio.removeEventListener('loadedmetadata', onLoadedMetadata);
     };
-  }, [message.id, isPlaying, audioRefs]);
+  }, [message.id, audioUrl, audioRefs]);
 
   const effectiveProgress = dragRatio !== null ? dragRatio : playbackProgress;
   const playedBars = Math.floor(effectiveProgress * bars);
@@ -352,32 +389,70 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
   };
 
+  const seekTo = (ratio: number) => {
+    const audio = audioRefs.current[message.id];
+    if (!audio) return;
+    const clampedRatio = Math.max(0, Math.min(1, ratio));
+
+    const applySeek = () => {
+      if (audio.duration && isFinite(audio.duration)) {
+        audio.currentTime = clampedRatio * audio.duration;
+      }
+    };
+
+    if (audio.readyState >= 1) {
+      applySeek();
+    } else {
+      audio.addEventListener('loadedmetadata', applySeek, { once: true });
+    }
+
+    if (audio.paused) {
+      onRequestExclusivePlayback(message.id);
+      audio.play().catch(() => {});
+    }
+  };
+
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.currentTarget.setPointerCapture(e.pointerId);
     const ratio = ratioFromPointer(e);
     setDragRatio(ratio);
-    onSeek(message.id, audioUrl, ratio);
+    seekTo(ratio);
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (dragRatio === null) return;
     const ratio = ratioFromPointer(e);
     setDragRatio(ratio);
-    onSeek(message.id, audioUrl, ratio);
+    seekTo(ratio);
   };
 
   const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
+    // No need to fall back to a stale playbackProgress here anymore — the
+    // 'timeupdate'/'play' listeners above keep it genuinely in sync with
+    // the audio element in real time, so dropping back to it on release no
+    // longer snaps the bar backwards.
     setDragRatio(null);
+  };
+
+  const handleTogglePlayback = () => {
+    const audio = audioRefs.current[message.id];
+    if (!audio) return;
+    if (audio.paused) {
+      onRequestExclusivePlayback(message.id);
+      audio.play().catch(() => {});
+    } else {
+      audio.pause();
+    }
   };
 
   return (
     <div className={`voice-message-bubble ${isOwn ? 'own' : 'received'}`}>
       {/* Play/Pause Button */}
       <button
-        onClick={() => onTogglePlayback(message.id, audioUrl)}
+        onClick={handleTogglePlayback}
         className={`voice-message-play-btn ${isOwn ? 'own' : 'received'} ${isPlaying ? 'is-playing' : ''}`}
         aria-label={isPlaying ? 'Pause voice message' : 'Play voice message'}
       >
@@ -665,8 +740,12 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [groups, setGroups] = useState<GroupWithMembers[]>([]);
 
-  // Audio Playback
-  const [playingAudio, setPlayingAudio] = useState<string | null>(null);
+  // Audio Playback — each VoiceMessageBubble owns and drives its own
+  // <audio> element entirely from that element's native events (see the
+  // component for why), so the only thing ChatView itself needs to
+  // coordinate is making sure starting one voice message pauses any other
+  // one that's currently playing. audioRefs is a ref, not state, on
+  // purpose: nothing here needs to trigger a ChatView re-render.
   const audioRefs = useRef<{ [key: string]: HTMLAudioElement }>({});
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -1555,61 +1634,17 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     };
   }, [handleGlobalMouseMove, handleGlobalMouseUp, handleGlobalTouchMove, handleGlobalTouchEnd]);
 
-  // Audio Playback
-  // Shared by toggleAudioPlayback and seekAudio: get (creating if needed)
-  // the <audio> element for a voice message, and make sure any other
-  // voice message that's currently playing gets paused first — only one
-  // voice note plays at a time.
-  const ensureAudio = useCallback((messageId: string, audioUrl: string) => {
-    if (playingAudio && playingAudio !== messageId && audioRefs.current[playingAudio]) {
-      audioRefs.current[playingAudio].pause();
-    }
-
-    if (!audioRefs.current[messageId]) {
-      audioRefs.current[messageId] = new Audio(audioUrl);
-      audioRefs.current[messageId].onended = () => setPlayingAudio(null);
-    }
-    return audioRefs.current[messageId];
-  }, [playingAudio]);
-
-  const toggleAudioPlayback = useCallback((messageId: string, audioUrl: string) => {
-    if (playingAudio === messageId) {
-      audioRefs.current[messageId]?.pause();
-      setPlayingAudio(null);
-      return;
-    }
-
-    const audio = ensureAudio(messageId, audioUrl);
-    audio.play().catch(() => {});
-    setPlayingAudio(messageId);
-  }, [playingAudio, ensureAudio]);
-
-  // Drag/tap-to-seek on a voice message's waveform ("jump" to any point and
-  // keep listening from there, like WhatsApp's scrubber). Always (re)starts
-  // playback from the dragged position so the gesture is immediately
-  // audible, and avoids calling .play() again on every pointermove while a
-  // drag is already in progress (which would otherwise glitch playback).
-  const seekAudio = useCallback((messageId: string, audioUrl: string, ratio: number) => {
-    const audio = ensureAudio(messageId, audioUrl);
-    const clampedRatio = Math.max(0, Math.min(1, ratio));
-
-    const applySeek = () => {
-      if (audio.duration && isFinite(audio.duration)) {
-        audio.currentTime = clampedRatio * audio.duration;
+  // Audio Playback — only cross-bubble concern left: when one voice
+  // message starts playing, pause whatever other one is currently playing,
+  // so only one plays at a time. Everything else (play/pause state, seek,
+  // progress) is now fully owned by each VoiceMessageBubble itself.
+  const pauseOtherVoiceMessages = useCallback((exceptMessageId: string) => {
+    Object.entries(audioRefs.current).forEach(([id, audio]) => {
+      if (id !== exceptMessageId && !audio.paused) {
+        audio.pause();
       }
-    };
-
-    if (audio.readyState >= 1) {
-      applySeek();
-    } else {
-      audio.addEventListener('loadedmetadata', applySeek, { once: true });
-    }
-
-    if (audio.paused) {
-      audio.play().catch(() => {});
-    }
-    setPlayingAudio(messageId);
-  }, [ensureAudio]);
+    });
+  }, []);
 
   // Media Viewer
   const openMediaViewer = (type: 'image' | 'video', url: string) => {
@@ -1681,10 +1716,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           <VoiceMessageBubble
             message={message}
             isOwn={isOwn}
-            isPlaying={playingAudio === message.id}
             audioRefs={audioRefs}
-            onTogglePlayback={toggleAudioPlayback}
-            onSeek={seekAudio}
+            onRequestExclusivePlayback={pauseOtherVoiceMessages}
           />
         );
       case 'gif':
