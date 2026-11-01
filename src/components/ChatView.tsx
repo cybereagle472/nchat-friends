@@ -255,11 +255,19 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
 }: VoiceMessageBubbleProps) {
   const [waveformData, setWaveformData] = useState<number[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
+  // currentTime/playbackProgress are intentionally only "checkpoints" —
+  // updated a few times a second, not every frame (see the rAF effect
+  // below) — they drive the duration *text* and the progress overlay's
+  // resting position, not the live animation itself.
   const [playbackProgress, setPlaybackProgress] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [dragRatio, setDragRatio] = useState<number | null>(null);
   const waveformRef = useRef<HTMLDivElement>(null);
+  // The "played" portion is a second, absolutely-positioned copy of the
+  // same bars in a brighter color, revealed left-to-right via clip-path as
+  // playback advances — painted directly via this ref, not React state.
+  const overlayRef = useRef<HTMLDivElement>(null);
   const bars = VOICE_WAVEFORM_BARS;
   const audioUrl = message.media_url || message.content;
 
@@ -295,11 +303,24 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     setWaveformData(data);
   }, [message.id, message.thumbnail_url, bars]);
 
+  // Paints the progress overlay directly via the DOM, bypassing React
+  // entirely. clip-path on a GPU-composited layer is dramatically cheaper
+  // than re-rendering (and re-diffing) up to 27 separate bar elements'
+  // classes every frame, which is what made this feel laggy before —
+  // this is the same technique native video/audio scrubbers use.
+  const paintProgress = useCallback((ratio: number) => {
+    const clamped = Math.max(0, Math.min(1, ratio));
+    const el = overlayRef.current;
+    if (el) el.style.clipPath = `inset(0 ${(1 - clamped) * 100}% 0 0)`;
+  }, []);
+
   // This bubble owns its <audio> element outright: it creates it (if it
   // doesn't already exist — e.g. a previous mount of this exact message
   // already created and is still playing it) as soon as it mounts, and
   // drives every bit of its own UI (play/pause icon, progress, duration)
-  // purely from that element's *native* play/pause/timeupdate/ended events.
+  // purely from that element's *native* play/pause/ended events (plus a
+  // rAF loop for smooth progress, see below) rather than from any prop
+  // computed by a parent.
   //
   // This used to instead receive `isPlaying` as a prop computed by the
   // parent from a `playingAudio` state value. That silently broke, because
@@ -308,15 +329,10 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
   // (id/is_read/content/edited/deleted/reactions) — it has no idea
   // `playingAudio` even exists, so clicking play updated state in the
   // parent that this already-mounted, memo-blocked bubble was never told
-  // about. The icon looked "static and idle", the waveform never filled in
-  // (because the progress-tracking effect's dependency on the stale
-  // `isPlaying` prop meant it was attached once and never revisited), and
-  // a seek looked like it snapped straight back (dragRatio reset to null
-  // on release, falling back to a playbackProgress value that had never
-  // actually been updated). Driving everything off the audio element's own
-  // events sidesteps all of that: this component's *own* state updates
-  // always cause *this* component to re-render, regardless of whether its
-  // parent ever does.
+  // about. Driving everything off the audio element's own events
+  // sidesteps all of that: this component's *own* state updates always
+  // cause *this* component to re-render, regardless of whether its parent
+  // ever does.
   useEffect(() => {
     if (!audioRefs.current[message.id]) {
       const audioEl = new Audio(audioUrl);
@@ -332,37 +348,76 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     const onPlay = () => setIsPlaying(true);
     const onPause = () => setIsPlaying(false);
     const onEnded = () => setIsPlaying(false);
-    const updateProgress = () => {
+    const syncCheckpoint = () => {
       if (audio.duration) {
-        setPlaybackProgress(audio.currentTime / audio.duration);
+        const ratio = audio.currentTime / audio.duration;
+        setPlaybackProgress(ratio);
         setCurrentTime(audio.currentTime);
         setDuration(audio.duration);
+        paintProgress(ratio);
       }
     };
-    const onLoadedMetadata = () => setDuration(audio.duration);
 
     audio.addEventListener('play', onPlay);
     audio.addEventListener('pause', onPause);
     audio.addEventListener('ended', onEnded);
-    audio.addEventListener('timeupdate', updateProgress);
-    audio.addEventListener('loadedmetadata', onLoadedMetadata);
+    // 'timeupdate' only fires a handful of times a second in most browsers
+    // — far too coarse to animate from directly, but perfect as the
+    // low-frequency "checkpoint" that keeps the text/resting position
+    // accurate whenever the fast rAF loop below isn't the one driving it
+    // (i.e. whenever this message isn't the one currently playing).
+    audio.addEventListener('timeupdate', syncCheckpoint);
+    audio.addEventListener('loadedmetadata', syncCheckpoint);
 
     // Sync immediately in case the element already existed with state this
     // fresh instance doesn't know about yet (e.g. it's already playing).
     setIsPlaying(!audio.paused);
-    if (audio.readyState >= 1) updateProgress();
+    if (audio.readyState >= 1) syncCheckpoint();
 
     return () => {
       audio.removeEventListener('play', onPlay);
       audio.removeEventListener('pause', onPause);
       audio.removeEventListener('ended', onEnded);
-      audio.removeEventListener('timeupdate', updateProgress);
-      audio.removeEventListener('loadedmetadata', onLoadedMetadata);
+      audio.removeEventListener('timeupdate', syncCheckpoint);
+      audio.removeEventListener('loadedmetadata', syncCheckpoint);
     };
-  }, [message.id, audioUrl, audioRefs]);
+  }, [message.id, audioUrl, audioRefs, paintProgress]);
 
-  const effectiveProgress = dragRatio !== null ? dragRatio : playbackProgress;
-  const playedBars = Math.floor(effectiveProgress * bars);
+  // The actual smooth animation: while this message is playing, repaint
+  // the progress overlay every animation frame (~60fps) straight from the
+  // audio element's currentTime, with zero React re-renders in the hot
+  // path. The timer text is throttled to ~5/sec here, since a counting
+  // clock redrawing faster than that is imperceptible but a wasted render.
+  useEffect(() => {
+    if (!isPlaying) return;
+    const audio = audioRefs.current[message.id];
+    if (!audio) return;
+
+    let rafId = 0;
+    let lastTextUpdate = 0;
+
+    const tick = (now: number) => {
+      if (audio.duration && isFinite(audio.duration)) {
+        paintProgress(audio.currentTime / audio.duration);
+        if (now - lastTextUpdate >= 200) {
+          lastTextUpdate = now;
+          setCurrentTime(audio.currentTime);
+        }
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+
+    return () => cancelAnimationFrame(rafId);
+  }, [isPlaying, message.id, audioRefs, paintProgress]);
+
+  // Keep the overlay in sync with any *non*-animated progress change too
+  // (a seek while paused, drag feedback, metadata finally loading in) —
+  // the rAF loop above only runs while actually playing.
+  useEffect(() => {
+    if (dragRatio !== null) return;
+    paintProgress(playbackProgress);
+  }, [playbackProgress, dragRatio, paintProgress]);
 
   const formatAudioTime = (seconds: number) => {
     if (!seconds || isNaN(seconds)) return '0:00';
@@ -416,6 +471,7 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     e.currentTarget.setPointerCapture(e.pointerId);
     const ratio = ratioFromPointer(e);
     setDragRatio(ratio);
+    paintProgress(ratio);
     seekTo(ratio);
   };
 
@@ -423,6 +479,7 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     if (dragRatio === null) return;
     const ratio = ratioFromPointer(e);
     setDragRatio(ratio);
+    paintProgress(ratio);
     seekTo(ratio);
   };
 
@@ -431,8 +488,8 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
     // No need to fall back to a stale playbackProgress here anymore — the
-    // 'timeupdate'/'play' listeners above keep it genuinely in sync with
-    // the audio element in real time, so dropping back to it on release no
+    // checkpoint/rAF effects above keep it genuinely in sync with the
+    // audio element in real time, so dropping back to it on release no
     // longer snaps the bar backwards.
     setDragRatio(null);
   };
@@ -447,6 +504,23 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
       audio.pause();
     }
   };
+
+  const renderBars = (variant: 'base' | 'overlay') => waveformData.map((value, i) => {
+    // `value` is already normalized per-clip at record time (see
+    // downsampleWaveform) so it genuinely spans ~0–1 with real contrast
+    // between quiet and loud moments. A light gamma lift still helps
+    // quieter-but-real bars stay readable, and a small floor just keeps a
+    // near-silent bucket from collapsing to an invisible sliver.
+    const clamped = Math.max(0, Math.min(1, value));
+    const visualHeight = Math.max(0.12, Math.pow(clamped, 0.7));
+    return (
+      <div
+        key={i}
+        className={`voice-waveform-bar ${isOwn ? 'own' : 'received'} ${variant === 'overlay' ? 'played' : ''}`}
+        style={{ height: `${visualHeight * 100}%` }}
+      />
+    );
+  });
 
   return (
     <div className={`voice-message-bubble ${isOwn ? 'own' : 'received'}`}>
@@ -466,7 +540,11 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
       {/* Waveform and Duration */}
       <div className="voice-message-content">
         {/* Waveform — tap or drag anywhere on it to jump to that point and
-            keep listening from there. */}
+            keep listening from there. Two stacked copies of the same bars:
+            a static "unplayed" base layer, and a brighter "played" layer
+            clipped to the current progress and repainted directly via
+            paintProgress() for a smooth 60fps fill with no React
+            re-renders in the hot path. */}
         <div
           ref={waveformRef}
           className="voice-message-waveform"
@@ -475,26 +553,10 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
           onPointerUp={endDrag}
           onPointerCancel={endDrag}
         >
-          {waveformData.map((value, i) => {
-            const isPlayed = i < playedBars;
-            const isPlayhead = i === playedBars;
-            // `value` is already normalized per-clip at record time (see
-            // downsampleWaveform) so it genuinely spans ~0–1 with real
-            // contrast between quiet and loud moments. A light gamma lift
-            // still helps quieter-but-real bars stay readable, and a
-            // small floor just keeps a near-silent bucket from collapsing
-            // to an invisible sliver — neither needs to be aggressive
-            // anymore now that the underlying data isn't clustered flat.
-            const clamped = Math.max(0, Math.min(1, value));
-            const visualHeight = Math.max(0.12, Math.pow(clamped, 0.7));
-            return (
-              <div
-                key={i}
-                className={`voice-waveform-bar ${isOwn ? 'own' : 'received'} ${isPlayed ? 'played' : ''} ${isPlayhead ? 'playhead' : ''}`}
-                style={{ height: `${visualHeight * 100}%` }}
-              />
-            );
-          })}
+          <div className="voice-waveform-track">
+            <div className="voice-waveform-bars-layer">{renderBars('base')}</div>
+            <div ref={overlayRef} className="voice-waveform-bars-layer overlay">{renderBars('overlay')}</div>
+          </div>
         </div>
 
         {/* Duration */}
@@ -1603,6 +1665,12 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
   const handleVoiceButtonTouchStart = (e: React.TouchEvent | React.MouseEvent) => {
     e.preventDefault();
+    // Stop any voice message that's currently playing the instant the user
+    // touches the mic button — before even asking for microphone
+    // permission, which can itself take a moment. Otherwise the speaker is
+    // still audibly playing while the mic opens, and gets picked right back
+    // up into the new recording.
+    pauseAllVoiceMessages();
     const isTouch = 'touches' in e;
     const clientX = isTouch ? e.touches[0].clientX : e.clientX;
     startXRef.current = clientX;
@@ -1643,6 +1711,17 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
       if (id !== exceptMessageId && !audio.paused) {
         audio.pause();
       }
+    });
+  }, []);
+
+  // Also used by startRecording (see below): stop *every* currently
+  // playing voice message, with no exception. Starting a new recording
+  // while another voice message is still audibly playing both sounds
+  // wrong and, worse, the speaker output bleeds straight back into the
+  // microphone and gets captured into the new recording.
+  const pauseAllVoiceMessages = useCallback(() => {
+    Object.values(audioRefs.current).forEach((audio) => {
+      if (!audio.paused) audio.pause();
     });
   }, []);
 
@@ -2733,9 +2812,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         .voice-message-waveform {
           display: flex;
           align-items: center;
-          justify-content: space-between;
-          gap: 2.5px;
-          height: 30px;
           cursor: pointer;
           /* Prevent the page from scrolling while dragging to seek on
              touch, and stop the default double-tap/long-press highlight
@@ -2751,11 +2827,42 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           box-sizing: content-box;
         }
 
+        /* Positioning context for the overlay layer below — kept as a
+           separate inner element (rather than making .voice-message-waveform
+           itself position:relative) so the extra touch-target padding above
+           doesn't have to be accounted for in the overlay's offsets. */
+        .voice-waveform-track {
+          position: relative;
+          width: 100%;
+          height: 30px;
+        }
+
+        .voice-waveform-bars-layer {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 2.5px;
+          width: 100%;
+          height: 30px;
+        }
+
+        /* The "played" copy of the bars, drawn directly on top of the base
+           (unplayed) layer and revealed left-to-right via clip-path as
+           playback advances. Updated straight through a ref in JS
+           (paintProgress) rather than React state/props, and clip-path is
+           GPU-composited, so this animates at a smooth 60fps with none of
+           the per-bar class-toggling + re-render cost the old approach had. */
+        .voice-waveform-bars-layer.overlay {
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+          will-change: clip-path;
+        }
+
         .voice-waveform-bar {
           width: 3px;
           flex-shrink: 0;
           border-radius: 2px;
-          transition: height 0.1s ease, background 0.15s ease, transform 0.15s ease;
           min-height: 6px;
         }
 
@@ -2764,12 +2871,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
         }
 
         .voice-waveform-bar.own.played {
-          background: rgba(255, 255, 255, 0.95);
-        }
-
-        .voice-waveform-bar.own.playhead {
           background: #ffffff;
-          transform: scaleY(1.25);
         }
 
         .voice-waveform-bar.received {
@@ -2778,11 +2880,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
         .voice-waveform-bar.received.played {
           background: #8b5cf6;
-        }
-
-        .voice-waveform-bar.received.playhead {
-          background: #7c3aed;
-          transform: scaleY(1.25);
         }
 
         .voice-message-duration {
