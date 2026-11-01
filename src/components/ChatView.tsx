@@ -755,6 +755,8 @@ interface ChatViewProps {
   onBack: () => void;
   onCall: (type: 'voice' | 'video') => void;
   onBlockUser?: (userId: string) => void;
+  /** Opens the full profile preview for this contact. */
+  onViewProfile?: () => void;
 }
 
 // Voice Recording State
@@ -779,7 +781,7 @@ interface MediaViewerState {
   url: string;
 }
 
-export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: ChatViewProps) {
+export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, onViewProfile }: ChatViewProps) {
   // Seed state synchronously from the in-memory cache (if warm) so reopening a
   // chat you just viewed never renders an empty/skeleton frame before
   // painting — this is what eliminates the visible "blink" on reopen.
@@ -1947,8 +1949,13 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
             <ArrowLeft className="w-5 h-5" strokeWidth={2} />
           </button>
 
-          {/* Circular Profile Picture */}
-          <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center text-lg overflow-hidden ring-2 ring-white/30">
+          {/* Circular Profile Picture — tap to view this contact's profile */}
+          <button
+            onClick={onViewProfile}
+            disabled={!onViewProfile}
+            className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center text-lg overflow-hidden ring-2 ring-white/30 flex-shrink-0 active:scale-95 transition-transform disabled:cursor-default"
+            aria-label="View profile"
+          >
             {contact.profile.avatar_url ? (
               <img
                 src={contact.profile.avatar_url}
@@ -1958,9 +1965,9 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
             ) : (
               <span className="font-semibold">{contact.profile.full_name.charAt(0).toUpperCase()}</span>
             )}
-          </div>
+          </button>
 
-          <div className="flex-1 min-w-0">
+          <button onClick={onViewProfile} disabled={!onViewProfile} className="flex-1 min-w-0 text-left disabled:cursor-default">
             <h2 className="text-base font-semibold truncate">{contact.profile.full_name}</h2>
             <p
               key={isContactRecording ? 'recording' : isTyping ? 'typing' : 'status'}
@@ -1991,7 +1998,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
                 </span>
               )}
             </p>
-          </div>
+          </button>
 
           <button
             onClick={() => onCall('video')}
@@ -2455,7 +2462,15 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
                 <ArrowLeft className="w-5 h-5 text-white" />
               </button>
 
-              <div className="flex items-center gap-3">
+              <button
+                onClick={() => {
+                  if (!onViewProfile) return;
+                  closeMediaViewer();
+                  onViewProfile();
+                }}
+                disabled={!onViewProfile}
+                className="flex items-center gap-3 active:opacity-80 transition-opacity disabled:cursor-default"
+              >
                 <div className="w-9 h-9 rounded-full overflow-hidden ring-2 ring-white/20">
                   {contact.profile.avatar_url ? (
                     <img src={contact.profile.avatar_url} alt="" className="w-full h-full object-cover" />
@@ -2465,11 +2480,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
                     </div>
                   )}
                 </div>
-                <div>
+                <div className="text-left">
                   <p className="text-white font-medium text-sm">{contact.profile.full_name}</p>
-                  <p className="text-white/60 text-xs">Tap to view profile</p>
+                  {onViewProfile && <p className="text-white/60 text-xs">Tap to view profile</p>}
                 </div>
-              </div>
+              </button>
 
               <button className="w-10 h-10 rounded-full bg-white/10 backdrop-blur-lg flex items-center justify-center hover:bg-white/20 transition-all active:scale-95">
                 <MoreVertical className="w-5 h-5 text-white" />

@@ -31,9 +31,10 @@ interface GroupInfoProps {
   /** Called after you leave or the group is deleted — navigate back out of it entirely. */
   onLeftOrDeleted: () => void;
   onBack: () => void;
+  onViewProfile?: (userId: string, initialProfile?: UserProfile) => void;
 }
 
-export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDeleted, onBack }: GroupInfoProps) {
+export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDeleted, onBack, onViewProfile }: GroupInfoProps) {
   const [view, setView] = useState<'info' | 'add-members'>('info');
   const [editingDetails, setEditingDetails] = useState(false);
   const [nameDraft, setNameDraft] = useState(group.name);
@@ -446,7 +447,12 @@ export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDele
           const profile = member.profile;
           return (
             <div key={member.user_id} className="relative flex items-center gap-3 px-4 py-3 border-b border-slate-50 last:border-0">
-              <div className="w-10 h-10 rounded-full overflow-hidden bg-gradient-to-br from-violet-400 to-purple-400 flex-shrink-0">
+              <button
+                onClick={() => !isSelf && onViewProfile?.(member.user_id, profile)}
+                disabled={isSelf || !onViewProfile}
+                className="w-10 h-10 rounded-full overflow-hidden bg-gradient-to-br from-violet-400 to-purple-400 flex-shrink-0 disabled:cursor-default"
+                aria-label="View profile"
+              >
                 {profile?.avatar_url ? (
                   <img src={profile.avatar_url} alt="" className="w-full h-full object-cover" />
                 ) : (
@@ -454,13 +460,17 @@ export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDele
                     {profile?.full_name?.charAt(0) || '?'}
                   </div>
                 )}
-              </div>
-              <div className="flex-1 min-w-0">
+              </button>
+              <button
+                onClick={() => !isSelf && onViewProfile?.(member.user_id, profile)}
+                disabled={isSelf || !onViewProfile}
+                className="flex-1 min-w-0 text-left disabled:cursor-default"
+              >
                 <p className="text-sm font-medium text-slate-800 truncate">
                   {isSelf ? 'You' : profile?.full_name || 'Unknown'}
                 </p>
                 {profile?.username && <p className="text-xs text-slate-400 truncate">@{profile.username}</p>}
-              </div>
+              </button>
               {member.role === 'admin' && (
                 <span className="flex items-center gap-1 text-[10px] font-bold text-violet-600 flex-shrink-0">
                   <Crown className="w-3 h-3" />

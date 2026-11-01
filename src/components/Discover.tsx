@@ -46,6 +46,7 @@ interface DiscoverProps {
   onRefresh: () => void;
   onMessage: (contact: Contact) => void;
   onCall: (userId: string, type: 'voice' | 'video') => void;
+  onViewProfile?: (userId: string, initialProfile?: UserProfile) => void;
 }
 
 type DiscoverTab = 'friends' | 'requests' | 'find';
@@ -59,7 +60,8 @@ export function Discover({
   onAddFriend,
   onRefresh,
   onMessage,
-  onCall
+  onCall,
+  onViewProfile
 }: DiscoverProps) {
   const [activeTab, setActiveTab] = useState<DiscoverTab>('friends');
   const [searchQuery, setSearchQuery] = useState('');
@@ -347,7 +349,12 @@ export function Discover({
                     style={{ animationDelay: `${index * 30}ms` }}
                     className="flex items-center gap-3 p-3 rounded-2xl backdrop-blur-xl bg-white/70 border border-white/70 hover:bg-white/90 hover:shadow-lg hover:shadow-purple-500/15 transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] animate-slide-up group"
                   >
-                    <div className="relative">
+                    <button
+                      onClick={() => onViewProfile?.(friend.id, friend.profile)}
+                      disabled={!onViewProfile}
+                      className="relative disabled:cursor-default"
+                      aria-label="View profile"
+                    >
                       <div className="w-14 h-14 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
                         {friend.profile.avatar_url ? (
                           <img src={friend.profile.avatar_url} alt={friend.profile.full_name} className="w-full h-full object-cover" />
@@ -358,9 +365,13 @@ export function Discover({
                       {friend.profile.is_online && (
                         <div className="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-green-500 rounded-full border-2 border-white shadow-md"></div>
                       )}
-                    </div>
+                    </button>
 
-                    <div className="flex-1 min-w-0">
+                    <button
+                      onClick={() => onViewProfile?.(friend.id, friend.profile)}
+                      disabled={!onViewProfile}
+                      className="flex-1 min-w-0 text-left disabled:cursor-default"
+                    >
                       <h3 className="text-sm font-semibold text-slate-800 group-hover:text-violet-600 transition-colors truncate">
                         {friend.profile.full_name}
                       </h3>
@@ -372,7 +383,7 @@ export function Discover({
                           presenceStatusText(friend.profile.is_online, friend.profile.last_seen)
                         )}
                       </p>
-                    </div>
+                    </button>
 
                     <div className="flex items-center gap-1 flex-shrink-0">
                       <button
@@ -416,7 +427,12 @@ export function Discover({
                     className="p-3.5 rounded-2xl backdrop-blur-xl bg-white/70 border border-white/70 hover:bg-white/90 hover:shadow-lg hover:shadow-purple-500/15 transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] animate-slide-up"
                   >
                     <div className="flex items-center gap-3 mb-3">
-                      <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 overflow-hidden">
+                      <button
+                        onClick={() => request.sender_profile && onViewProfile?.(request.sender_id, request.sender_profile)}
+                        disabled={!onViewProfile || !request.sender_profile}
+                        className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 overflow-hidden disabled:cursor-default"
+                        aria-label="View profile"
+                      >
                         {request.sender_profile?.avatar_url ? (
                           <img
                             src={request.sender_profile.avatar_url}
@@ -428,9 +444,13 @@ export function Discover({
                             {request.sender_profile?.full_name?.charAt(0).toUpperCase() || '?'}
                           </span>
                         )}
-                      </div>
+                      </button>
 
-                      <div className="flex-1 min-w-0">
+                      <button
+                        onClick={() => request.sender_profile && onViewProfile?.(request.sender_id, request.sender_profile)}
+                        disabled={!onViewProfile || !request.sender_profile}
+                        className="flex-1 min-w-0 text-left disabled:cursor-default"
+                      >
                         <h3 className="text-sm font-semibold text-slate-800 truncate">
                           {request.sender_profile?.full_name || 'Unknown'}
                         </h3>
@@ -440,7 +460,7 @@ export function Discover({
                         <p className="text-[10px] text-slate-500 font-medium">
                           {formatTime(request.created_at)}
                         </p>
-                      </div>
+                      </button>
                     </div>
 
                     <div className="flex gap-2">
@@ -513,7 +533,12 @@ export function Discover({
                       className="p-3.5 rounded-2xl backdrop-blur-xl bg-white/70 border border-white/70 hover:bg-white/90 hover:shadow-lg hover:shadow-purple-500/15 transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] animate-slide-up group"
                     >
                       <div className="flex items-center gap-3">
-                        <div className="relative">
+                        <button
+                          onClick={() => onViewProfile?.(user.id, user.profile)}
+                          disabled={!onViewProfile}
+                          className="relative disabled:cursor-default"
+                          aria-label="View profile"
+                        >
                           <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
                             {user.profile.avatar_url ? (
                               <img
@@ -530,9 +555,13 @@ export function Discover({
                           {user.profile.is_online && (
                             <div className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 bg-green-500 rounded-full border-2 border-white shadow-sm"></div>
                           )}
-                        </div>
+                        </button>
 
-                        <div className="flex-1 min-w-0">
+                        <button
+                          onClick={() => onViewProfile?.(user.id, user.profile)}
+                          disabled={!onViewProfile}
+                          className="flex-1 min-w-0 text-left disabled:cursor-default"
+                        >
                           <div className="flex items-center gap-2">
                             <h3 className="text-sm font-semibold text-slate-800 group-hover:text-violet-600 transition-colors duration-300 truncate">
                               {user.profile.full_name}
@@ -546,7 +575,7 @@ export function Discover({
                           <p className="text-[11px] text-slate-600 truncate">
                             @{user.profile.username || 'user'}
                           </p>
-                        </div>
+                        </button>
 
                         {renderActionButton(user)}
                       </div>

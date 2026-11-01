@@ -29,9 +29,10 @@ interface GroupChatViewProps {
   onBack: () => void;
   onGroupCall?: (type: 'voice' | 'video') => void;
   onManageGroup: () => void;
+  onViewProfile?: (userId: string, initialProfile?: UserProfile) => void;
 }
 
-export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManageGroup }: GroupChatViewProps) {
+export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManageGroup, onViewProfile }: GroupChatViewProps) {
   const [messageText, setMessageText] = useState('');
   const [showMenu, setShowMenu] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
@@ -428,8 +429,14 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
           <div className="flex gap-3 overflow-x-auto pb-2">
             {members.map((member) => {
               const profile = memberProfiles[member.user_id];
+              const isSelf = member.user_id === currentUser.id;
               return (
-                <div key={member.user_id} className="flex flex-col items-center flex-shrink-0">
+                <button
+                  key={member.user_id}
+                  onClick={() => !isSelf && onViewProfile?.(member.user_id, profile)}
+                  disabled={isSelf || !onViewProfile}
+                  className="flex flex-col items-center flex-shrink-0 disabled:cursor-default"
+                >
                   <div className="w-12 h-12 rounded-full overflow-hidden bg-gradient-to-br from-violet-400 to-purple-400 flex items-center justify-center">
                     {profile?.avatar_url ? (
                       <img src={profile.avatar_url} alt="" className="w-full h-full object-cover" />
@@ -440,12 +447,12 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                     )}
                   </div>
                   <p className="text-[10px] text-slate-600 mt-1 text-center max-w-[60px] truncate">
-                    {member.user_id === currentUser.id ? 'You' : profile?.full_name?.split(' ')[0] || 'Unknown'}
+                    {isSelf ? 'You' : profile?.full_name?.split(' ')[0] || 'Unknown'}
                   </p>
                   {member.role === 'admin' && (
                     <span className="text-[8px] text-violet-600 font-bold">Admin</span>
                   )}
-                </div>
+                </button>
               );
             })}
           </div>

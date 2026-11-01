@@ -14,6 +14,7 @@ import { Discover } from './components/Discover';
 import { History } from './components/History';
 import { Settings } from './components/Settings';
 import { CallModal } from './components/CallModal';
+import { ProfileView } from './components/ProfileView';
 import { authService, ProfileResolution } from './services/authService';
 import { profileService } from './services/profileService';
 import {
@@ -545,6 +546,33 @@ function MainApp({
 
   const [showGroupInfo, setShowGroupInfo] = useState(false);
 
+  // Profile preview — a lightweight overlay that can be opened from anywhere
+  // (a chat header, a friends/discover row, a group member, call history)
+  // to view someone's profile, independent of whichever tab/screen is
+  // currently showing.
+  const [viewProfile, setViewProfile] = useState<{ userId: string; initialProfile?: UserProfile } | null>(null);
+
+  const handleViewProfile = useCallback((userId: string, initialProfile?: UserProfile) => {
+    // Viewing your own profile here doesn't make sense — Settings already
+    // owns that, with editing. Route it there instead of showing a
+    // read-only duplicate.
+    if (userId === currentUser.id) {
+      handleOpenSettings();
+      return;
+    }
+    setViewProfile({ userId, initialProfile });
+  }, [currentUser.id, handleOpenSettings]);
+
+  const handleCloseProfileView = useCallback(() => {
+    setViewProfile(null);
+  }, []);
+
+  const handleProfileRelationChanged = useCallback(() => {
+    appData.refreshFriends();
+    appData.refreshRequests();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // If someone else removes you from a group (or deletes it) while you
   // still have it open, appData.groups (kept live by realtime events) will
   // stop containing it. Rather than silently leaving you on a now-stale
@@ -611,6 +639,7 @@ function MainApp({
             contact={liveSelectedChat}
             onBack={handleBackToChats}
             onCall={(type) => handleCall(liveSelectedChat.user_id, type)}
+            onViewProfile={() => handleViewProfile(liveSelectedChat.user_id, liveSelectedChat.profile)}
           />
         ) : liveSelectedGroup && showGroupInfo ? (
           <GroupInfo
@@ -620,6 +649,7 @@ function MainApp({
             onBack={() => setShowGroupInfo(false)}
             onChanged={handleGroupInfoChanged}
             onLeftOrDeleted={handleGroupLeftOrDeleted}
+            onViewProfile={handleViewProfile}
           />
         ) : liveSelectedGroup ? (
           <GroupChatView
@@ -627,6 +657,7 @@ function MainApp({
             group={liveSelectedGroup}
             onBack={handleBackFromGroup}
             onManageGroup={handleManageGroup}
+            onViewProfile={handleViewProfile}
           />
         ) : showCreateGroup ? (
           <CreateGroup
@@ -670,6 +701,7 @@ function MainApp({
                 onRefresh={appData.refreshRequests}
                 onMessage={handleOpenChat}
                 onCall={handleCall}
+                onViewProfile={handleViewProfile}
               />
             )}
             {activeTab === 'history' && (
@@ -678,6 +710,7 @@ function MainApp({
                 history={appData.callHistory}
                 onCall={handleCall}
                 onMessage={handleMessageFromHistory}
+                onViewProfile={handleViewProfile}
               />
             )}
           </>
@@ -794,6 +827,19 @@ function MainApp({
           callType={callState.callType}
           incomingCall={callState.incomingCall}
           onClose={handleCloseCall}
+        />
+      )}
+
+      {/* Profile Preview — overlays whatever screen is open */}
+      {viewProfile && (
+        <ProfileView
+          currentUser={currentUser}
+          userId={viewProfile.userId}
+          initialProfile={viewProfile.initialProfile}
+          onClose={handleCloseProfileView}
+          onMessage={handleOpenChat}
+          onCall={handleCall}
+          onChanged={handleProfileRelationChanged}
         />
       )}
     </div>
