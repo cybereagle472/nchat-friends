@@ -34,6 +34,8 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
   const ringTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const eventSubRef = useRef<{ unsubscribe: () => void } | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const remoteDescriptionSetRef = useRef(false);
   const endedRef = useRef(false);
 
   const clearRingTimeout = useCallback(() => {
@@ -67,6 +69,8 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
     }
 
     pendingCandidatesRef.current = [];
+    pendingRemoteCandidatesRef.current = [];
+    remoteDescriptionSetRef.current = false;
   }, [clearRingTimeout]);
 
   // status defaults to 'ended' (a normal hangup); pass 'missed' for an
@@ -142,13 +146,41 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
     return pc;
   }, [clearRingTimeout, endCall]);
 
-  // Subscribed once per call id, for both the caller and callee sides.
-  const subscribeToSignaling = useCallback((pc: RTCPeerConnection, callId: string) => {
+  // Apply any ICE candidates that arrived before we had a peer connection
+  // (or before its remote description was set) ready to accept them.
+  const flushPendingRemoteCandidates = useCallback(async (pc: RTCPeerConnection) => {
+    const queued = pendingRemoteCandidatesRef.current;
+    pendingRemoteCandidatesRef.current = [];
+    for (const candidate of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Stale/invalid by the time it's applied; safe to ignore.
+      }
+    }
+  }, []);
+
+  // Subscribed once per call id. Reads peerConnectionRef live (instead of
+  // closing over a `pc`) because for an incoming call this has to start
+  // listening the moment the phone starts ringing — well before the user
+  // taps Accept and a peer connection actually exists. That matters: the
+  // caller's ICE candidates start being broadcast immediately after the
+  // offer is sent, they don't wait for an answer, so if the callee only
+  // subscribed once answering (which can be several seconds into the ring,
+  // however long someone takes to notice and respond), every one of those
+  // early candidates would already be gone — leaving nothing for ICE to
+  // connect with, which is exactly why calls were stuck on "Connecting..."
+  // forever on both ends even after being picked up.
+  const subscribeToSignaling = useCallback((callId: string) => {
     eventSubRef.current?.unsubscribe();
     eventSubRef.current = callService.subscribeToCallEvents({
       onCallAnswered: async (id, answerSdp) => {
         if (id !== callId) return;
+        const pc = peerConnectionRef.current;
+        if (!pc) return;
         await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
+        remoteDescriptionSetRef.current = true;
+        await flushPendingRemoteCandidates(pc);
         setCallState('connecting');
       },
       onCallEnded: (id, status) => {
@@ -160,15 +192,23 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       },
       onIceCandidate: async (id, candidate) => {
         if (id !== callId) return;
+        const pc = peerConnectionRef.current;
+        if (!pc || !remoteDescriptionSetRef.current) {
+          // No peer connection yet (still ringing) or its remote
+          // description isn't set yet — hold onto it instead of dropping
+          // it; it gets applied as soon as both are ready.
+          pendingRemoteCandidatesRef.current.push(candidate);
+          return;
+        }
         try {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
         } catch {
-          // A candidate can legitimately arrive before setRemoteDescription
-          // has run (ICE and SDP exchange race); safe to ignore.
+          // A candidate can legitimately arrive right as the connection is
+          // closing; safe to ignore.
         }
       },
     });
-  }, [cleanupCall, onClose]);
+  }, [cleanupCall, flushPendingRemoteCandidates, onClose]);
 
   const initiateCall = useCallback(async () => {
     if (!calleeId) return;
@@ -209,7 +249,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       }
 
       setCallState('ringing');
-      subscribeToSignaling(pc, result.data.id);
+      subscribeToSignaling(result.data.id);
 
       // No call-waiting / voicemail — if nobody answers in time, give up
       // and record it as missed rather than ringing forever.
@@ -244,6 +284,12 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
 
       if (incomingCall.offer_sdp) {
         await pc.setRemoteDescription(new RTCSessionDescription(incomingCall.offer_sdp));
+        remoteDescriptionSetRef.current = true;
+        // We've been subscribed to signaling (and possibly collecting the
+        // caller's ICE candidates) since the phone started ringing, well
+        // before this peer connection existed — apply whatever came in
+        // during that wait now that there's somewhere to put it.
+        await flushPendingRemoteCandidates(pc);
       }
 
       const answer = await pc.createAnswer();
@@ -251,7 +297,8 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       await callService.answerCall(incomingCall.id, answer);
 
       setCallState('connecting');
-      subscribeToSignaling(pc, incomingCall.id);
+      // Already subscribed to signaling since the ringing screen appeared
+      // (see the mount effect below) — no need to subscribe again here.
     } catch (err: any) {
       console.error('Error answering call:', err);
       setError('Failed to answer call');
@@ -261,7 +308,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       cleanupCall();
       setTimeout(onClose, 2000);
     }
-  }, [cleanupCall, createPeerConnection, incomingCall, initializeMedia, onClose, remoteUser, subscribeToSignaling]);
+  }, [cleanupCall, createPeerConnection, flushPendingRemoteCandidates, incomingCall, initializeMedia, onClose, remoteUser]);
 
   const declineCall = useCallback(async () => {
     if (incomingCall) {
@@ -295,6 +342,11 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       } else {
         profileService.getProfile(incomingCall.caller_id).then(setRemoteUser);
       }
+      // Start listening for the caller's ICE candidates right away, not
+      // only once Accept is tapped — see subscribeToSignaling's comment
+      // for why that gap was silently breaking every call's connection.
+      callIdRef.current = incomingCall.id;
+      subscribeToSignaling(incomingCall.id);
     } else if (calleeId) {
       initiateCall();
     }
