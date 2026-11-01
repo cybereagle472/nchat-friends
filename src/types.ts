@@ -154,6 +154,7 @@ export interface GroupMember {
   group_id: string;
   user_id: string;
   role: 'admin' | 'member';
+  is_muted?: boolean;
   joined_at: string;
   profile?: UserProfile;
 }

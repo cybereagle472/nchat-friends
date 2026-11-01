@@ -685,9 +685,33 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
     const friendRemovedSub = realtimeClient.on('friend:removed', () => debouncedRefreshFriendsAndRequests());
     subscriptionsRef.current.push(friendRequestSub, friendAcceptedSub, friendDeclinedSub, friendRemovedSub);
 
-    // Groups / call history: poll periodically until they get dedicated
-    // realtime events of their own.
-    const groupsInterval = setInterval(() => debouncedRefreshGroups(), 20000);
+    // Groups: created/renamed/deleted, and any membership change (joined,
+    // left, promoted/demoted) all just trigger a full refetch rather than
+    // trying to hand-merge a partial payload — getUserGroups() is the one
+    // source of truth for the shape the Groups list and an open group
+    // chat's header both render from.
+    const groupCreatedOrUpdatedSub = realtimeClient.on('group:created', () => debouncedRefreshGroups());
+    const groupUpdatedSub = realtimeClient.on('group:updated', () => debouncedRefreshGroups());
+    const groupDeletedSub = realtimeClient.on('group:deleted', () => debouncedRefreshGroups());
+    const groupMemberJoinedSub = realtimeClient.on('group-member:joined', () => debouncedRefreshGroups());
+    const groupMemberLeftSub = realtimeClient.on('group-member:left', () => debouncedRefreshGroups());
+    const groupMemberUpdatedSub = realtimeClient.on('group-member:updated', () => debouncedRefreshGroups());
+    // A new group message changes the list's "last message" preview too.
+    const groupMessageSub = realtimeClient.on('group-message:new', () => debouncedRefreshGroups());
+    subscriptionsRef.current.push(
+      groupCreatedOrUpdatedSub,
+      groupUpdatedSub,
+      groupDeletedSub,
+      groupMemberJoinedSub,
+      groupMemberLeftSub,
+      groupMemberUpdatedSub,
+      groupMessageSub
+    );
+
+    // Call history: no realtime event of its own yet, still polled.
+    // Groups now update live above — this interval is just a safety net
+    // in case a realtime event is ever missed (e.g. a brief reconnect gap).
+    const groupsInterval = setInterval(() => debouncedRefreshGroups(), 45000);
     const callsInterval = setInterval(() => debouncedRefreshCallHistory(), 30000);
 
     // Online/offline status has no realtime push of its own (it's a simple

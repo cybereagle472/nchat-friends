@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Toaster } from 'sonner';
+import { Toaster, toast } from 'sonner';
 import { MessageCircle, Circle, UsersRound, Compass, Clock } from 'lucide-react';
 import { Auth } from './components/Auth';
 import { ProfileSetup } from './components/ProfileSetup';
@@ -8,6 +8,7 @@ import { ChatView } from './components/ChatView';
 import { Status } from './components/Status';
 import { Groups } from './components/Groups';
 import { GroupChatView } from './components/GroupChatView';
+import { GroupInfo } from './components/GroupInfo';
 import { CreateGroup } from './components/CreateGroup';
 import { Discover } from './components/Discover';
 import { History } from './components/History';
@@ -522,6 +523,61 @@ function MainApp({
     return selectedChat;
   }, [selectedChat, appData.chats, appData.friends]);
 
+  // Same idea as liveSelectedChat, but for the currently-open group: a
+  // rename, avatar change, member joining/leaving/being promoted, or the
+  // group being deleted out from under you should all show up immediately
+  // in the open chat's header/member list instead of only after reopening
+  // it, since appData.groups is already kept fresh by realtime events +
+  // refreshGroups() (see useAppData.ts).
+  const liveSelectedGroup = useMemo(() => {
+    if (!selectedGroup) return null;
+    return appData.groups.find(g => g.id === selectedGroup.id) || selectedGroup;
+  }, [selectedGroup, appData.groups]);
+
+  const [showGroupInfo, setShowGroupInfo] = useState(false);
+
+  // If someone else removes you from a group (or deletes it) while you
+  // still have it open, appData.groups (kept live by realtime events) will
+  // stop containing it. Rather than silently leaving you on a now-stale
+  // view where sending a message would fail with a confusing 403, back out
+  // of it automatically with a plain-language explanation — exactly the
+  // kind of "frustrating error" this should never surface as.
+  useEffect(() => {
+    if (!appData.isReady || !selectedGroup) return;
+    const stillIn = appData.groups.some(g => g.id === selectedGroup.id);
+    if (!stillIn) {
+      toast.info('You are no longer in this group');
+      setShowGroupInfo(false);
+      handleBackFromGroup();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appData.isReady, appData.groups, selectedGroup]);
+
+  const handleManageGroup = useCallback(() => {
+    setShowGroupInfo(true);
+  }, []);
+
+  const handleGroupInfoChanged = useCallback(() => {
+    // Optimistic refresh for the person who just made the change — the
+    // Worker also broadcasts the same event back to them over realtime
+    // (see useAppData.ts), so this just avoids waiting on that round trip.
+    appData.refreshGroups();
+  }, [appData]);
+
+  const handleGroupLeftOrDeleted = useCallback(() => {
+    setShowGroupInfo(false);
+    handleBackFromGroup();
+    appData.refreshGroups();
+  }, [appData, handleBackFromGroup]);
+
+  // Wrap the outer App's onGroupCreated so the brand-new group shows up in
+  // the Groups tab immediately instead of waiting for the next realtime
+  // event or the 45s safety-net poll.
+  const handleGroupCreatedWithRefresh = useCallback(async (groupId: string) => {
+    await appData.refreshGroups();
+    handleGroupCreated(groupId);
+  }, [appData, handleGroupCreated]);
+
   return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 relative overflow-hidden">
       {/* Animated Background Blobs */}
@@ -547,17 +603,27 @@ function MainApp({
             onBack={handleBackToChats}
             onCall={(type) => handleCall(liveSelectedChat.user_id, type)}
           />
-        ) : selectedGroup ? (
+        ) : liveSelectedGroup && showGroupInfo ? (
+          <GroupInfo
+            currentUser={currentUser}
+            group={liveSelectedGroup}
+            friends={appData.friends}
+            onBack={() => setShowGroupInfo(false)}
+            onChanged={handleGroupInfoChanged}
+            onLeftOrDeleted={handleGroupLeftOrDeleted}
+          />
+        ) : liveSelectedGroup ? (
           <GroupChatView
             currentUser={currentUser}
-            group={selectedGroup}
+            group={liveSelectedGroup}
             onBack={handleBackFromGroup}
+            onManageGroup={handleManageGroup}
           />
         ) : showCreateGroup ? (
           <CreateGroup
             currentUser={currentUser}
             onBack={handleBackFromGroup}
-            onGroupCreated={handleGroupCreated}
+            onGroupCreated={handleGroupCreatedWithRefresh}
           />
         ) : (
           <>

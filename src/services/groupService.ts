@@ -463,22 +463,6 @@ class GroupService {
 
     return { unsubscribe: () => subs.forEach((s) => s.unsubscribe()) };
   }
-
-  /**
-   * Subscribe to "a group you're in was created/renamed/deleted" events —
-   * used by the Groups list so it updates live instead of needing a
-   * manual refresh after being added to a new group, a rename, etc.
-   */
-  subscribeToGroupList(
-    onGroupCreatedOrUpdated: (group: GroupWithMembers) => void,
-    onGroupDeleted: (groupId: string) => void
-  ): GroupSubscription {
-    const subs: GroupSubscription[] = [];
-    subs.push(realtimeClient.on('group:created', (payload) => payload?.group && onGroupCreatedOrUpdated(payload.group)));
-    subs.push(realtimeClient.on('group:updated', (payload) => payload?.group && onGroupCreatedOrUpdated(payload.group)));
-    subs.push(realtimeClient.on('group:deleted', (payload) => payload?.group_id && onGroupDeleted(payload.group_id)));
-    return { unsubscribe: () => subs.forEach((s) => s.unsubscribe()) };
-  }
 }
 
 export const groupService = new GroupService();

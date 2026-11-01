@@ -15,7 +15,6 @@ import {
   CheckCheck,
   X,
   Settings,
-  LogOut,
   Trash2
 } from 'lucide-react';
 import { useGroupChat, GroupMessageWithStatus } from '../hooks/useGroupChat';
@@ -29,7 +28,7 @@ interface GroupChatViewProps {
   group: GroupWithMembers;
   onBack: () => void;
   onGroupCall?: (type: 'voice' | 'video') => void;
-  onManageGroup?: () => void;
+  onManageGroup: () => void;
 }
 
 export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManageGroup }: GroupChatViewProps) {
@@ -400,20 +399,12 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                     <Users className="w-4 h-4 text-violet-500" />
                     View Members
                   </button>
-                  {onManageGroup && (
-                    <button
-                      onClick={() => { onManageGroup(); setShowMenu(false); }}
-                      className="w-full px-4 py-3 text-left text-sm text-slate-700 hover:bg-violet-50 flex items-center gap-3"
-                    >
-                      <Settings className="w-4 h-4 text-violet-500" />
-                      Group Settings
-                    </button>
-                  )}
                   <button
-                    className="w-full px-4 py-3 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-3"
+                    onClick={() => { onManageGroup(); setShowMenu(false); }}
+                    className="w-full px-4 py-3 text-left text-sm text-slate-700 hover:bg-violet-50 flex items-center gap-3"
                   >
-                    <LogOut className="w-4 h-4" />
-                    Leave Group
+                    <Settings className="w-4 h-4 text-violet-500" />
+                    Group Settings
                   </button>
                 </div>
               )}
