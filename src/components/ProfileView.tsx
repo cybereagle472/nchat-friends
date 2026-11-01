@@ -216,10 +216,10 @@ export function ProfileView({ currentUser, userId, initialProfile, onClose, onMe
   const avatarUrl = profile?.avatar_url;
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-end sm:items-center justify-center animate-fade-in">
-      <div className="w-full sm:max-w-md sm:rounded-3xl rounded-t-3xl bg-white shadow-2xl overflow-hidden max-h-[92vh] flex flex-col animate-slide-up">
+    <div className="fixed inset-0 z-50 bg-white flex flex-col h-full animate-fade-in">
+      <div className="flex-1 flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="relative bg-gradient-to-r from-violet-500 via-purple-500 to-fuchsia-500 px-4 pt-4 pb-16 flex items-center justify-between flex-shrink-0">
+        <div className="relative bg-gradient-to-r from-violet-500 via-purple-500 to-fuchsia-500 px-4 pb-16 pt-[max(1rem,env(safe-area-inset-top))] flex items-center justify-between flex-shrink-0">
           <button
             onClick={onClose}
             className="p-2 -ml-1 rounded-full hover:bg-white/20 active:bg-white/30 transition-all text-white"
@@ -471,12 +471,7 @@ export function ProfileView({ currentUser, userId, initialProfile, onClose, onMe
           from { opacity: 0; }
           to { opacity: 1; }
         }
-        @keyframes slide-up {
-          from { opacity: 0; transform: translateY(24px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-        .animate-fade-in { animation: fade-in 0.2s ease-out; }
-        .animate-slide-up { animation: slide-up 0.25s ease-out; }
+        .animate-fade-in { animation: fade-in 0.15s ease-out; }
       `}</style>
     </div>
   );
