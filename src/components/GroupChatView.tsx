@@ -202,6 +202,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
 
   const renderMessage = (message: GroupMessageWithStatus, index: number) => {
     const isOwn = message.sender_id === currentUser.id;
+    const isImage = message.type === 'image' && !!message.content;
     const showDate = index === 0 ||
       formatDate(messages[index - 1].created_at) !== formatDate(message.created_at);
     const showSender = !isOwn && (index === 0 || messages[index - 1].sender_id !== message.sender_id);
@@ -273,52 +274,88 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
               </p>
             )}
 
-            <div
-              className={`rounded-2xl px-3.5 py-2 shadow-sm select-none ${
-                isOwn
-                  ? 'bg-gradient-to-r from-violet-500 to-purple-500 text-white rounded-tr-sm'
-                  : 'bg-white/90 text-slate-800 rounded-tl-sm border border-white/70'
-              }`}
-              onTouchStart={(e) => handleTouchStart(e, message)}
-              onTouchMove={handleTouchMove}
-              onTouchEnd={handleTouchEnd}
-              onContextMenu={(e) => handleContextMenu(e, message)}
-            >
-              {message.type === 'image' && message.content && (
-                <img
-                  src={message.content}
-                  alt="Shared image"
-                  className="rounded-lg max-w-full mb-1"
-                  loading="lazy"
-                />
-              )}
-
-              {(!message.type || message.type === 'text') && (
-                <p className="text-sm whitespace-pre-wrap break-words">{message.content}</p>
-              )}
-
-              <div className={`flex items-center justify-end gap-1 mt-0.5 ${isOwn ? 'text-white/70' : 'text-slate-400'}`}>
-                <span className="text-[10px]">{formatTime(message.created_at)}</span>
-                {message.is_edited && <span className="text-[10px] italic">edited</span>}
-                {isOwn && (
-                  <>
-                    {message.syncStatus === 'pending' && <Clock className="w-3 h-3 opacity-70" />}
-                    {message.syncStatus === 'sent' && <Check className="w-3 h-3" />}
-                    {(!message.syncStatus || message.syncStatus === 'sent') && message.is_read && (
-                      <CheckCheck className="w-3 h-3" />
+            {isImage ? (
+              <>
+                {/* Edge-to-edge media bubble (no px-3.5 py-2 text padding) —
+                    matches the 1:1 chat's photo bubbles: the image fills the
+                    whole rounded shape instead of sitting inside a visible
+                    margin of solid bubble color, with the timestamp overlaid
+                    directly on the image's own corner, WhatsApp-style. */}
+                <div
+                  className={`relative rounded-2xl overflow-hidden shadow-sm select-none ${
+                    isOwn ? 'rounded-tr-sm' : 'rounded-tl-sm'
+                  }`}
+                  onTouchStart={(e) => handleTouchStart(e, message)}
+                  onTouchMove={handleTouchMove}
+                  onTouchEnd={handleTouchEnd}
+                  onContextMenu={(e) => handleContextMenu(e, message)}
+                >
+                  <img
+                    src={message.content}
+                    alt="Shared image"
+                    className="block max-w-full max-h-[300px] object-cover"
+                    loading="lazy"
+                  />
+                  <div className="absolute bottom-1.5 right-1.5 flex items-center gap-1 pl-1.5 pr-1 py-0.5 rounded-full bg-black/45 text-[10px] text-white leading-none">
+                    <span>{formatTime(message.created_at)}</span>
+                    {message.is_edited && <span className="italic">edited</span>}
+                    {isOwn && (
+                      <>
+                        {message.syncStatus === 'pending' && <Clock className="w-3 h-3 opacity-70" />}
+                        {message.syncStatus === 'sent' && <Check className="w-3 h-3" />}
+                        {(!message.syncStatus || message.syncStatus === 'sent') && message.is_read && (
+                          <CheckCheck className="w-3 h-3" />
+                        )}
+                        {message.syncStatus === 'failed' && <X className="w-3 h-3 text-red-400" />}
+                      </>
                     )}
-                    {message.syncStatus === 'failed' && <X className="w-3 h-3 text-red-400" />}
-                  </>
-                )}
-              </div>
+                  </div>
+                </div>
+                {/* Kept outside the rounded/clipped image box above so the
+                    reaction pills never get clipped by its corner rounding. */}
+                <GroupReactionsDisplay
+                  reactions={message.reactions}
+                  currentUserId={currentUser.id}
+                  onReactionClick={(emoji) => handleReactionClick(message.id, emoji)}
+                />
+              </>
+            ) : (
+              <div
+                className={`rounded-2xl px-3.5 py-2 shadow-sm select-none ${
+                  isOwn
+                    ? 'bg-gradient-to-r from-violet-500 to-purple-500 text-white rounded-tr-sm'
+                    : 'bg-white/90 text-slate-800 rounded-tl-sm border border-white/70'
+                }`}
+                onTouchStart={(e) => handleTouchStart(e, message)}
+                onTouchMove={handleTouchMove}
+                onTouchEnd={handleTouchEnd}
+                onContextMenu={(e) => handleContextMenu(e, message)}
+              >
+                <p className="text-sm whitespace-pre-wrap break-words">{message.content}</p>
 
-              {/* Reactions Display */}
-              <GroupReactionsDisplay
-                reactions={message.reactions}
-                currentUserId={currentUser.id}
-                onReactionClick={(emoji) => handleReactionClick(message.id, emoji)}
-              />
-            </div>
+                <div className={`flex items-center justify-end gap-1 mt-0.5 ${isOwn ? 'text-white/70' : 'text-slate-400'}`}>
+                  <span className="text-[10px]">{formatTime(message.created_at)}</span>
+                  {message.is_edited && <span className="text-[10px] italic">edited</span>}
+                  {isOwn && (
+                    <>
+                      {message.syncStatus === 'pending' && <Clock className="w-3 h-3 opacity-70" />}
+                      {message.syncStatus === 'sent' && <Check className="w-3 h-3" />}
+                      {(!message.syncStatus || message.syncStatus === 'sent') && message.is_read && (
+                        <CheckCheck className="w-3 h-3" />
+                      )}
+                      {message.syncStatus === 'failed' && <X className="w-3 h-3 text-red-400" />}
+                    </>
+                  )}
+                </div>
+
+                {/* Reactions Display */}
+                <GroupReactionsDisplay
+                  reactions={message.reactions}
+                  currentUserId={currentUser.id}
+                  onReactionClick={(emoji) => handleReactionClick(message.id, emoji)}
+                />
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -466,6 +503,14 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
               value={messageText}
               onChange={(e) => setMessageText(e.target.value)}
               onKeyPress={handleKeyPress}
+              onFocus={() => {
+                // Same keyboard-covers-the-input fallback as the 1:1 chat
+                // input — see ChatView's handleInputFocus for why this is
+                // needed even with the app shell's own viewport resize fix.
+                setTimeout(() => {
+                  inputRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+                }, 300);
+              }}
               placeholder="Type a message..."
               rows={1}
               className="w-full px-4 py-2.5 rounded-2xl bg-white border border-slate-200 text-sm text-slate-800 placeholder-slate-400 resize-none focus:outline-none focus:ring-2 focus:ring-violet-500/30 focus:border-violet-300 transition-all"

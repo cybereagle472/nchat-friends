@@ -59,6 +59,46 @@ function downsampleWaveform(samples: number[], targetBars: number = VOICE_WAVEFO
   return normalized.map((v) => Math.round(v * 100) / 100).join(',');
 }
 
+// Header subtitle text (the "last seen …" / presence line under the
+// contact's name) that slides left-and-back to reveal its full content
+// when it's too long to fit, instead of either wrapping onto extra lines
+// (which used to make the header taller than intended) or just getting
+// cut off with "…" and never showing the rest — this is the same sliding
+// "marquee" behavior WhatsApp uses for the same spot.
+function MarqueeText({ text, className }: { text: string; className?: string }) {
+  const containerRef = useRef<HTMLSpanElement>(null);
+  const textRef = useRef<HTMLSpanElement>(null);
+  const [shift, setShift] = useState(0);
+
+  useEffect(() => {
+    const measure = () => {
+      const container = containerRef.current;
+      const textEl = textRef.current;
+      if (!container || !textEl) return;
+      const overflow = textEl.scrollWidth - container.clientWidth;
+      // A few px of slack so the very last character actually clears the
+      // edge instead of the animation stopping just short of it.
+      setShift(overflow > 4 ? overflow + 6 : 0);
+    };
+
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [text]);
+
+  return (
+    <span ref={containerRef} className="block overflow-hidden whitespace-nowrap">
+      <span
+        ref={textRef}
+        className={`inline-block whitespace-nowrap ${shift > 0 ? 'header-marquee-text' : ''} ${className || ''}`}
+        style={shift > 0 ? ({ '--marquee-shift': `-${shift}px` } as React.CSSProperties) : undefined}
+      >
+        {text}
+      </span>
+    </span>
+  );
+}
+
 // Memoized Message Bubble - prevents re-render of all messages when one changes
 interface MessageBubbleProps {
   message: Message;
@@ -80,6 +120,13 @@ const MessageBubble = memo(function MessageBubble({
   onReactionClick
 }: MessageBubbleProps) {
   const isVoice = message.type === 'voice';
+  // Photos/videos/GIFs get their own bubble treatment below: unlike text
+  // (which needs padding to breathe) a media bubble should be filled
+  // edge-to-edge by the image/video itself, exactly like WhatsApp — the
+  // standard px-3 py-2 bubble padding used to wrap a visible margin of
+  // solid color around every photo's rounded corners, which looked like
+  // wasted/broken space rather than a deliberate border.
+  const isMedia = message.type === 'image' || message.type === 'video' || message.type === 'gif';
   const longPressTimer = useRef<NodeJS.Timeout | null>(null);
   const touchStartPos = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
@@ -163,6 +210,38 @@ const MessageBubble = memo(function MessageBubble({
             <span>{formatTime(message.created_at)}</span>
             {message.is_edited && <span className="italic">edited</span>}
             {renderStatus()}
+          </div>
+          <ReactionsDisplay
+            reactions={message.reactions}
+            currentUserId={currentUserId}
+            onReactionClick={(emoji) => onReactionClick(message.id, emoji)}
+            isOwn={isOwn}
+          />
+        </div>
+      ) : isMedia ? (
+        <div
+          className={`message-bubble-wrapper ${isOwn ? 'own' : 'received'}`}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+          onContextMenu={handleContextMenu}
+        >
+          <div
+            className={`relative max-w-full rounded-2xl overflow-hidden select-none ${
+              isOwn ? 'rounded-br-md' : 'rounded-bl-md'
+            }`}
+          >
+            {renderMessageContent(message, isOwn)}
+            {/* Timestamp + ticks overlaid directly on the media's own
+                bottom-right corner (a small translucent pill, same as
+                WhatsApp) instead of being pushed into a separate padded
+                row below the image — that row was the other half of why
+                these bubbles looked oversized relative to their content. */}
+            <div className="absolute bottom-1.5 right-1.5 flex items-center gap-1 pl-1.5 pr-1 py-0.5 rounded-full bg-black/45 text-[10px] text-white leading-none">
+              <span>{formatTime(message.created_at)}</span>
+              {message.is_edited && <span className="italic">edited</span>}
+              {renderStatus()}
+            </div>
           </div>
           <ReactionsDisplay
             reactions={message.reactions}
@@ -949,6 +1028,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
   const audioRefs = useRef<{ [key: string]: HTMLAudioElement }>({});
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messageInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
@@ -1169,6 +1249,24 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
     typingService.sendTyping(currentUser.id, contact.user_id);
     debouncedStopTyping();
   }, [currentUser.id, contact.user_id, debouncedStopTyping]);
+
+  // Belt-and-suspenders for the on-screen keyboard covering the input:
+  // the app shell already resizes itself to the real visible viewport
+  // (see useVisualViewportHeight in App.tsx) so this normally isn't even
+  // needed, but that relies on the browser/WebView actually reporting
+  // visualViewport resizes promptly and on nothing else on the page
+  // overriding that height. Explicitly scrolling the focused input into
+  // view is the same trick every mobile web app with a bottom-pinned
+  // input bar ends up needing as a fallback, and costs nothing when the
+  // shell resize already did its job (scrolling an element that's already
+  // fully in view is a no-op). The delay gives the keyboard's own open
+  // animation time to finish — scrolling immediately on focus races it
+  // and commonly undershoots on Android.
+  const handleInputFocus = useCallback(() => {
+    setTimeout(() => {
+      messageInputRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+    }, 300);
+  }, []);
 
   const handleSendMessage = async () => {
     if (!inputMessage.trim() || sending) return;
@@ -1936,27 +2034,28 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
   const renderMessageContent = (message: Message, isOwn: boolean) => {
     switch (message.type) {
       case 'image':
+        // No wrapping/rounding/overflow-hidden here — the parent media
+        // bubble (see isMedia branch in MessageBubble) already clips and
+        // rounds this to the bubble's own shape. Adding another rounded,
+        // clipped container around it here used to nest two different
+        // corner radii on the exact same box for no visual benefit.
         return (
-          <div
-            className="cursor-pointer overflow-hidden rounded-xl"
+          <img
+            src={message.media_url || message.content}
+            alt="Shared image"
+            className="block cursor-pointer max-w-[250px] max-h-[300px] object-cover hover:opacity-90 transition-opacity"
             onClick={() => openMediaViewer('image', message.media_url || message.content)}
-          >
-            <img
-              src={message.media_url || message.content}
-              alt="Shared image"
-              className="max-w-[250px] max-h-[300px] object-cover hover:opacity-90 transition-opacity"
-            />
-          </div>
+          />
         );
       case 'video':
         return (
           <div
-            className="relative cursor-pointer overflow-hidden rounded-xl group"
+            className="relative cursor-pointer group"
             onClick={() => openMediaViewer('video', message.media_url || message.content)}
           >
             <video
               src={message.media_url || message.content}
-              className="max-w-[250px] max-h-[300px] object-cover"
+              className="block max-w-[250px] max-h-[300px] object-cover"
             />
             <div className="absolute inset-0 bg-black/30 flex items-center justify-center group-hover:bg-black/40 transition-colors">
               <div className="w-14 h-14 rounded-full bg-white/90 flex items-center justify-center">
@@ -1982,7 +2081,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           <img
             src={message.gif_url || message.content}
             alt="GIF"
-            className="max-w-[250px] rounded-xl"
+            className="block max-w-[250px] object-cover"
           />
         );
       case 'file':
@@ -2069,10 +2168,10 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                 line. */}
             <p
               key={isContactRecording ? 'recording' : isTyping ? 'typing' : 'status'}
-              className="text-xs text-white/80 h-4 truncate animate-fade-in"
+              className="text-xs text-white/80 h-4 overflow-hidden animate-fade-in"
             >
               {isContactRecording ? (
-                <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle">
+                <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle max-w-full truncate">
                   <Mic className="w-3 h-3 recording-indicator-mic shrink-0" strokeWidth={2.5} />
                   recording audio
                   <span className="flex items-end gap-0.5 h-2 shrink-0">
@@ -2082,7 +2181,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                   </span>
                 </span>
               ) : isTyping ? (
-                <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle">
+                <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle max-w-full truncate">
                   typing
                   <span className="flex items-end gap-0.5 h-2 shrink-0">
                     <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '0ms' }} />
@@ -2091,9 +2190,10 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                   </span>
                 </span>
               ) : (
-                <span className={contact.profile.is_online ? 'text-green-300 font-medium' : ''}>
-                  {presenceStatusText(contact.profile.is_online, contact.profile.last_seen)}
-                </span>
+                <MarqueeText
+                  text={presenceStatusText(contact.profile.is_online, contact.profile.last_seen)}
+                  className={contact.profile.is_online ? 'text-green-300 font-medium' : ''}
+                />
               )}
             </p>
           </button>
@@ -2531,11 +2631,13 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
               {/* Text Input Field */}
               <div className="chat-input-field">
                 <input
+                  ref={messageInputRef}
                   type="text"
                   placeholder="Type a message..."
                   value={inputMessage}
                   onChange={(e) => handleInputChange(e.target.value)}
                   onKeyPress={handleKeyPress}
+                  onFocus={handleInputFocus}
                 />
               </div>
 
@@ -2963,7 +3065,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           display: flex;
           align-items: center;
           gap: 8px;
-          padding: 6px 10px 6px 6px;
+          padding: 5px 10px 5px 5px;
           /* Match the corner treatment of every other bubble type
              (rounded-2xl = 16px with a 6px "tail" corner) instead of the
              bespoke 20px radius this used to have — voice bubbles used to
@@ -3036,7 +3138,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           min-width: 0;
           display: flex;
           flex-direction: column;
-          gap: 5px;
+          gap: 2px;
           padding-right: 2px;
         }
 
@@ -3050,11 +3152,15 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           touch-action: none;
           -webkit-tap-highlight-color: transparent;
           user-select: none;
-          /* Extra vertical hit area so dragging with a finger (much less
-             precise than a mouse) is easy to grab. box-sizing: content-box
-             means this padding sits outside the 30px content height the
-             bars size themselves against, so it doesn't squash them. */
-          padding: 8px 0;
+          /* A little vertical hit-area padding still helps dragging with a
+             finger (much less precise than a mouse), but this used to add
+             a full 16px (8px top+bottom) on top of the already-30px bar
+             track — nearly 50px just for the waveform row — which was the
+             single biggest reason these bubbles were so much taller than
+             a WhatsApp voice bubble. box-sizing: content-box means this
+             sits outside the bar track's own height, so it doesn't squash
+             the bars. */
+          padding: 3px 0;
           box-sizing: content-box;
         }
 
@@ -3065,7 +3171,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
         .voice-waveform-track {
           position: relative;
           width: 100%;
-          height: 30px;
+          height: 22px;
         }
 
         .voice-waveform-bars-layer {
@@ -3074,7 +3180,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           justify-content: space-between;
           gap: 2.5px;
           width: 100%;
-          height: 30px;
+          height: 22px;
         }
 
         /* The "played" copy of the bars, drawn directly on top of the base
@@ -3114,10 +3220,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
         }
 
         .voice-message-duration {
-          font-size: 11.5px;
+          font-size: 11px;
           font-weight: 500;
           font-variant-numeric: tabular-nums;
           letter-spacing: 0.01em;
+          line-height: 1.1;
         }
 
         .voice-message-duration.own {
@@ -3359,6 +3466,20 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
             font-size: 14px;
             padding: 8px 2px;
           }
+        }
+
+        /* Header subtitle sliding marquee — see MarqueeText above. Slides
+           left to reveal the clipped end, pauses, slides back, pauses,
+           repeats — same back-and-forth WhatsApp uses instead of a
+           continuous one-direction loop. */
+        .header-marquee-text {
+          animation: header-marquee-slide 8s ease-in-out infinite;
+        }
+
+        @keyframes header-marquee-slide {
+          0%, 15% { transform: translateX(0); }
+          45%, 60% { transform: translateX(var(--marquee-shift)); }
+          92%, 100% { transform: translateX(0); }
         }
 
         /* Date Separator Pill - shown between messages sent on different
