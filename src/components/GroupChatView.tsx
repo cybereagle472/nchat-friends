@@ -3,7 +3,6 @@ import {
   ArrowLeft,
   Phone,
   Video,
-  MoreVertical,
   Send,
   Image,
   Paperclip,
@@ -14,7 +13,6 @@ import {
   Check,
   CheckCheck,
   X,
-  Settings,
   Trash2
 } from 'lucide-react';
 import { useGroupChat, GroupMessageWithStatus } from '../hooks/useGroupChat';
@@ -29,13 +27,10 @@ interface GroupChatViewProps {
   onBack: () => void;
   onGroupCall?: (type: 'voice' | 'video') => void;
   onManageGroup: () => void;
-  onViewProfile?: (userId: string, initialProfile?: UserProfile) => void;
 }
 
-export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManageGroup, onViewProfile }: GroupChatViewProps) {
+export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManageGroup }: GroupChatViewProps) {
   const [messageText, setMessageText] = useState('');
-  const [showMenu, setShowMenu] = useState(false);
-  const [showMembers, setShowMembers] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -333,7 +328,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
   return (
     <div className="h-full flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50">
       {/* Header */}
-      <div className="backdrop-blur-2xl bg-gradient-to-r from-violet-500/95 via-purple-500/95 to-fuchsia-500/95 text-white px-3 py-3 shadow-xl shadow-purple-500/20">
+      <div className="relative z-20 backdrop-blur-2xl bg-gradient-to-r from-violet-500/95 via-purple-500/95 to-fuchsia-500/95 text-white px-3 py-3 shadow-xl shadow-purple-500/20">
         <div className="flex items-center gap-3">
           <button
             onClick={onBack}
@@ -343,9 +338,11 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
             <ArrowLeft className="w-5 h-5" strokeWidth={2.5} />
           </button>
 
-          <div
-            className="flex-1 flex items-center gap-3 cursor-pointer"
-            onClick={() => setShowMembers(!showMembers)}
+          <button
+            type="button"
+            className="flex-1 flex items-center gap-3 text-left min-w-0"
+            onClick={onManageGroup}
+            aria-label="Open group info"
           >
             <div className="w-10 h-10 rounded-xl overflow-hidden flex-shrink-0 bg-white/20 flex items-center justify-center">
               {group.avatar_url ? (
@@ -361,7 +358,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                 {!isOnline && ' • Offline'}
               </p>
             </div>
-          </div>
+          </button>
 
           <div className="flex items-center gap-1">
             {onGroupCall && (
@@ -382,82 +379,9 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                 </button>
               </>
             )}
-            <div className="relative">
-              <button
-                onClick={() => setShowMenu(!showMenu)}
-                className="p-2 rounded-xl hover:bg-white/20 transition-all duration-300 active:scale-95"
-                aria-label="More options"
-              >
-                <MoreVertical className="w-5 h-5" strokeWidth={2.5} />
-              </button>
-
-              {showMenu && (
-                <div className="absolute right-0 top-full mt-2 w-48 rounded-xl bg-white shadow-xl shadow-purple-500/20 border border-white/70 overflow-hidden z-50">
-                  <button
-                    onClick={() => { setShowMembers(true); setShowMenu(false); }}
-                    className="w-full px-4 py-3 text-left text-sm text-slate-700 hover:bg-violet-50 flex items-center gap-3"
-                  >
-                    <Users className="w-4 h-4 text-violet-500" />
-                    View Members
-                  </button>
-                  <button
-                    onClick={() => { onManageGroup(); setShowMenu(false); }}
-                    className="w-full px-4 py-3 text-left text-sm text-slate-700 hover:bg-violet-50 flex items-center gap-3"
-                  >
-                    <Settings className="w-4 h-4 text-violet-500" />
-                    Group Settings
-                  </button>
-                </div>
-              )}
-            </div>
           </div>
         </div>
       </div>
-
-      {/* Members Panel (Slide Down) */}
-      {showMembers && (
-        <div className="bg-white/90 backdrop-blur-xl border-b border-white/70 px-4 py-3 animate-slide-down">
-          <div className="flex items-center justify-between mb-2">
-            <h3 className="text-sm font-semibold text-slate-700">Members ({members.length})</h3>
-            <button
-              onClick={() => setShowMembers(false)}
-              className="p-1 rounded-lg hover:bg-slate-100"
-            >
-              <X className="w-4 h-4 text-slate-500" />
-            </button>
-          </div>
-          <div className="flex gap-3 overflow-x-auto pb-2">
-            {members.map((member) => {
-              const profile = memberProfiles[member.user_id];
-              const isSelf = member.user_id === currentUser.id;
-              return (
-                <button
-                  key={member.user_id}
-                  onClick={() => !isSelf && onViewProfile?.(member.user_id, profile)}
-                  disabled={isSelf || !onViewProfile}
-                  className="flex flex-col items-center flex-shrink-0 disabled:cursor-default"
-                >
-                  <div className="w-12 h-12 rounded-full overflow-hidden bg-gradient-to-br from-violet-400 to-purple-400 flex items-center justify-center">
-                    {profile?.avatar_url ? (
-                      <img src={profile.avatar_url} alt="" className="w-full h-full object-cover" />
-                    ) : (
-                      <span className="text-white font-bold">
-                        {profile?.full_name?.charAt(0) || '?'}
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-[10px] text-slate-600 mt-1 text-center max-w-[60px] truncate">
-                    {isSelf ? 'You' : profile?.full_name?.split(' ')[0] || 'Unknown'}
-                  </p>
-                  {member.role === 'admin' && (
-                    <span className="text-[8px] text-violet-600 font-bold">Admin</span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-3 py-4">
@@ -570,14 +494,6 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
           </div>
         </div>
       </div>
-
-      {/* Click outside to close menu */}
-      {showMenu && (
-        <div
-          className="fixed inset-0 z-40"
-          onClick={() => setShowMenu(false)}
-        />
-      )}
 
       {/* Message Actions Menu */}
       {selectedMessage && (

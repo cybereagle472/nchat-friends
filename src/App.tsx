@@ -657,7 +657,6 @@ function MainApp({
             group={liveSelectedGroup}
             onBack={handleBackFromGroup}
             onManageGroup={handleManageGroup}
-            onViewProfile={handleViewProfile}
           />
         ) : showCreateGroup ? (
           <CreateGroup
