@@ -3,7 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <!-- interactive-widget=resizes-content: makes the browser actually
+         shrink the layout viewport (so 100vh/flex layouts, and the chat
+         input pinned at the bottom of one, resize) when the on-screen
+         keyboard opens, instead of the keyboard just overlaying on top of
+         an unchanged layout and covering whatever was at the bottom. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#8b5cf6" />
     <meta name="description" content="NChat - Modern messaging app with voice & video calls" />
     <meta name="apple-mobile-web-app-capable" content="yes" />

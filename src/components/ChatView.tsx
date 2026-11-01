@@ -516,8 +516,22 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     const clampedRatio = Math.max(0, Math.min(1, ratio));
 
     const applySeek = () => {
-      if (audio.duration && isFinite(audio.duration)) {
-        audio.currentTime = clampedRatio * audio.duration;
+      // audio.duration can still be Infinity here even once metadata is
+      // "loaded" — MediaRecorder-produced webm/opus blobs don't carry a
+      // real duration in their container until the forced huge-seek
+      // workaround above (fixInfiniteDuration) has actually resolved it,
+      // which can easily still be in flight the first time someone
+      // touches a just-opened bubble. The old code only ever trusted
+      // audio.duration and silently did nothing when it wasn't finite yet
+      // — currentTime stayed at 0, so tapping Play right after looked
+      // exactly like the seek had been ignored and playback had jumped
+      // back to the very start. knownDuration (the server-reported
+      // duration for this clip) is already available independently of
+      // whatever the <audio> element itself currently believes, so fall
+      // back to it instead of giving up.
+      const effectiveDuration = audio.duration && isFinite(audio.duration) ? audio.duration : knownDuration;
+      if (effectiveDuration && isFinite(effectiveDuration) && effectiveDuration > 0) {
+        audio.currentTime = clampedRatio * effectiveDuration;
       }
     };
 
@@ -527,14 +541,14 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
       audio.addEventListener('loadedmetadata', applySeek, { once: true });
     }
 
-    // Repositioning (above) is silent and fine to allow even mid-recording,
-    // but never start audibly playing while the mic is live — see
-    // isRecordingActiveRef's doc comment for why pausing once at record-
-    // start isn't enough on its own.
-    if (audio.paused && !isRecordingActiveRef.current) {
-      onRequestExclusivePlayback(message.id);
-      audio.play().catch(() => {});
-    }
+    // Seeking only repositions — it no longer starts playback on its own.
+    // It used to call audio.play() here unconditionally, so tapping/
+    // dragging anywhere on the waveform while paused would immediately
+    // start playing, and combined with the stale-duration bug above often
+    // audibly restarted from 0 right as you were trying to jump somewhere
+    // specific. Now: drag/tap to land on a position, then press Play to
+    // actually start listening from there — same two-step gesture as the
+    // dedicated play button everywhere else in the UI.
   };
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -579,7 +593,35 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     }
   };
 
-  const renderBars = (variant: 'base' | 'overlay') => waveformData.map((value, i) => {
+  // Sized roughly in proportion to the clip's own length (clamped to a
+  // sane range), instead of every voice note — a 2-second "ok" or a
+  // minute-long ramble alike — always stretching out to the same near-
+  // maximum width. `knownDuration` is 0 until it's actually known (either
+  // from the server-sent message.duration or the <audio> element's own
+  // metadata), so brand-new/unloaded bubbles still get a small, sane
+  // default rather than momentarily rendering at 0 width.
+  const bubbleWidth = Math.round(Math.min(284, Math.max(176, 176 + knownDuration * 2.6)));
+
+  // The stored waveform is always a fixed 27 samples (see
+  // VOICE_WAVEFORM_BARS/downsampleWaveform), regardless of the bubble's
+  // own width — rendering all 27 as fixed-width, non-shrinking bars inside
+  // a narrow bubble would force them to overflow or touch edge-to-edge
+  // instead of actually looking narrower. Resample down to however many
+  // bars comfortably fit the *actual* waveform area this bubble has (play
+  // button + avatar + padding subtracted out) so short clips genuinely
+  // read as short, compact waveforms instead of a squeezed full-size one.
+  const waveformAreaWidth = Math.max(32, bubbleWidth - 92);
+  const displayBarCount = Math.max(8, Math.min(waveformData.length || VOICE_WAVEFORM_BARS, Math.round(waveformAreaWidth / 5.5)));
+  const displayWaveform = useMemo(() => {
+    if (waveformData.length <= displayBarCount) return waveformData;
+    const resampled: number[] = [];
+    for (let i = 0; i < displayBarCount; i++) {
+      resampled.push(waveformData[Math.floor((i / displayBarCount) * waveformData.length)]);
+    }
+    return resampled;
+  }, [waveformData, displayBarCount]);
+
+  const renderBars = (variant: 'base' | 'overlay') => displayWaveform.map((value, i) => {
     // `value` is already normalized per-clip at record time (see
     // downsampleWaveform) so it genuinely spans ~0–1 with real contrast
     // between quiet and loud moments. A light gamma lift still helps
@@ -597,7 +639,7 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
   });
 
   return (
-    <div className={`voice-message-bubble ${isOwn ? 'own' : 'received'}`}>
+    <div className={`voice-message-bubble ${isOwn ? 'own' : 'received'}`} style={{ width: `${bubbleWidth}px` }}>
       {/* Play/Pause Button */}
       <button
         onClick={handleTogglePlayback}
@@ -605,9 +647,9 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
         aria-label={isPlaying ? 'Pause voice message' : 'Play voice message'}
       >
         {isPlaying ? (
-          <Pause className="w-[18px] h-[18px]" fill="currentColor" />
+          <Pause className="w-4 h-4" fill="currentColor" />
         ) : (
-          <Play className="w-[18px] h-[18px] ml-0.5" fill="currentColor" />
+          <Play className="w-4 h-4 ml-0.5" fill="currentColor" />
         )}
       </button>
 
@@ -2015,24 +2057,34 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
 
           <button onClick={onViewProfile} disabled={!onViewProfile} className="flex-1 min-w-0 text-left disabled:cursor-default">
             <h2 className="text-base font-semibold truncate">{contact.profile.full_name}</h2>
+            {/* `truncate` (not `flex`) on the <p> itself — this used to be
+                a flex row, which has no text-overflow/ellipsis behavior of
+                its own, so a longer presence string (e.g. "last seen today
+                at 6:09 PM") just wrapped onto a second and third line
+                instead of being clipped, stretching the header taller than
+                intended. A single-line, ellipsis-truncated status is what
+                every other chat app does here — the inner spans switch to
+                `inline-flex` so they still lay out their icon/dots
+                correctly while remaining part of that one truncatable
+                line. */}
             <p
               key={isContactRecording ? 'recording' : isTyping ? 'typing' : 'status'}
-              className="text-xs text-white/80 h-4 flex items-center animate-fade-in"
+              className="text-xs text-white/80 h-4 truncate animate-fade-in"
             >
               {isContactRecording ? (
-                <span className="flex items-center gap-1.5 text-green-300 font-medium">
-                  <Mic className="w-3 h-3 recording-indicator-mic" strokeWidth={2.5} />
+                <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle">
+                  <Mic className="w-3 h-3 recording-indicator-mic shrink-0" strokeWidth={2.5} />
                   recording audio
-                  <span className="flex items-end gap-0.5 h-2">
+                  <span className="flex items-end gap-0.5 h-2 shrink-0">
                     <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '0ms' }} />
                     <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '150ms' }} />
                     <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '300ms' }} />
                   </span>
                 </span>
               ) : isTyping ? (
-                <span className="flex items-center gap-1.5 text-green-300 font-medium">
+                <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle">
                   typing
-                  <span className="flex items-end gap-0.5 h-2">
+                  <span className="flex items-end gap-0.5 h-2 shrink-0">
                     <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '0ms' }} />
                     <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '150ms' }} />
                     <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '300ms' }} />
@@ -2910,17 +2962,17 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
         .voice-message-bubble {
           display: flex;
           align-items: center;
-          gap: 10px;
-          padding: 8px 12px 8px 8px;
+          gap: 8px;
+          padding: 6px 10px 6px 6px;
           /* Match the corner treatment of every other bubble type
              (rounded-2xl = 16px with a 6px "tail" corner) instead of the
              bespoke 20px radius this used to have — voice bubbles used to
              be the only message type with its own unique shape *and* a
              per-message avatar, which made them look out of place next to
-             text/image bubbles in a 1:1 chat. */
+             text/image bubbles in a 1:1 chat. Width itself is set inline
+             per-bubble (see bubbleWidth above), scaled to the clip's own
+             length instead of a single fixed size for every recording. */
           border-radius: 16px;
-          min-width: 224px;
-          max-width: 320px;
         }
 
         .voice-message-bubble.own {
@@ -2935,9 +2987,9 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
         }
 
         .voice-message-play-btn {
-          width: 40px;
-          height: 40px;
-          min-width: 40px;
+          width: 34px;
+          height: 34px;
+          min-width: 34px;
           border-radius: 50%;
           display: flex;
           align-items: center;
@@ -3078,9 +3130,9 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
 
         .voice-message-avatar {
           position: relative;
-          width: 34px;
-          height: 34px;
-          min-width: 34px;
+          width: 28px;
+          height: 28px;
+          min-width: 28px;
           border-radius: 50%;
           overflow: visible;
           display: flex;
@@ -3121,8 +3173,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           position: absolute;
           bottom: -2px;
           right: -2px;
-          width: 16px;
-          height: 16px;
+          width: 14px;
+          height: 14px;
           border-radius: 50%;
           display: flex;
           align-items: center;

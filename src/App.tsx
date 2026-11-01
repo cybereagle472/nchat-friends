@@ -38,6 +38,7 @@ import { GroupWithMembers } from './services/groupService';
 import { UserProfile, Contact, Call } from './types';
 import { realtimeClient } from './lib/realtimeClient';
 import { useAppData } from './hooks/useAppData';
+import { useVisualViewportHeight } from './hooks/useVisualViewportHeight';
 
 type AppView = 'chats' | 'status' | 'groups' | 'discover' | 'history';
 
@@ -546,6 +547,13 @@ function MainApp({
   handleProfileUpdate: (profile: UserProfile) => void;
   handleMessageFromHistory: (userId: string) => void;
 }) {
+  // Real visible height (keyboard-aware) — see the hook's doc comment for
+  // why `h-screen`/100vh alone can't be trusted to keep the chat input
+  // visible above the on-screen keyboard on every Android browser/WebView
+  // this runs in. Falls back to plain `h-screen` CSS (null) wherever
+  // visualViewport isn't available at all.
+  const visibleHeight = useVisualViewportHeight();
+
   // Preload ALL data on mount - this is the key to instant tabs. Passing the
   // currently-open chat's id lets the hook avoid bumping that chat's unread
   // badge for messages the user is already looking at live.
@@ -661,7 +669,10 @@ function MainApp({
   }, [appData, handleGroupCreated]);
 
   return (
-    <div className="h-screen flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 relative overflow-hidden">
+    <div
+      className="h-screen flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 relative overflow-hidden"
+      style={visibleHeight ? { height: `${visibleHeight}px` } : undefined}
+    >
       {/* Animated Background Blobs */}
       <div className="absolute inset-0 overflow-hidden pointer-events-none">
         <div className="absolute top-0 -left-4 w-64 h-64 bg-purple-300 rounded-full mix-blend-multiply filter blur-xl opacity-60 animate-blob"></div>
