@@ -224,6 +224,328 @@ const MessageBubble = memo(function MessageBubble({
   );
 });
 
+// Voice Message Bubble — Modern design with waveform + drag-to-seek.
+//
+// IMPORTANT: this must stay a module-level (stable) component type, not be
+// defined inline inside ChatView's render. It used to be defined inside
+// ChatView, which meant every single re-render of ChatView created a brand
+// new VoiceMessageBubble *function* (a new component type), and whenever
+// the message bubble that rendered it re-rendered for any reason (e.g. a
+// read-receipt flipping is_read on that very message, which happens almost
+// immediately after it's opened), React fully unmounted and remounted it —
+// wiping its local playbackProgress/currentTime/duration state back to 0
+// mid-playback and making the play/pause button's visual state look stuck
+// or inconsistent. Keeping it here, with everything it needs passed in as
+// props instead of closed over, means re-renders just update it in place.
+interface VoiceMessageBubbleProps {
+  message: Message;
+  isOwn: boolean;
+  isPlaying: boolean;
+  audioRefs: { current: Record<string, HTMLAudioElement> };
+  onTogglePlayback: (messageId: string, audioUrl: string) => void;
+  onSeek: (messageId: string, audioUrl: string, ratio: number) => void;
+}
+
+const VoiceMessageBubble = memo(function VoiceMessageBubble({
+  message,
+  isOwn,
+  isPlaying,
+  audioRefs,
+  onTogglePlayback,
+  onSeek
+}: VoiceMessageBubbleProps) {
+  const [waveformData, setWaveformData] = useState<number[]>([]);
+  const [playbackProgress, setPlaybackProgress] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [dragRatio, setDragRatio] = useState<number | null>(null);
+  const waveformRef = useRef<HTMLDivElement>(null);
+  const bars = VOICE_WAVEFORM_BARS;
+  const audioUrl = message.media_url || message.content;
+
+  // Voice messages sent after this fix carry their *real* recorded
+  // amplitude in thumbnail_url (reusing that otherwise-unused column, see
+  // chatService's `waveform` param). Older messages sent before the fix
+  // don't have it, so fall back to a deterministic placeholder pattern
+  // based on the message id, rather than showing nothing.
+  useEffect(() => {
+    const real = (message.thumbnail_url ?? '')
+      .split(',')
+      .map((n) => parseFloat(n))
+      .filter((n) => !isNaN(n) && isFinite(n));
+
+    if (real.length > 0) {
+      setWaveformData(real);
+      return;
+    }
+
+    const data: number[] = [];
+    let hash = 0;
+    for (let i = 0; i < message.id.length; i++) {
+      hash = ((hash << 5) - hash) + message.id.charCodeAt(i);
+      hash |= 0;
+    }
+
+    for (let i = 0; i < bars; i++) {
+      const seed = Math.abs(Math.sin(hash * (i + 1) * 0.1)) * 0.6;
+      const variation = Math.abs(Math.sin(i * 0.4)) * 0.3;
+      const noise = Math.abs(Math.cos(hash * i * 0.05)) * 0.1;
+      data.push(0.2 + seed + variation + noise);
+    }
+    setWaveformData(data);
+  }, [message.id, message.thumbnail_url, bars]);
+
+  // Track playback progress and duration
+  useEffect(() => {
+    const audio = audioRefs.current[message.id];
+    if (!audio) return;
+
+    const updateProgress = () => {
+      if (audio.duration) {
+        setPlaybackProgress(audio.currentTime / audio.duration);
+        setCurrentTime(audio.currentTime);
+        setDuration(audio.duration);
+      }
+    };
+
+    const onLoadedMetadata = () => {
+      setDuration(audio.duration);
+    };
+
+    audio.addEventListener('timeupdate', updateProgress);
+    audio.addEventListener('loadedmetadata', onLoadedMetadata);
+    // Covers the case where metadata already loaded before this effect
+    // attached (e.g. audio was created earlier via a seek before playing).
+    if (audio.readyState >= 1) updateProgress();
+
+    return () => {
+      audio.removeEventListener('timeupdate', updateProgress);
+      audio.removeEventListener('loadedmetadata', onLoadedMetadata);
+    };
+  }, [message.id, isPlaying, audioRefs]);
+
+  const effectiveProgress = dragRatio !== null ? dragRatio : playbackProgress;
+  const playedBars = Math.floor(effectiveProgress * bars);
+
+  const formatAudioTime = (seconds: number) => {
+    if (!seconds || isNaN(seconds)) return '0:00';
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const knownDuration = duration || parseFloat(message.duration || '0');
+  // Floor at 1s for the same reason the recorder now floors it when
+  // saving (see stopRecording) — covers any voice message sent before
+  // that fix which may still have a stored duration of exactly 0.
+  const displayTime = dragRatio !== null
+    ? formatAudioTime(dragRatio * knownDuration)
+    : isPlaying
+      ? formatAudioTime(currentTime)
+      : formatAudioTime(Math.max(1, knownDuration));
+
+  const ratioFromPointer = (e: { clientX: number }) => {
+    const el = waveformRef.current;
+    if (!el) return 0;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0) return 0;
+    return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const ratio = ratioFromPointer(e);
+    setDragRatio(ratio);
+    onSeek(message.id, audioUrl, ratio);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (dragRatio === null) return;
+    const ratio = ratioFromPointer(e);
+    setDragRatio(ratio);
+    onSeek(message.id, audioUrl, ratio);
+  };
+
+  const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    setDragRatio(null);
+  };
+
+  return (
+    <div className={`voice-message-bubble ${isOwn ? 'own' : 'received'}`}>
+      {/* Play/Pause Button */}
+      <button
+        onClick={() => onTogglePlayback(message.id, audioUrl)}
+        className={`voice-message-play-btn ${isOwn ? 'own' : 'received'} ${isPlaying ? 'is-playing' : ''}`}
+        aria-label={isPlaying ? 'Pause voice message' : 'Play voice message'}
+      >
+        {isPlaying ? (
+          <Pause className="w-[18px] h-[18px]" fill="currentColor" />
+        ) : (
+          <Play className="w-[18px] h-[18px] ml-0.5" fill="currentColor" />
+        )}
+      </button>
+
+      {/* Waveform and Duration */}
+      <div className="voice-message-content">
+        {/* Waveform — tap or drag anywhere on it to jump to that point and
+            keep listening from there. */}
+        <div
+          ref={waveformRef}
+          className="voice-message-waveform"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+        >
+          {waveformData.map((value, i) => {
+            const isPlayed = i < playedBars;
+            const isPlayhead = i === playedBars;
+            // `value` is already normalized per-clip at record time (see
+            // downsampleWaveform) so it genuinely spans ~0–1 with real
+            // contrast between quiet and loud moments. A light gamma lift
+            // still helps quieter-but-real bars stay readable, and a
+            // small floor just keeps a near-silent bucket from collapsing
+            // to an invisible sliver — neither needs to be aggressive
+            // anymore now that the underlying data isn't clustered flat.
+            const clamped = Math.max(0, Math.min(1, value));
+            const visualHeight = Math.max(0.12, Math.pow(clamped, 0.7));
+            return (
+              <div
+                key={i}
+                className={`voice-waveform-bar ${isOwn ? 'own' : 'received'} ${isPlayed ? 'played' : ''} ${isPlayhead ? 'playhead' : ''}`}
+                style={{ height: `${visualHeight * 100}%` }}
+              />
+            );
+          })}
+        </div>
+
+        {/* Duration */}
+        <div className={`voice-message-duration ${isOwn ? 'own' : 'received'}`}>
+          <span>{displayTime}</span>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+// Document Bubble Component - Modern design with preview. Also kept at
+// module scope for the same "stable component type" reason as
+// VoiceMessageBubble above (it doesn't need any ChatView-scoped state, so
+// nothing else changes).
+interface DocumentBubbleProps {
+  message: Message;
+  isOwn: boolean;
+}
+
+const DocumentBubble = memo(function DocumentBubble({ message, isOwn }: DocumentBubbleProps) {
+  const [isDownloading, setIsDownloading] = useState(false);
+  const fileUrl = message.media_url || message.content;
+
+  // Extract file info from URL or message metadata
+  const getFileInfo = () => {
+    const fileName = message.fileName || fileUrl.split('/').pop()?.split('?')[0] || 'Document';
+    const extension = fileName.split('.').pop()?.toLowerCase() || '';
+    let fileType = 'File';
+    let bgColor = isOwn ? 'bg-white/20' : 'bg-slate-100';
+    let iconColor = isOwn ? 'text-white' : 'text-slate-600';
+
+    // Determine file type based on extension
+    if (['pdf'].includes(extension)) {
+      fileType = 'PDF Document';
+      bgColor = isOwn ? 'bg-red-400/30' : 'bg-red-100';
+      iconColor = isOwn ? 'text-red-200' : 'text-red-600';
+    } else if (['doc', 'docx'].includes(extension)) {
+      fileType = 'Word Document';
+      bgColor = isOwn ? 'bg-blue-400/30' : 'bg-blue-100';
+      iconColor = isOwn ? 'text-blue-200' : 'text-blue-600';
+    } else if (['xls', 'xlsx'].includes(extension)) {
+      fileType = 'Excel Spreadsheet';
+      bgColor = isOwn ? 'bg-green-400/30' : 'bg-green-100';
+      iconColor = isOwn ? 'text-green-200' : 'text-green-600';
+    } else if (['ppt', 'pptx'].includes(extension)) {
+      fileType = 'PowerPoint';
+      bgColor = isOwn ? 'bg-orange-400/30' : 'bg-orange-100';
+      iconColor = isOwn ? 'text-orange-200' : 'text-orange-600';
+    } else if (['zip', 'rar', '7z'].includes(extension)) {
+      fileType = 'Archive';
+      bgColor = isOwn ? 'bg-amber-400/30' : 'bg-amber-100';
+      iconColor = isOwn ? 'text-amber-200' : 'text-amber-600';
+    } else if (['txt'].includes(extension)) {
+      fileType = 'Text File';
+    }
+
+    return { fileName, fileType, bgColor, iconColor, extension };
+  };
+
+  const { fileName, fileType, bgColor, iconColor, extension } = getFileInfo();
+
+  const handleDownload = async () => {
+    setIsDownloading(true);
+    try {
+      window.open(fileUrl, '_blank');
+    } catch (error) {
+      console.error('Error downloading file:', error);
+    } finally {
+      setTimeout(() => setIsDownloading(false), 1000);
+    }
+  };
+
+  const handlePreview = () => {
+    // For PDFs and images, open in new tab for preview
+    window.open(fileUrl, '_blank');
+  };
+
+  return (
+    <div className={`document-bubble ${isOwn ? 'own' : 'received'}`}>
+      {/* File Icon */}
+      <div className={`document-icon ${bgColor}`}>
+        <FileText className={`w-6 h-6 ${iconColor}`} />
+        <span className={`document-extension ${isOwn ? 'bg-white/90 text-violet-600' : 'bg-violet-500 text-white'}`}>
+          {extension.toUpperCase()}
+        </span>
+      </div>
+
+      {/* File Info */}
+      <div className="document-info">
+        <p className={`document-name ${isOwn ? 'text-white' : 'text-slate-800'}`}>
+          {fileName.length > 25 ? fileName.substring(0, 22) + '...' : fileName}
+        </p>
+        <p className={`document-type ${isOwn ? 'text-white/70' : 'text-slate-500'}`}>
+          {fileType} • {message.fileSize || 'Tap to open'}
+        </p>
+      </div>
+
+      {/* Action Buttons */}
+      <div className="document-actions">
+        <button
+          onClick={handlePreview}
+          className={`document-action-btn ${isOwn ? 'bg-white/20 hover:bg-white/30 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-600'}`}
+          title="Preview"
+        >
+          <Play className="w-4 h-4" />
+        </button>
+        <button
+          onClick={handleDownload}
+          disabled={isDownloading}
+          className={`document-action-btn ${isOwn ? 'bg-white/20 hover:bg-white/30 text-white' : 'bg-violet-500 hover:bg-violet-600 text-white'}`}
+          title="Download"
+        >
+          {isDownloading ? (
+            <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+          ) : (
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+            </svg>
+          )}
+        </button>
+      </div>
+    </div>
+  );
+});
+
 interface ChatViewProps {
   currentUser: UserProfile;
   contact: Contact;
@@ -1234,25 +1556,60 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   }, [handleGlobalMouseMove, handleGlobalMouseUp, handleGlobalTouchMove, handleGlobalTouchEnd]);
 
   // Audio Playback
-  const toggleAudioPlayback = (messageId: string, audioUrl: string) => {
+  // Shared by toggleAudioPlayback and seekAudio: get (creating if needed)
+  // the <audio> element for a voice message, and make sure any other
+  // voice message that's currently playing gets paused first — only one
+  // voice note plays at a time.
+  const ensureAudio = useCallback((messageId: string, audioUrl: string) => {
+    if (playingAudio && playingAudio !== messageId && audioRefs.current[playingAudio]) {
+      audioRefs.current[playingAudio].pause();
+    }
+
+    if (!audioRefs.current[messageId]) {
+      audioRefs.current[messageId] = new Audio(audioUrl);
+      audioRefs.current[messageId].onended = () => setPlayingAudio(null);
+    }
+    return audioRefs.current[messageId];
+  }, [playingAudio]);
+
+  const toggleAudioPlayback = useCallback((messageId: string, audioUrl: string) => {
     if (playingAudio === messageId) {
       audioRefs.current[messageId]?.pause();
       setPlayingAudio(null);
-    } else {
-      // Pause any currently playing audio
-      if (playingAudio && audioRefs.current[playingAudio]) {
-        audioRefs.current[playingAudio].pause();
-      }
-
-      if (!audioRefs.current[messageId]) {
-        audioRefs.current[messageId] = new Audio(audioUrl);
-        audioRefs.current[messageId].onended = () => setPlayingAudio(null);
-      }
-
-      audioRefs.current[messageId].play();
-      setPlayingAudio(messageId);
+      return;
     }
-  };
+
+    const audio = ensureAudio(messageId, audioUrl);
+    audio.play().catch(() => {});
+    setPlayingAudio(messageId);
+  }, [playingAudio, ensureAudio]);
+
+  // Drag/tap-to-seek on a voice message's waveform ("jump" to any point and
+  // keep listening from there, like WhatsApp's scrubber). Always (re)starts
+  // playback from the dragged position so the gesture is immediately
+  // audible, and avoids calling .play() again on every pointermove while a
+  // drag is already in progress (which would otherwise glitch playback).
+  const seekAudio = useCallback((messageId: string, audioUrl: string, ratio: number) => {
+    const audio = ensureAudio(messageId, audioUrl);
+    const clampedRatio = Math.max(0, Math.min(1, ratio));
+
+    const applySeek = () => {
+      if (audio.duration && isFinite(audio.duration)) {
+        audio.currentTime = clampedRatio * audio.duration;
+      }
+    };
+
+    if (audio.readyState >= 1) {
+      applySeek();
+    } else {
+      audio.addEventListener('loadedmetadata', applySeek, { once: true });
+    }
+
+    if (audio.paused) {
+      audio.play().catch(() => {});
+    }
+    setPlayingAudio(messageId);
+  }, [ensureAudio]);
 
   // Media Viewer
   const openMediaViewer = (type: 'image' | 'video', url: string) => {
@@ -1280,264 +1637,12 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   };
 
   // Voice Message Bubble Component - Modern design with waveform
-  const VoiceMessageBubble = ({
-    message,
-    isOwn
-  }: {
-    message: Message;
-    isOwn: boolean;
-  }) => {
-    const [waveformData, setWaveformData] = useState<number[]>([]);
-    const [playbackProgress, setPlaybackProgress] = useState(0);
-    const [currentTime, setCurrentTime] = useState(0);
-    const [duration, setDuration] = useState(0);
-    const bars = VOICE_WAVEFORM_BARS;
-    const isPlaying = playingAudio === message.id;
-    const audioUrl = message.media_url || message.content;
-
-    // Voice messages sent after this fix carry their *real* recorded
-    // amplitude in thumbnail_url (reusing that otherwise-unused column, see
-    // chatService's `waveform` param). Older messages sent before the fix
-    // don't have it, so fall back to a deterministic placeholder pattern
-    // based on the message id, rather than showing nothing.
-    useEffect(() => {
-      const real = (message.thumbnail_url ?? '')
-        .split(',')
-        .map((n) => parseFloat(n))
-        .filter((n) => !isNaN(n) && isFinite(n));
-
-      if (real.length > 0) {
-        setWaveformData(real);
-        return;
-      }
-
-      const data: number[] = [];
-      let hash = 0;
-      for (let i = 0; i < message.id.length; i++) {
-        hash = ((hash << 5) - hash) + message.id.charCodeAt(i);
-        hash |= 0;
-      }
-
-      for (let i = 0; i < bars; i++) {
-        const seed = Math.abs(Math.sin(hash * (i + 1) * 0.1)) * 0.6;
-        const variation = Math.abs(Math.sin(i * 0.4)) * 0.3;
-        const noise = Math.abs(Math.cos(hash * i * 0.05)) * 0.1;
-        data.push(0.2 + seed + variation + noise);
-      }
-      setWaveformData(data);
-    }, [message.id, message.thumbnail_url, bars]);
-
-    // Track playback progress and duration
-    useEffect(() => {
-      const audio = audioRefs.current[message.id];
-      if (!audio) return;
-
-      const updateProgress = () => {
-        if (audio.duration) {
-          setPlaybackProgress(audio.currentTime / audio.duration);
-          setCurrentTime(audio.currentTime);
-          setDuration(audio.duration);
-        }
-      };
-
-      const onLoadedMetadata = () => {
-        setDuration(audio.duration);
-      };
-
-      audio.addEventListener('timeupdate', updateProgress);
-      audio.addEventListener('loadedmetadata', onLoadedMetadata);
-
-      return () => {
-        audio.removeEventListener('timeupdate', updateProgress);
-        audio.removeEventListener('loadedmetadata', onLoadedMetadata);
-      };
-    }, [message.id, isPlaying]);
-
-    const playedBars = Math.floor(playbackProgress * bars);
-
-    const formatAudioTime = (seconds: number) => {
-      if (!seconds || isNaN(seconds)) return '0:00';
-      const mins = Math.floor(seconds / 60);
-      const secs = Math.floor(seconds % 60);
-      return `${mins}:${secs.toString().padStart(2, '0')}`;
-    };
-
-    // Floor at 1s for the same reason the recorder now floors it when
-    // saving (see stopRecording) — covers any voice message sent before
-    // that fix which may still have a stored duration of exactly 0.
-    const displayTime = isPlaying
-      ? formatAudioTime(currentTime)
-      : formatAudioTime(Math.max(1, duration || parseFloat(message.duration || '0')));
-
-    return (
-      <div className={`voice-message-bubble ${isOwn ? 'own' : 'received'}`}>
-        {/* Play/Pause Button */}
-        <button
-          onClick={() => toggleAudioPlayback(message.id, audioUrl)}
-          className={`voice-message-play-btn ${isOwn ? 'own' : 'received'} ${isPlaying ? 'is-playing' : ''}`}
-          aria-label={isPlaying ? 'Pause voice message' : 'Play voice message'}
-        >
-          {isPlaying ? (
-            <Pause className="w-[18px] h-[18px]" fill="currentColor" />
-          ) : (
-            <Play className="w-[18px] h-[18px] ml-0.5" fill="currentColor" />
-          )}
-        </button>
-
-        {/* Waveform and Duration */}
-        <div className="voice-message-content">
-          {/* Waveform */}
-          <div className="voice-message-waveform">
-            {waveformData.map((value, i) => {
-              const isPlayed = i < playedBars;
-              const isPlayhead = isPlaying && i === playedBars;
-              // `value` is already normalized per-clip at record time (see
-              // downsampleWaveform) so it genuinely spans ~0–1 with real
-              // contrast between quiet and loud moments. A light gamma lift
-              // still helps quieter-but-real bars stay readable, and a
-              // small floor just keeps a near-silent bucket from collapsing
-              // to an invisible sliver — neither needs to be aggressive
-              // anymore now that the underlying data isn't clustered flat.
-              const clamped = Math.max(0, Math.min(1, value));
-              const visualHeight = Math.max(0.12, Math.pow(clamped, 0.7));
-              return (
-                <div
-                  key={i}
-                  className={`voice-waveform-bar ${isOwn ? 'own' : 'received'} ${isPlayed ? 'played' : ''} ${isPlayhead ? 'playhead' : ''}`}
-                  style={{ height: `${visualHeight * 100}%` }}
-                />
-              );
-            })}
-          </div>
-
-          {/* Duration */}
-          <div className={`voice-message-duration ${isOwn ? 'own' : 'received'}`}>
-            <span>{displayTime}</span>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  // Document Bubble Component - Modern design with preview
-  const DocumentBubble = ({
-    message,
-    isOwn
-  }: {
-    message: Message;
-    isOwn: boolean;
-  }) => {
-    const [isDownloading, setIsDownloading] = useState(false);
-    const fileUrl = message.media_url || message.content;
-
-    // Extract file info from URL or message metadata
-    const getFileInfo = () => {
-      const fileName = message.fileName || fileUrl.split('/').pop()?.split('?')[0] || 'Document';
-      const extension = fileName.split('.').pop()?.toLowerCase() || '';
-      let fileType = 'File';
-      let icon = 'file';
-      let bgColor = isOwn ? 'bg-white/20' : 'bg-slate-100';
-      let iconColor = isOwn ? 'text-white' : 'text-slate-600';
-
-      // Determine file type based on extension
-      if (['pdf'].includes(extension)) {
-        fileType = 'PDF Document';
-        icon = 'pdf';
-        bgColor = isOwn ? 'bg-red-400/30' : 'bg-red-100';
-        iconColor = isOwn ? 'text-red-200' : 'text-red-600';
-      } else if (['doc', 'docx'].includes(extension)) {
-        fileType = 'Word Document';
-        icon = 'word';
-        bgColor = isOwn ? 'bg-blue-400/30' : 'bg-blue-100';
-        iconColor = isOwn ? 'text-blue-200' : 'text-blue-600';
-      } else if (['xls', 'xlsx'].includes(extension)) {
-        fileType = 'Excel Spreadsheet';
-        icon = 'excel';
-        bgColor = isOwn ? 'bg-green-400/30' : 'bg-green-100';
-        iconColor = isOwn ? 'text-green-200' : 'text-green-600';
-      } else if (['ppt', 'pptx'].includes(extension)) {
-        fileType = 'PowerPoint';
-        icon = 'ppt';
-        bgColor = isOwn ? 'bg-orange-400/30' : 'bg-orange-100';
-        iconColor = isOwn ? 'text-orange-200' : 'text-orange-600';
-      } else if (['zip', 'rar', '7z'].includes(extension)) {
-        fileType = 'Archive';
-        icon = 'zip';
-        bgColor = isOwn ? 'bg-amber-400/30' : 'bg-amber-100';
-        iconColor = isOwn ? 'text-amber-200' : 'text-amber-600';
-      } else if (['txt'].includes(extension)) {
-        fileType = 'Text File';
-        icon = 'txt';
-      }
-
-      return { fileName, fileType, icon, bgColor, iconColor, extension };
-    };
-
-    const { fileName, fileType, bgColor, iconColor, extension } = getFileInfo();
-
-    const handleDownload = async () => {
-      setIsDownloading(true);
-      try {
-        window.open(fileUrl, '_blank');
-      } catch (error) {
-        console.error('Error downloading file:', error);
-      } finally {
-        setTimeout(() => setIsDownloading(false), 1000);
-      }
-    };
-
-    const handlePreview = () => {
-      // For PDFs and images, open in new tab for preview
-      window.open(fileUrl, '_blank');
-    };
-
-    return (
-      <div className={`document-bubble ${isOwn ? 'own' : 'received'}`}>
-        {/* File Icon */}
-        <div className={`document-icon ${bgColor}`}>
-          <FileText className={`w-6 h-6 ${iconColor}`} />
-          <span className={`document-extension ${isOwn ? 'bg-white/90 text-violet-600' : 'bg-violet-500 text-white'}`}>
-            {extension.toUpperCase()}
-          </span>
-        </div>
-
-        {/* File Info */}
-        <div className="document-info">
-          <p className={`document-name ${isOwn ? 'text-white' : 'text-slate-800'}`}>
-            {fileName.length > 25 ? fileName.substring(0, 22) + '...' : fileName}
-          </p>
-          <p className={`document-type ${isOwn ? 'text-white/70' : 'text-slate-500'}`}>
-            {fileType} • {message.fileSize || 'Tap to open'}
-          </p>
-        </div>
-
-        {/* Action Buttons */}
-        <div className="document-actions">
-          <button
-            onClick={handlePreview}
-            className={`document-action-btn ${isOwn ? 'bg-white/20 hover:bg-white/30 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-600'}`}
-            title="Preview"
-          >
-            <Play className="w-4 h-4" />
-          </button>
-          <button
-            onClick={handleDownload}
-            disabled={isDownloading}
-            className={`document-action-btn ${isOwn ? 'bg-white/20 hover:bg-white/30 text-white' : 'bg-violet-500 hover:bg-violet-600 text-white'}`}
-            title="Download"
-          >
-            {isDownloading ? (
-              <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-            ) : (
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-            )}
-          </button>
-        </div>
-      </div>
-    );
-  };
+  // VoiceMessageBubble and DocumentBubble now live at module scope (see
+  // above MessageBubble) so they're stable component types across renders
+  // — see the comment above the module-level VoiceMessageBubble for why
+  // that matters (it used to reset/remount on almost every unrelated
+  // ChatView re-render, wiping playback progress and breaking the
+  // play/pause button's visual state).
 
   const renderMessageContent = (message: Message, isOwn: boolean) => {
     switch (message.type) {
@@ -1572,7 +1677,16 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           </div>
         );
       case 'voice':
-        return <VoiceMessageBubble message={message} isOwn={isOwn} />;
+        return (
+          <VoiceMessageBubble
+            message={message}
+            isOwn={isOwn}
+            isPlaying={playingAudio === message.id}
+            audioRefs={audioRefs}
+            onTogglePlayback={toggleAudioPlayback}
+            onSeek={seekAudio}
+          />
+        );
       case 'gif':
         return (
           <img
@@ -2589,6 +2703,19 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
           justify-content: space-between;
           gap: 2.5px;
           height: 30px;
+          cursor: pointer;
+          /* Prevent the page from scrolling while dragging to seek on
+             touch, and stop the default double-tap/long-press highlight
+             from flashing on every tap. */
+          touch-action: none;
+          -webkit-tap-highlight-color: transparent;
+          user-select: none;
+          /* Extra vertical hit area so dragging with a finger (much less
+             precise than a mouse) is easy to grab. box-sizing: content-box
+             means this padding sits outside the 30px content height the
+             bars size themselves against, so it doesn't squash them. */
+          padding: 8px 0;
+          box-sizing: content-box;
         }
 
         .voice-waveform-bar {
