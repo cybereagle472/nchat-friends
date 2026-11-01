@@ -254,6 +254,12 @@ interface VoiceMessageBubbleProps {
   // microphone. A ref (not state) so checking/flipping it never triggers a
   // re-render of every voice bubble in the chat.
   isRecordingActiveRef: { current: boolean };
+  // Shown as a small circular photo (with a mic badge) at the end of the
+  // bubble, same as WhatsApp does for voice notes specifically — every
+  // other bubble type stays avatar-free, this one gets it back because
+  // it's genuinely how the reference app marks "who recorded this".
+  avatarUrl?: string;
+  avatarFallback: string;
 }
 
 const VoiceMessageBubble = memo(function VoiceMessageBubble({
@@ -261,7 +267,9 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
   isOwn,
   audioRefs,
   onRequestExclusivePlayback,
-  isRecordingActiveRef
+  isRecordingActiveRef,
+  avatarUrl,
+  avatarFallback
 }: VoiceMessageBubbleProps) {
   const [waveformData, setWaveformData] = useState<number[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -629,6 +637,20 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
         <div className={`voice-message-duration ${isOwn ? 'own' : 'received'}`}>
           <span>{displayTime}</span>
         </div>
+      </div>
+
+      {/* Sender photo with a small mic badge — mirrors WhatsApp's voice
+          note bubbles, which are the one message type that keeps a
+          per-message avatar even in a 1:1 chat. */}
+      <div className={`voice-message-avatar ${isOwn ? 'own' : 'received'}`}>
+        {avatarUrl ? (
+          <img src={avatarUrl} alt="" className="voice-message-avatar-img" />
+        ) : (
+          <span className="voice-message-avatar-fallback">{avatarFallback}</span>
+        )}
+        <span className={`voice-message-mic-badge ${isOwn ? 'own' : 'received'}`}>
+          <Mic className="w-2.5 h-2.5" fill="currentColor" />
+        </span>
       </div>
     </div>
   );
@@ -1839,6 +1861,28 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // "Today" / "Yesterday" / weekday-and-date pill shown between groups of
+  // messages sent on different days — WhatsApp always has this, and
+  // without it a chat with any real history just reads as one undated
+  // wall of bubbles with no sense of when anything happened.
+  const formatDateSeparator = useCallback((timestamp: string) => {
+    const date = new Date(timestamp);
+    const now = new Date();
+    const startOf = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const diffDays = Math.round((startOf(now) - startOf(date)) / 86_400_000);
+
+    if (diffDays === 0) return 'Today';
+    if (diffDays === 1) return 'Yesterday';
+    if (diffDays > 1 && diffDays < 7) {
+      return date.toLocaleDateString('en-US', { weekday: 'long' });
+    }
+    return date.toLocaleDateString('en-US', {
+      day: 'numeric',
+      month: 'long',
+      year: date.getFullYear() !== now.getFullYear() ? 'numeric' : undefined
+    });
+  }, []);
+
   // Voice Message Bubble Component - Modern design with waveform
   // VoiceMessageBubble and DocumentBubble now live at module scope (see
   // above MessageBubble) so they're stable component types across renders
@@ -1887,6 +1931,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
             audioRefs={audioRefs}
             onRequestExclusivePlayback={pauseOtherVoiceMessages}
             isRecordingActiveRef={isRecordingActiveRef}
+            avatarUrl={isOwn ? currentUser.avatar_url : contact.profile.avatar_url}
+            avatarFallback={(isOwn ? currentUser.full_name : contact.profile.full_name).charAt(0).toUpperCase()}
           />
         );
       case 'gif':
@@ -2100,18 +2146,39 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
             </div>
           </div>
         ) : (
-          messages.map((message) => (
-            <MessageBubble
-              key={message.client_message_id || message.id}
-              message={message}
-              isOwn={message.sender_id === currentUser.id}
-              currentUserId={currentUser.id}
-              renderMessageContent={stableRenderMessageContent}
-              formatTime={formatTime}
-              onLongPress={handleMessageLongPress}
-              onReactionClick={handleReactionClick}
-            />
-          ))
+          (() => {
+            let lastDateKey: string | null = null;
+            const items: React.ReactNode[] = [];
+
+            messages.forEach((message) => {
+              const dateKey = new Date(message.created_at).toDateString();
+              if (dateKey !== lastDateKey) {
+                lastDateKey = dateKey;
+                items.push(
+                  <div key={`date-${dateKey}`} className="flex justify-center my-2">
+                    <span className="date-separator-pill">
+                      {formatDateSeparator(message.created_at)}
+                    </span>
+                  </div>
+                );
+              }
+
+              items.push(
+                <MessageBubble
+                  key={message.client_message_id || message.id}
+                  message={message}
+                  isOwn={message.sender_id === currentUser.id}
+                  currentUserId={currentUser.id}
+                  renderMessageContent={stableRenderMessageContent}
+                  formatTime={formatTime}
+                  onLongPress={handleMessageLongPress}
+                  onReactionClick={handleReactionClick}
+                />
+              );
+            });
+
+            return items;
+          })()
         )}
         <div ref={messagesEndRef} />
       </div>
@@ -2133,64 +2200,73 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           style={{ touchAction: 'none', overscrollBehavior: 'none' }}
         >
           {voiceState.isLocked ? (
-            // Locked Recording Mode
+            // Locked Recording Mode — two rows, WhatsApp-style: the top row
+            // is purely the duration + live waveform (so the waveform
+            // actually has room to be legible), the bottom row is the three
+            // actions (delete / pause-resume / send) as clear, labeled,
+            // full-size touch targets instead of competing for space with
+            // the waveform in a single cramped line.
             <div className="px-4 py-3">
-              {/* `min-w-0` + `overflow-hidden` on the waveform cell and
-                  `shrink-0` on every other control are both required here:
-                  this row used to render up to 50 fixed-width (4px) bars
-                  inside a plain `flex-1` cell, which has no min-width
-                  override by default — flexbox's automatic minimum size
-                  for a non-wrapping row of fixed-width children is the sum
-                  of their widths, so the cell refused to shrink below
-                  ~400px and pushed the pause/duration/send buttons straight
-                  off the right edge of the screen on real phones. */}
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={() => stopRecording(true)}
-                  className="w-10 h-10 shrink-0 rounded-full bg-red-100 text-red-500 flex items-center justify-center hover:bg-red-200 transition-colors"
-                >
-                  <Trash2 className="w-5 h-5" />
-                </button>
-
-                {/* Real-time Waveform */}
-                <div className="flex-1 min-w-0 overflow-hidden flex items-center gap-1 h-10 px-2">
-                  {voiceState.waveformData.slice(-18).map((value, i) => (
-                    <div
-                      key={i}
-                      className={`w-1 shrink-0 bg-violet-500 rounded-full transition-all duration-75 ${voiceState.isPaused ? 'opacity-50' : ''}`}
-                      style={{ height: `${Math.max(4, value * 32)}px` }}
-                    />
-                  ))}
-                  {/* Fill remaining space with placeholder bars */}
-                  {Array.from({ length: Math.max(0, 18 - voiceState.waveformData.length) }).map((_, i) => (
-                    <div key={`placeholder-${i}`} className="w-1 h-1 shrink-0 bg-slate-300 rounded-full" />
-                  ))}
-                </div>
-
-                {/* Pause / Resume the locked recording in place */}
-                <button
-                  onClick={() => (voiceState.isPaused ? resumeRecording() : pauseRecording())}
-                  className="w-10 h-10 shrink-0 rounded-full bg-violet-100 text-violet-600 flex items-center justify-center hover:bg-violet-200 transition-colors"
-                  aria-label={voiceState.isPaused ? 'Resume recording' : 'Pause recording'}
-                >
-                  {voiceState.isPaused ? (
-                    <Play className="w-5 h-5 ml-0.5" fill="currentColor" />
-                  ) : (
-                    <Pause className="w-5 h-5" fill="currentColor" />
-                  )}
-                </button>
-
+              {/* Row 1 — duration + live waveform */}
+              <div className="flex items-center gap-3 mb-3">
                 <div className="flex items-center gap-2 shrink-0">
-                  <div className={`w-2 h-2 rounded-full bg-red-500 ${voiceState.isPaused ? '' : 'animate-pulse'}`} />
-                  <span className="text-sm font-semibold text-slate-700 tabular-nums min-w-[40px]">
+                  <div className={`w-2.5 h-2.5 rounded-full bg-red-500 ${voiceState.isPaused ? '' : 'animate-pulse'}`} />
+                  <span className="text-base font-semibold text-slate-800 tabular-nums min-w-[44px]">
                     {formatDuration(voiceState.duration)}
                   </span>
                 </div>
 
+                {/* `min-w-0` + `overflow-hidden` on the waveform cell is
+                    required here: this row used to render up to 50
+                    fixed-width (4px) bars inside a plain `flex-1` cell,
+                    which has no min-width override by default —
+                    flexbox's automatic minimum size for a non-wrapping row
+                    of fixed-width children is the sum of their widths, so
+                    the cell refused to shrink below ~400px and pushed
+                    other controls straight off the right edge of the
+                    screen on real phones. */}
+                <div className="flex-1 min-w-0 overflow-hidden flex items-center gap-[3px] h-10">
+                  {voiceState.waveformData.slice(-36).map((value, i) => (
+                    <div
+                      key={i}
+                      className={`w-1 shrink-0 bg-violet-500 rounded-full transition-all duration-75 ${voiceState.isPaused ? 'opacity-40' : ''}`}
+                      style={{ height: `${Math.max(4, value * 32)}px` }}
+                    />
+                  ))}
+                  {/* Fill remaining space with placeholder bars */}
+                  {Array.from({ length: Math.max(0, 36 - voiceState.waveformData.length) }).map((_, i) => (
+                    <div key={`placeholder-${i}`} className="w-1 h-1 shrink-0 bg-slate-200 rounded-full" />
+                  ))}
+                </div>
+              </div>
+
+              {/* Row 2 — delete / pause-resume (labeled) / send */}
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => stopRecording(true)}
+                  className="w-12 h-12 shrink-0 rounded-full bg-red-50 text-red-500 flex items-center justify-center hover:bg-red-100 active:scale-95 transition-all"
+                  aria-label="Delete recording"
+                >
+                  <Trash2 className="w-5 h-5" />
+                </button>
+
+                <button
+                  onClick={() => (voiceState.isPaused ? resumeRecording() : pauseRecording())}
+                  className="flex-1 h-12 rounded-full bg-slate-100 text-slate-700 flex items-center justify-center gap-2 font-medium hover:bg-slate-200 active:scale-[0.98] transition-all"
+                  aria-label={voiceState.isPaused ? 'Resume recording' : 'Pause recording'}
+                >
+                  {voiceState.isPaused ? (
+                    <Play className="w-5 h-5" fill="currentColor" />
+                  ) : (
+                    <Pause className="w-5 h-5" fill="currentColor" />
+                  )}
+                  <span>{voiceState.isPaused ? 'Resume' : 'Pause'}</span>
+                </button>
 
                 <button
                   onClick={() => stopRecording(false)}
-                  className="w-10 h-10 shrink-0 rounded-full bg-gradient-to-r from-violet-500 to-purple-500 text-white flex items-center justify-center shadow-lg"
+                  className="w-12 h-12 shrink-0 rounded-full bg-gradient-to-r from-violet-500 to-purple-500 text-white flex items-center justify-center shadow-lg hover:shadow-xl active:scale-95 transition-all"
+                  aria-label="Send voice message"
                 >
                   <Send className="w-5 h-5" />
                 </button>
@@ -2843,8 +2919,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
              per-message avatar, which made them look out of place next to
              text/image bubbles in a 1:1 chat. */
           border-radius: 16px;
-          min-width: 196px;
-          max-width: 300px;
+          min-width: 224px;
+          max-width: 320px;
         }
 
         .voice-message-bubble.own {
@@ -2998,6 +3074,70 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
 
         .voice-message-duration.received {
           color: #64748b;
+        }
+
+        .voice-message-avatar {
+          position: relative;
+          width: 34px;
+          height: 34px;
+          min-width: 34px;
+          border-radius: 50%;
+          overflow: visible;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+
+        .voice-message-avatar-img {
+          width: 100%;
+          height: 100%;
+          border-radius: 50%;
+          object-fit: cover;
+          display: block;
+        }
+
+        .voice-message-avatar.own .voice-message-avatar-img {
+          box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.5);
+        }
+
+        .voice-message-avatar.received .voice-message-avatar-img {
+          box-shadow: 0 0 0 1.5px rgba(139, 92, 246, 0.15);
+        }
+
+        .voice-message-avatar-fallback {
+          width: 100%;
+          height: 100%;
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 13px;
+          font-weight: 700;
+          color: white;
+          background: linear-gradient(135deg, #a78bfa 0%, #7c3aed 100%);
+        }
+
+        .voice-message-mic-badge {
+          position: absolute;
+          bottom: -2px;
+          right: -2px;
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: white;
+        }
+
+        .voice-message-mic-badge.own {
+          background: #7c3aed;
+          box-shadow: 0 0 0 2px #8b5cf6;
+        }
+
+        .voice-message-mic-badge.received {
+          background: #7c3aed;
+          box-shadow: 0 0 0 2px #ffffff;
         }
 
         /* Voice Recording Slide UI - WhatsApp Style */
@@ -3167,6 +3307,19 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
             font-size: 14px;
             padding: 8px 2px;
           }
+        }
+
+        /* Date Separator Pill - shown between messages sent on different
+           days, WhatsApp-style. */
+        .date-separator-pill {
+          display: inline-block;
+          padding: 5px 14px;
+          font-size: 12px;
+          font-weight: 600;
+          color: #64748b;
+          background: rgba(255, 255, 255, 0.9);
+          border-radius: 10px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
         }
 
         /* Message Bubble Wrapper for Reactions Positioning */
