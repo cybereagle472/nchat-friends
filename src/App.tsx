@@ -58,6 +58,42 @@ function AppLoadingScreen() {
   );
 }
 
+// Fallback for switching between already-open-app screens (tabs, a chat, a
+// group, settings, ...). Deliberately small and un-branded — it sits inside
+// the existing app chrome (bottom nav stays put) instead of replacing the
+// whole screen with the splash logo, so a brief chunk load reads as "this
+// is loading" rather than "the app just restarted".
+function InlineLoadingSpinner() {
+  return (
+    <div className="h-full flex items-center justify-center">
+      <div className="w-8 h-8 rounded-full border-2 border-violet-200 border-t-violet-500 animate-spin" />
+    </div>
+  );
+}
+
+// Every screen that's code-split below this point only pays its network
+// cost the first time its chunk is actually requested. Kicking all of them
+// off in the background (once, right after the authenticated app shell has
+// had a chance to render) means that by the time someone taps a tab or
+// opens a chat, the code is already sitting in the browser's cache — so in
+// practice the loading fallback above almost never gets a chance to show.
+let prefetchedAppScreens = false;
+function prefetchAppScreens() {
+  if (prefetchedAppScreens) return;
+  prefetchedAppScreens = true;
+  void import('./components/ChatView');
+  void import('./components/Status');
+  void import('./components/Groups');
+  void import('./components/GroupChatView');
+  void import('./components/GroupInfo');
+  void import('./components/CreateGroup');
+  void import('./components/Discover');
+  void import('./components/History');
+  void import('./components/Settings');
+  void import('./components/CallModal');
+  void import('./components/ProfileView');
+}
+
 interface CallState {
   active: boolean;
   calleeId?: string;
@@ -398,6 +434,24 @@ function App() {
     setCurrentUser(profile);
   }, []);
 
+  // Warm the other screens' code in the background once the user is in the
+  // app, so switching tabs/opening a chat later doesn't have to wait on a
+  // network fetch. Scheduled on idle time (with a short-timeout fallback
+  // for browsers without requestIdleCallback) so it never competes with the
+  // Chats list's own first paint/data load.
+  useEffect(() => {
+    if (!isAuthenticated || !currentUser) return;
+    const idle = (window as any).requestIdleCallback as
+      | ((cb: () => void) => number)
+      | undefined;
+    if (idle) {
+      const handle = idle(prefetchAppScreens);
+      return () => (window as any).cancelIdleCallback?.(handle);
+    }
+    const timer = setTimeout(prefetchAppScreens, 1500);
+    return () => clearTimeout(timer);
+  }, [isAuthenticated, currentUser]);
+
   // Loading state - Static splash, no spinner
   if (loading) {
     return <AppLoadingScreen />;
@@ -645,7 +699,7 @@ function MainApp({
 
       {/* Main Content */}
       <div className="flex-1 overflow-hidden relative z-10">
-        <Suspense fallback={<AppLoadingScreen />}>
+        <Suspense fallback={<InlineLoadingSpinner />}>
         {showSettings ? (
           <Settings
             currentUser={currentUser}
