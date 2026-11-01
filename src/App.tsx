@@ -13,9 +13,15 @@ import { Discover } from './components/Discover';
 import { History } from './components/History';
 import { Settings } from './components/Settings';
 import { CallModal } from './components/CallModal';
-import { authService } from './services/authService';
+import { authService, ProfileResolution } from './services/authService';
 import { profileService } from './services/profileService';
-import { markProfileComplete } from './lib/apiClient';
+import {
+  markProfileComplete,
+  getCurrentUserId as getStoredUserIdSync,
+  getStoredAuth,
+  wasProfileEverComplete,
+  getCachedUserProfile,
+} from './lib/apiClient';
 import { callService } from './services/callService';
 import { GroupWithMembers } from './services/groupService';
 import { UserProfile, Contact, Call } from './types';
@@ -55,8 +61,94 @@ function App() {
     callType: 'audio'
   });
 
+  // Applies the result of authService.resolveProfileState to app state.
+  // Shared by the background reconciliation below and by the SIGNED_IN
+  // handler, so both treat every outcome the same safe way — in
+  // particular, a mere "couldn't confirm it this time" (sessionError) must
+  // never interrupt someone who's already looking at the app with a
+  // perfectly good cached profile; only a *confirmed* dead session
+  // (sessionInvalid) is ever allowed to do that.
+  const applyProfileResolution = useCallback((userId: string, resolution: ProfileResolution) => {
+    if (resolution.sessionInvalid) {
+      realtimeClient.disconnect();
+      setIsAuthenticated(false);
+      setCurrentUser(null);
+      setNeedsProfileSetup(false);
+      setUserId(null);
+      setUserEmail('');
+      setSessionError(false);
+      return;
+    }
+    if (resolution.user) {
+      setCurrentUser(resolution.user);
+      setNeedsProfileSetup(false);
+      setSessionError(false);
+      if (resolution.user.email) setUserEmail(resolution.user.email);
+      return;
+    }
+    if (resolution.sessionError) {
+      // Couldn't confirm the profile this time. If we (or the cache-first
+      // bootstrap below) already have a known-good cached profile for this
+      // exact account, just keep it — there's nothing to show the user
+      // over a background check that didn't pan out. Only show the "try
+      // again" screen when there's truly nothing to fall back to.
+      const cached = getCachedUserProfile(userId);
+      if (cached) {
+        setCurrentUser(cached);
+        setNeedsProfileSetup(false);
+        setSessionError(false);
+      } else {
+        setSessionError(true);
+      }
+      return;
+    }
+    // Retried and it genuinely never looked complete — a real, brand-new
+    // account that hasn't finished onboarding yet.
+    setNeedsProfileSetup(true);
+  }, []);
+
   // Check auth on mount (and whenever the user retries from the session-error screen)
   const checkAuth = useCallback(async () => {
+    const userId = getStoredUserIdSync();
+    const auth = getStoredAuth();
+
+    // Cache-first bootstrap: if we've ever confirmed this exact account's
+    // profile as complete on this device before, open straight into the
+    // app right now using whatever's cached — the same way WhatsApp/
+    // Telegram/Messenger open to your chats immediately and reconcile with
+    // the server quietly afterward, rather than gating every single
+    // launch on a network round trip that can (and, per the reports this
+    // was built to fix, does) occasionally fail for reasons that have
+    // nothing to do with whether the account is actually fine. A single
+    // failed check here can therefore never again bounce an established
+    // user back to onboarding or a blocking error screen; only a
+    // *confirmed* dead session (handled inside applyProfileResolution)
+    // can sign them out from this point on.
+    if (userId && auth && wasProfileEverComplete(userId)) {
+      const bestEffortProfile: UserProfile =
+        getCachedUserProfile(userId) ?? {
+          id: auth.user.id,
+          email: auth.user.email,
+          full_name: auth.user.full_name || '',
+        };
+      setIsAuthenticated(true);
+      setCurrentUser(bestEffortProfile);
+      setNeedsProfileSetup(false);
+      setSessionError(false);
+      setUserId(userId);
+      if (bestEffortProfile.email) setUserEmail(bestEffortProfile.email);
+      setLoading(false);
+
+      void authService.resolveProfileState(userId).then((resolution) => {
+        applyProfileResolution(userId, resolution);
+      });
+      return;
+    }
+
+    // No local evidence this account has ever finished onboarding on this
+    // device (brand-new signup, first-ever visit here, or genuinely signed
+    // out) — this is the only situation where it's actually correct to
+    // gate the UI on the network: there's nothing honest to show yet.
     setLoading(true);
     try {
       const authState = await authService.checkSession();
@@ -66,8 +158,7 @@ function App() {
       setCurrentUser(authState.user);
 
       if (authState.isAuthenticated) {
-        const id = await authService.getCurrentUserId();
-        setUserId(id);
+        setUserId(userId);
 
         if (authState.user?.email) {
           setUserEmail(authState.user.email);
@@ -78,7 +169,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyProfileResolution]);
 
   useEffect(() => {
     checkAuth();
@@ -95,20 +186,7 @@ function App() {
         // dropped request here must never be confused with "brand new
         // user" and silently drop them into onboarding again.
         const resolution = await authService.resolveProfileState(session.user.id);
-        if (resolution.sessionInvalid) {
-          setIsAuthenticated(false);
-          return;
-        }
-        if (resolution.sessionError) {
-          setSessionError(true);
-          return;
-        }
-        if (resolution.user) {
-          setCurrentUser(resolution.user);
-          setNeedsProfileSetup(false);
-        } else {
-          setNeedsProfileSetup(true);
-        }
+        applyProfileResolution(session.user.id, resolution);
       } else if (event === 'SIGNED_OUT') {
         // Also covers another tab signing out (see the cross-tab 'storage'
         // sync in lib/apiClient.ts) — make sure the realtime socket this
@@ -126,7 +204,7 @@ function App() {
     return () => {
       subscription.unsubscribe();
     };
-  }, [checkAuth]);
+  }, [checkAuth, applyProfileResolution]);
 
   // Update online status.
   // The Worker derives is_online server-side from a presence heartbeat
@@ -190,27 +268,16 @@ function App() {
 
   const handleAuthSuccess = useCallback(async () => {
     const id = await authService.getCurrentUserId();
-    if (id) {
-      setUserId(id);
-      const resolution = await authService.resolveProfileState(id);
-      if (resolution.sessionInvalid) {
-        setIsAuthenticated(false);
-        return;
-      }
-      setSessionError(!!resolution.sessionError);
-      if (resolution.user) {
-        setCurrentUser(resolution.user);
-        setNeedsProfileSetup(false);
-      } else if (!resolution.sessionError) {
-        setNeedsProfileSetup(true);
-      }
-      setIsAuthenticated(true);
-
-      if (resolution.user?.email) {
-        setUserEmail(resolution.user.email);
-      }
-    }
-  }, []);
+    if (!id) return;
+    setUserId(id);
+    // The login/signup call that led here already proves the session is
+    // valid — resolveProfileState below only needs to figure out the
+    // profile side of things (and applyProfileResolution still handles the
+    // rare case where something's gone more seriously wrong).
+    setIsAuthenticated(true);
+    const resolution = await authService.resolveProfileState(id);
+    applyProfileResolution(id, resolution);
+  }, [applyProfileResolution]);
 
   const handleProfileComplete = useCallback((profile: UserProfile) => {
     // Record it right away (not just on the next bootstrap's

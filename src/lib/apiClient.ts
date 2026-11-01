@@ -196,6 +196,58 @@ export function wasProfileEverComplete(userId: string): boolean {
   return !!readProfileCompleteMap()[userId];
 }
 
+// --- Cached profile (stale-while-revalidate bootstrap) -----------------
+//
+// The old bootstrap flow was "network call must succeed before the user
+// sees anything but a loading spinner, an onboarding screen, or an error
+// screen" — meaning any single bad network blip on startup (exactly the
+// kind of thing that happens on a phone that's still reconnecting) was
+// user-visible, even for someone who was perfectly fine a moment ago.
+// Real chat apps don't work that way: they show you your last-known app
+// state immediately from a local cache and quietly reconcile with the
+// server in the background, only ever interrupting you for a *confirmed*
+// dead session (an explicit 401/403), never for "couldn't tell right now".
+// This is that local cache, keyed by user id.
+const PROFILE_CACHE_KEY = 'nchat_profile_cache_v1';
+
+function readProfileCacheMap(): Record<string, UserProfile> {
+  try {
+    const raw = localStorage.getItem(PROFILE_CACHE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, UserProfile>) : {};
+  } catch {
+    return {};
+  }
+}
+
+export function cacheUserProfile(userId: string, profile: UserProfile) {
+  try {
+    const map = readProfileCacheMap();
+    map[userId] = profile;
+    localStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify(map));
+  } catch {
+    /* best-effort — worst case we just lose the instant-startup benefit */
+  }
+}
+
+export function getCachedUserProfile(userId: string): UserProfile | null {
+  try {
+    return readProfileCacheMap()[userId] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Wipes every cached profile — called on logout and on a confirmed dead
+ * session, so a different account signing in later (or this one after a
+ * real sign-out) can never momentarily show stale/foreign cached data. */
+export function clearProfileCache() {
+  try {
+    localStorage.removeItem(PROFILE_CACHE_KEY);
+  } catch {
+    /* best-effort */
+  }
+}
+
 export function getAccessToken(): string | null {
   return readAuth()?.access_token ?? null;
 }

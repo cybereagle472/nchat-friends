@@ -8,6 +8,9 @@ import {
   onAuthStateChange,
   markProfileComplete,
   wasProfileEverComplete,
+  cacheUserProfile,
+  getCachedUserProfile,
+  clearProfileCache,
 } from '../lib/apiClient';
 import { profileService } from './profileService';
 import { UserProfile } from '../types';
@@ -81,6 +84,7 @@ export const authService = {
         const profile = await profileService.getMyProfileOrThrow();
         if (isProfileComplete(profile)) {
           markProfileComplete(userId);
+          cacheUserProfile(userId, profile);
           return { user: profile, needsProfileSetup: false };
         }
         // Apparent incompleteness (including a flat 404) is always worth
@@ -127,6 +131,7 @@ export const authService = {
     const resolution = await this.resolveProfileState(userId);
     if (resolution.sessionInvalid) {
       clearAuthSession();
+      clearProfileCache();
       return { isAuthenticated: false, user: null, needsProfileSetup: false };
     }
     return {
@@ -210,11 +215,22 @@ export const authService = {
       /* best-effort server-side revoke */
     }
     clearAuthSession();
+    // An explicit, user-initiated sign-out is the one case where wiping
+    // everything is exactly right — nothing cached should carry over to
+    // whoever (or whatever session) signs in next on this device.
+    clearProfileCache();
   },
 
   // Get current user ID
   async getCurrentUserId(): Promise<string | null> {
     return getStoredUserId();
+  },
+
+  // Synchronous, local-only lookup of the last profile we confirmed
+  // complete for this exact user — used for the instant, cache-first app
+  // bootstrap in App.tsx (see getCachedUserProfile's doc comment).
+  getCachedProfile(userId: string): UserProfile | null {
+    return getCachedUserProfile(userId);
   },
 
   // Subscribe to auth changes — mirrors supabase.auth.onAuthStateChange's shape
