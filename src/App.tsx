@@ -1,20 +1,29 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, lazy, Suspense } from 'react';
 import { Toaster, toast } from 'sonner';
 import { MessageCircle, Circle, UsersRound, Compass, Clock } from 'lucide-react';
 import { Auth } from './components/Auth';
-import { ProfileSetup } from './components/ProfileSetup';
 import { Chats } from './components/Chats';
-import { ChatView } from './components/ChatView';
-import { Status } from './components/Status';
-import { Groups } from './components/Groups';
-import { GroupChatView } from './components/GroupChatView';
-import { GroupInfo } from './components/GroupInfo';
-import { CreateGroup } from './components/CreateGroup';
-import { Discover } from './components/Discover';
-import { History } from './components/History';
-import { Settings } from './components/Settings';
-import { CallModal } from './components/CallModal';
-import { ProfileView } from './components/ProfileView';
+
+// Everything below is loaded on demand instead of bundled into the initial
+// download. `Chats` (the default landing tab) and `Auth` (the logged-out
+// landing screen) stay eager above since one of them is needed on every
+// single app load anyway — splitting them out would only add a pointless
+// extra network round trip. Every other screen here (including ChatView,
+// the single largest component in the app) is only needed once the user
+// actually navigates to it, so there's no reason to make every visitor pay
+// for its weight up front.
+const ProfileSetup = lazy(() => import('./components/ProfileSetup').then((m) => ({ default: m.ProfileSetup })));
+const ChatView = lazy(() => import('./components/ChatView').then((m) => ({ default: m.ChatView })));
+const Status = lazy(() => import('./components/Status').then((m) => ({ default: m.Status })));
+const Groups = lazy(() => import('./components/Groups').then((m) => ({ default: m.Groups })));
+const GroupChatView = lazy(() => import('./components/GroupChatView').then((m) => ({ default: m.GroupChatView })));
+const GroupInfo = lazy(() => import('./components/GroupInfo').then((m) => ({ default: m.GroupInfo })));
+const CreateGroup = lazy(() => import('./components/CreateGroup').then((m) => ({ default: m.CreateGroup })));
+const Discover = lazy(() => import('./components/Discover').then((m) => ({ default: m.Discover })));
+const History = lazy(() => import('./components/History').then((m) => ({ default: m.History })));
+const Settings = lazy(() => import('./components/Settings').then((m) => ({ default: m.Settings })));
+const CallModal = lazy(() => import('./components/CallModal').then((m) => ({ default: m.CallModal })));
+const ProfileView = lazy(() => import('./components/ProfileView').then((m) => ({ default: m.ProfileView })));
 import { authService, ProfileResolution } from './services/authService';
 import { profileService } from './services/profileService';
 import {
@@ -31,6 +40,23 @@ import { realtimeClient } from './lib/realtimeClient';
 import { useAppData } from './hooks/useAppData';
 
 type AppView = 'chats' | 'status' | 'groups' | 'discover' | 'history';
+
+// Shared fallback shown for the brief moment a lazy-loaded screen's code is
+// still downloading (effectively only on its very first visit — the
+// browser caches the chunk after that). Matches the existing cold-start
+// loading screen so a lazy chunk load never looks like a different app.
+function AppLoadingScreen() {
+  return (
+    <div className="h-screen flex flex-col items-center justify-center bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50">
+      <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500 via-purple-500 to-fuchsia-500 flex items-center justify-center shadow-xl shadow-purple-500/40 animate-pulse">
+        <MessageCircle className="w-10 h-10 text-white" />
+      </div>
+      <h1 className="mt-4 text-xl font-bold bg-gradient-to-r from-violet-600 to-fuchsia-600 bg-clip-text text-transparent">
+        NChat
+      </h1>
+    </div>
+  );
+}
 
 interface CallState {
   active: boolean;
@@ -374,16 +400,7 @@ function App() {
 
   // Loading state - Static splash, no spinner
   if (loading) {
-    return (
-      <div className="h-screen flex flex-col items-center justify-center bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50">
-        <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500 via-purple-500 to-fuchsia-500 flex items-center justify-center shadow-xl shadow-purple-500/40 animate-pulse">
-          <MessageCircle className="w-10 h-10 text-white" />
-        </div>
-        <h1 className="mt-4 text-xl font-bold bg-gradient-to-r from-violet-600 to-fuchsia-600 bg-clip-text text-transparent">
-          NChat
-        </h1>
-      </div>
-    );
+    return <AppLoadingScreen />;
   }
 
   // Auth screen
@@ -417,11 +434,13 @@ function App() {
   // Profile setup screen
   if (needsProfileSetup && userId) {
     return (
-      <ProfileSetup
-        userId={userId}
-        email={userEmail}
-        onComplete={handleProfileComplete}
-      />
+      <Suspense fallback={<AppLoadingScreen />}>
+        <ProfileSetup
+          userId={userId}
+          email={userEmail}
+          onComplete={handleProfileComplete}
+        />
+      </Suspense>
     );
   }
 
@@ -626,6 +645,7 @@ function MainApp({
 
       {/* Main Content */}
       <div className="flex-1 overflow-hidden relative z-10">
+        <Suspense fallback={<AppLoadingScreen />}>
         {showSettings ? (
           <Settings
             currentUser={currentUser}
@@ -714,6 +734,7 @@ function MainApp({
             )}
           </>
         )}
+        </Suspense>
       </div>
 
       {/* Bottom Navigation */}
@@ -820,26 +841,30 @@ function MainApp({
 
       {/* Call Modal */}
       {callState.active && (
-        <CallModal
-          currentUser={currentUser}
-          calleeId={callState.calleeId}
-          callType={callState.callType}
-          incomingCall={callState.incomingCall}
-          onClose={handleCloseCall}
-        />
+        <Suspense fallback={null}>
+          <CallModal
+            currentUser={currentUser}
+            calleeId={callState.calleeId}
+            callType={callState.callType}
+            incomingCall={callState.incomingCall}
+            onClose={handleCloseCall}
+          />
+        </Suspense>
       )}
 
       {/* Profile Preview — overlays whatever screen is open */}
       {viewProfile && (
-        <ProfileView
-          currentUser={currentUser}
-          userId={viewProfile.userId}
-          initialProfile={viewProfile.initialProfile}
-          onClose={handleCloseProfileView}
-          onMessage={handleOpenChat}
-          onCall={handleCall}
-          onChanged={handleProfileRelationChanged}
-        />
+        <Suspense fallback={null}>
+          <ProfileView
+            currentUser={currentUser}
+            userId={viewProfile.userId}
+            initialProfile={viewProfile.initialProfile}
+            onClose={handleCloseProfileView}
+            onMessage={handleOpenChat}
+            onCall={handleCall}
+            onChanged={handleProfileRelationChanged}
+          />
+        </Suspense>
       )}
     </div>
   );

@@ -154,32 +154,61 @@ messages.post('/', async (c) => {
 
   const id = newId();
   const created_at = nowIso();
-  await c.env.DB.prepare(
-    `INSERT INTO messages (id, sender_id, receiver_id, content, type, media_url, thumbnail_url, file_name, file_size, duration, client_message_id, reply_to, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      id,
-      userId,
-      receiver_id,
-      content,
-      type,
-      body.media_url ?? null,
-      body.thumbnail_url ?? null,
-      body.fileName ?? null,
-      body.fileSize ?? null,
-      body.duration ?? null,
-      client_message_id ?? null,
-      body.reply_to ?? null,
-      created_at
+
+  // Every field of the row we're about to insert is already known here —
+  // there's no DB-generated column (defaults are all 0/null for a brand
+  // new message) — so build the response/broadcast payload straight from
+  // those values instead of writing the row and then reading it back out
+  // of D1 a second time. Combined with running the insert and the
+  // Durable Object broadcast concurrently (rather than one after the
+  // other) this turns what used to be three sequential D1/DO round trips
+  // into effectively one, which is what made sending a message feel slow.
+  const msg = messageJson({
+    id,
+    sender_id: userId,
+    receiver_id,
+    content,
+    type,
+    media_url: body.media_url ?? null,
+    thumbnail_url: body.thumbnail_url ?? null,
+    file_name: body.fileName ?? null,
+    file_size: body.fileSize ?? null,
+    duration: body.duration ?? null,
+    client_message_id: client_message_id ?? null,
+    reply_to: body.reply_to ?? null,
+    is_read: 0,
+    is_edited: 0,
+    edited_at: null,
+    is_deleted: 0,
+    deleted_for: null,
+    reactions: null,
+    created_at,
+  });
+
+  await Promise.all([
+    c.env.DB.prepare(
+      `INSERT INTO messages (id, sender_id, receiver_id, content, type, media_url, thumbnail_url, file_name, file_size, duration, client_message_id, reply_to, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run();
-
-  const row = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first();
-  const msg = messageJson(row);
-
-  // Fan out to both participants so any open tab/device updates live.
-  await broadcastToParticipants(c.env, userId, receiver_id, { type: 'message:new', message: msg });
+      .bind(
+        id,
+        userId,
+        receiver_id,
+        content,
+        type,
+        body.media_url ?? null,
+        body.thumbnail_url ?? null,
+        body.fileName ?? null,
+        body.fileSize ?? null,
+        body.duration ?? null,
+        client_message_id ?? null,
+        body.reply_to ?? null,
+        created_at
+      )
+      .run(),
+    // Fan out to both participants so any open tab/device updates live.
+    broadcastToParticipants(c.env, userId, receiver_id, { type: 'message:new', message: msg }),
+  ]);
 
   return c.json({ message: msg }, 201);
 });
@@ -188,11 +217,8 @@ messages.patch('/:id', async (c) => {
   const userId = c.get('userId');
   const id = c.req.param('id');
   const { content } = await c.req.json().catch(() => ({}));
-  const row = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ? AND sender_id = ?').bind(id, userId).first<{
-    receiver_id: string;
-    created_at: string;
-    type: string;
-  }>();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const row = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ? AND sender_id = ?').bind(id, userId).first<any>();
   if (!row) return c.json({ error: 'Message not found' }, 404);
   if (row.type !== 'text') return c.json({ error: 'Only text messages can be edited' }, 400);
 
@@ -201,14 +227,20 @@ messages.patch('/:id', async (c) => {
     return c.json({ error: 'Messages can only be edited within 15 minutes' }, 400);
   }
 
-  await c.env.DB.prepare(
-    "UPDATE messages SET content = ?, is_edited = 1, edited_at = datetime('now') WHERE id = ?"
-  )
-    .bind(content, id)
-    .run();
-  const updated = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first();
-  await broadcastToParticipants(c.env, userId, row.receiver_id, { type: 'message:edit', message: messageJson(updated) });
-  return c.json({ message: messageJson(updated) });
+  // `row` already has every column (it was a `SELECT *`), so the updated
+  // row can be built in memory instead of writing then reading it back a
+  // second time, and the write + broadcast can run concurrently instead
+  // of one after the other — same latency win as sending a new message.
+  const edited_at = nowIso();
+  const updatedMsg = messageJson({ ...row, content, is_edited: 1, edited_at });
+
+  await Promise.all([
+    c.env.DB.prepare("UPDATE messages SET content = ?, is_edited = 1, edited_at = ? WHERE id = ?")
+      .bind(content, edited_at, id)
+      .run(),
+    broadcastToParticipants(c.env, userId, row.receiver_id, { type: 'message:edit', message: updatedMsg }),
+  ]);
+  return c.json({ message: updatedMsg });
 });
 
 // DELETE /messages/:id — delete for everyone (sender only)

@@ -12,6 +12,7 @@ import callRoutes from './routes/calls';
 import statusRoutes from './routes/status';
 import mediaRoutes from './routes/media';
 import privacyRoutes from './routes/privacy';
+import adminRoutes from './routes/admin';
 
 export { RealtimeRoom } from './durable-objects/RealtimeRoom';
 
@@ -38,6 +39,7 @@ app.route('/calls', callRoutes);
 app.route('/status', statusRoutes);
 app.route('/media', mediaRoutes);
 app.route('/privacy', privacyRoutes);
+app.route('/admin', adminRoutes);
 
 // WebSocket entry point: GET /realtime/connect?room=<roomId>&token=<jwt>
 // Browsers can't send an Authorization header on a WS upgrade, so the access

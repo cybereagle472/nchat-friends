@@ -344,27 +344,49 @@ groups.post('/:id/messages', async (c) => {
 
   const id = newId();
   const created_at = nowIso();
-  await c.env.DB.prepare(
-    `INSERT INTO group_messages (id, group_id, sender_id, content, type, media_url, thumbnail_url, client_message_id, reply_to, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      id,
-      groupId,
-      userId,
-      body.content ?? '',
-      body.type ?? 'text',
-      body.media_url ?? null,
-      body.thumbnail_url ?? null,
-      body.client_message_id ?? null,
-      body.reply_to ?? null,
-      created_at
-    )
-    .run();
 
-  const row = await c.env.DB.prepare('SELECT * FROM group_messages WHERE id = ?').bind(id).first();
-  const msg = groupMessageJson(row);
-  await broadcastToGroup(c.env, groupId, { type: 'group-message:new', message: msg });
+  // Same latency fix as the 1:1 send route: every field is already known,
+  // so skip the write-then-read-back round trip and run the insert and
+  // the broadcast concurrently instead of sequentially.
+  const msg = groupMessageJson({
+    id,
+    group_id: groupId,
+    sender_id: userId,
+    content: body.content ?? '',
+    type: body.type ?? 'text',
+    media_url: body.media_url ?? null,
+    thumbnail_url: body.thumbnail_url ?? null,
+    client_message_id: body.client_message_id ?? null,
+    reply_to: body.reply_to ?? null,
+    is_edited: 0,
+    edited_at: null,
+    is_deleted: 0,
+    deleted_for: null,
+    reactions: null,
+    created_at,
+  });
+
+  await Promise.all([
+    c.env.DB.prepare(
+      `INSERT INTO group_messages (id, group_id, sender_id, content, type, media_url, thumbnail_url, client_message_id, reply_to, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        id,
+        groupId,
+        userId,
+        body.content ?? '',
+        body.type ?? 'text',
+        body.media_url ?? null,
+        body.thumbnail_url ?? null,
+        body.client_message_id ?? null,
+        body.reply_to ?? null,
+        created_at
+      )
+      .run(),
+    broadcastToGroup(c.env, groupId, { type: 'group-message:new', message: msg }),
+  ]);
+
   return c.json({ message: msg }, 201);
 });
 

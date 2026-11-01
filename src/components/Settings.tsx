@@ -28,7 +28,7 @@ import { profileService } from '../services/profileService';
 import { privacyService, PrivacySettings, PrivacyOption } from '../services/privacyService';
 import { friendService } from '../services/friendService';
 import { mediaService } from '../services/mediaService';
-import { supabase } from '../supabaseClient';
+import { apiFetch } from '../lib/apiClient';
 import { ImageCropper } from './ImageCropper';
 
 interface SettingsProps {
@@ -127,28 +127,18 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
     if (section === 'admin' && isAdmin(currentUser.email)) {
       const loadStats = async () => {
         try {
-          const { count: usersCount } = await supabase
-            .from('profiles')
-            .select('*', { count: 'exact', head: true });
-
-          const { count: onlineCount } = await supabase
-            .from('profiles')
-            .select('*', { count: 'exact', head: true })
-            .eq('is_online', true);
-
-          const { count: messagesCount } = await supabase
-            .from('messages')
-            .select('*', { count: 'exact', head: true });
-
-          const { count: groupsCount } = await supabase
-            .from('groups')
-            .select('*', { count: 'exact', head: true });
+          const stats = await apiFetch<{
+            totalUsers: number;
+            onlineUsers: number;
+            totalMessages: number;
+            totalGroups: number;
+          }>('/admin/stats');
 
           setAdminStats({
-            totalUsers: usersCount || 0,
-            onlineUsers: onlineCount || 0,
-            totalMessages: messagesCount || 0,
-            totalGroups: groupsCount || 0,
+            totalUsers: stats.totalUsers || 0,
+            onlineUsers: stats.onlineUsers || 0,
+            totalMessages: stats.totalMessages || 0,
+            totalGroups: stats.totalGroups || 0,
             loadingStats: false
           });
         } catch (error) {
