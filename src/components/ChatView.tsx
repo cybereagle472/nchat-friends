@@ -245,13 +245,23 @@ interface VoiceMessageBubbleProps {
   // whatever *other* voice message is currently playing — the only thing
   // that genuinely needs to be coordinated across bubbles.
   onRequestExclusivePlayback: (messageId: string) => void;
+  // True for the entire time a voice *recording* is in progress (from the
+  // moment the mic button is touched until it's sent/cancelled) — not just
+  // at the instant it starts. Pausing other playback once, at record-start,
+  // isn't enough: a locked/hands-free recording can run for a long time
+  // afterward, and tapping play on any voice message during that window
+  // would otherwise start audibly playing again straight into the live
+  // microphone. A ref (not state) so checking/flipping it never triggers a
+  // re-render of every voice bubble in the chat.
+  isRecordingActiveRef: { current: boolean };
 }
 
 const VoiceMessageBubble = memo(function VoiceMessageBubble({
   message,
   isOwn,
   audioRefs,
-  onRequestExclusivePlayback
+  onRequestExclusivePlayback,
+  isRecordingActiveRef
 }: VoiceMessageBubbleProps) {
   const [waveformData, setWaveformData] = useState<number[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -336,11 +346,16 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
   useEffect(() => {
     if (!audioRefs.current[message.id]) {
       const audioEl = new Audio(audioUrl);
-      // Don't eagerly fetch anything just because the bubble scrolled into
-      // view — every voice message in the chat mounts one of these. We
-      // already have message.duration to show before first play, so there's
-      // nothing to gain from preloading, only bandwidth to waste.
-      audioEl.preload = 'none';
+      // 'metadata' (not 'none'): fetch just the header info (duration,
+      // codec) as soon as the bubble mounts, not the full audio payload.
+      // With 'none', the very first tap on play had to do a cold-start
+      // connection *and* fetch metadata *and* buffer enough to play, all
+      // back to back — which is exactly why the waveform sat frozen for a
+      // few seconds before catching up. Pre-fetching just the lightweight
+      // metadata while the user is already sitting in the chat (not
+      // waiting on it) means duration/seekability are normally already
+      // known by the time they actually tap play.
+      audioEl.preload = 'metadata';
       audioRefs.current[message.id] = audioEl;
     }
     const audio = audioRefs.current[message.id];
@@ -348,7 +363,41 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     const onPlay = () => setIsPlaying(true);
     const onPause = () => setIsPlaying(false);
     const onEnded = () => setIsPlaying(false);
+
+    // Voice notes are recorded as MediaRecorder webm/opus blobs, which have
+    // a well-known browser quirk: audio.duration reports Infinity until the
+    // player has actually seeked through the file once, because the
+    // container doesn't store an upfront duration. Left alone, that
+    // Infinity flows into the UI as a literal "Infinity:NaN" (Infinity/60 is
+    // Infinity, but Infinity%60 is NaN). The standard fix: force a seek to
+    // a huge out-of-range time, which makes the browser scan to the real
+    // end of the data and recompute a correct, finite duration, then snap
+    // back to where playback actually was.
+    let fixingInfiniteDuration = false;
+    const fixInfiniteDuration = () => {
+      if (fixingInfiniteDuration || isFinite(audio.duration)) return;
+      fixingInfiniteDuration = true;
+      const resumeAt = audio.currentTime;
+      const onFixed = () => {
+        audio.removeEventListener('timeupdate', onFixed);
+        audio.currentTime = resumeAt;
+        fixingInfiniteDuration = false;
+        if (isFinite(audio.duration)) setDuration(audio.duration);
+      };
+      audio.addEventListener('timeupdate', onFixed);
+      audio.currentTime = 1e101;
+    };
+
     const syncCheckpoint = () => {
+      // While the forced end-seek above is in flight, audio.currentTime is
+      // sitting near the very end of the clip on purpose — skip painting
+      // from it so the waveform doesn't flash to "finished" for a frame
+      // before snapping back to where playback really is.
+      if (fixingInfiniteDuration) return;
+      if (!isFinite(audio.duration)) {
+        fixInfiniteDuration();
+        return;
+      }
       if (audio.duration) {
         const ratio = audio.currentTime / audio.duration;
         setPlaybackProgress(ratio);
@@ -368,6 +417,7 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     // (i.e. whenever this message isn't the one currently playing).
     audio.addEventListener('timeupdate', syncCheckpoint);
     audio.addEventListener('loadedmetadata', syncCheckpoint);
+    audio.addEventListener('durationchange', syncCheckpoint);
 
     // Sync immediately in case the element already existed with state this
     // fresh instance doesn't know about yet (e.g. it's already playing).
@@ -380,6 +430,7 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
       audio.removeEventListener('ended', onEnded);
       audio.removeEventListener('timeupdate', syncCheckpoint);
       audio.removeEventListener('loadedmetadata', syncCheckpoint);
+      audio.removeEventListener('durationchange', syncCheckpoint);
     };
   }, [message.id, audioUrl, audioRefs, paintProgress]);
 
@@ -420,7 +471,14 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
   }, [playbackProgress, dragRatio, paintProgress]);
 
   const formatAudioTime = (seconds: number) => {
-    if (!seconds || isNaN(seconds)) return '0:00';
+    // isNaN(Infinity) is false and !Infinity is false too, so neither half
+    // of the old check caught it — Infinity/60 is Infinity and Infinity%60
+    // is NaN, which rendered as the literal text "Infinity:NaN". That could
+    // show up any time audio.duration hadn't resolved yet (see the
+    // MediaRecorder Infinity-duration workaround above), so guard
+    // explicitly against non-finite values here too as a last line of
+    // defense regardless of where a bad value might come from.
+    if (!seconds || !isFinite(seconds)) return '0:00';
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, '0')}`;
@@ -461,7 +519,11 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
       audio.addEventListener('loadedmetadata', applySeek, { once: true });
     }
 
-    if (audio.paused) {
+    // Repositioning (above) is silent and fine to allow even mid-recording,
+    // but never start audibly playing while the mic is live — see
+    // isRecordingActiveRef's doc comment for why pausing once at record-
+    // start isn't enough on its own.
+    if (audio.paused && !isRecordingActiveRef.current) {
       onRequestExclusivePlayback(message.id);
       audio.play().catch(() => {});
     }
@@ -498,6 +560,10 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     const audio = audioRefs.current[message.id];
     if (!audio) return;
     if (audio.paused) {
+      // Never start playing a voice message while a recording is in
+      // progress — its own speaker output would get captured straight
+      // back into the microphone (see isRecordingActiveRef above).
+      if (isRecordingActiveRef.current) return;
       onRequestExclusivePlayback(message.id);
       audio.play().catch(() => {});
     } else {
@@ -779,6 +845,12 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
   // every voice message was being saved/shown as 0:01 no matter how long
   // it was actually held for.
   const durationRef = useRef(0);
+
+  // True for the entire span of an in-progress recording (including while
+  // locked/hands-free), so voice message playback can be blocked the whole
+  // time, not just paused once at the moment recording starts. See the
+  // VoiceMessageBubbleProps doc comment for the full story.
+  const isRecordingActiveRef = useRef(false);
 
   // Snapshot of the duration/waveform at the moment recording stops — the
   // MediaRecorder's onstop callback fires asynchronously afterward, by which
@@ -1425,6 +1497,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     } catch (error) {
       console.error('Error starting recording:', error);
       alert('Could not access microphone. Please allow microphone access and try again.');
+      // Recording never actually started (mic permission denied/unavailable)
+      // — undo the block on voice message playback set in
+      // handleVoiceButtonTouchStart, or every voice message would be stuck
+      // unplayable for the rest of the session.
+      isRecordingActiveRef.current = false;
       setVoiceState({
         isRecording: false,
         isPaused: false,
@@ -1441,6 +1518,10 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
 
   const stopRecording = (cancel: boolean = false) => {
     console.log('Stopping recording, cancel:', cancel);
+
+    // Recording is over either way (sent or cancelled) — voice messages
+    // are safe to play again from this point on.
+    isRecordingActiveRef.current = false;
 
     // Tell the contact recording has ended, whether it's being sent or
     // cancelled — their "recording audio..." indicator shouldn't outlive
@@ -1669,8 +1750,14 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
     // touches the mic button — before even asking for microphone
     // permission, which can itself take a moment. Otherwise the speaker is
     // still audibly playing while the mic opens, and gets picked right back
-    // up into the new recording.
+    // up into the new recording. Also block *starting* any voice message
+    // for the rest of the recording (handled in VoiceMessageBubble via
+    // isRecordingActiveRef) — pausing once here isn't enough on its own
+    // because a locked/hands-free recording can run for a long time after
+    // this, and tapping play during that window would otherwise start
+    // playing straight into the live mic again.
     pauseAllVoiceMessages();
+    isRecordingActiveRef.current = true;
     const isTouch = 'touches' in e;
     const clientX = isTouch ? e.touches[0].clientX : e.clientX;
     startXRef.current = clientX;
@@ -1797,6 +1884,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser }: 
             isOwn={isOwn}
             audioRefs={audioRefs}
             onRequestExclusivePlayback={pauseOtherVoiceMessages}
+            isRecordingActiveRef={isRecordingActiveRef}
           />
         );
       case 'gif':
