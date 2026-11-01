@@ -4,6 +4,7 @@ import { requireAuth } from '../middleware/auth';
 import { newId } from '../lib/id';
 import { broadcastToUser } from '../lib/realtime';
 import { getPresence, getPresenceMap, withPresence } from '../lib/presence';
+import { applyPrivacy, applyPrivacyToList, getPrivacySettings } from '../lib/privacy';
 
 const friends = new Hono<{ Bindings: Env; Variables: Variables }>();
 friends.use('*', requireAuth);
@@ -56,6 +57,9 @@ friends.post('/request', async (c) => {
 
   const sender = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
   const senderLastActiveAt = await getPresence(c.env, userId);
+  // You aren't friends yet at request time, so the sender's privacy
+  // settings (e.g. "last seen: contacts only") correctly apply here.
+  const senderSettings = await getPrivacySettings(c.env, userId);
   await broadcastToUser(c.env, receiver_id, {
     type: 'friend:request',
     request: {
@@ -63,7 +67,9 @@ friends.post('/request', async (c) => {
       sender_id: userId,
       receiver_id,
       status: 'pending',
-      sender_profile: sender ? profilePublic(sender, senderLastActiveAt) : undefined,
+      sender_profile: sender
+        ? applyPrivacy(profilePublic(sender, senderLastActiveAt), receiver_id, senderSettings, false)
+        : undefined,
     },
   });
 
@@ -94,9 +100,14 @@ friends.post('/:id/respond', async (c) => {
 
     const accepter = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
     const accepterLastActiveAt = await getPresence(c.env, userId);
+    const accepterSettings = await getPrivacySettings(c.env, userId);
     await broadcastToUser(c.env, req.sender_id, {
       type: 'friend:accepted',
-      friend: accepter ? profilePublic(accepter, accepterLastActiveAt) : { id: userId },
+      // They just became friends (inserted above), so the "contacts"
+      // visibility tier already applies.
+      friend: accepter
+        ? applyPrivacy(profilePublic(accepter, accepterLastActiveAt), req.sender_id, accepterSettings, true)
+        : { id: userId },
     });
   } else {
     await c.env.DB.prepare("UPDATE friend_requests SET status = 'rejected', updated_at = datetime('now') WHERE id = ?")
@@ -128,24 +139,24 @@ friends.get('/requests', async (c) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const rows = (results ?? []) as any[];
   const presenceMap = await getPresenceMap(c.env, rows.map((r) => r.u_id));
-  const requests = rows.map((r) => ({
+  const senderProfiles = await applyPrivacyToList(
+    c.env,
+    userId,
+    rows.map((r) =>
+      profilePublic(
+        { id: r.u_id, full_name: r.full_name, username: r.username, avatar_url: r.avatar_url, email: r.email, bio: r.bio },
+        presenceMap.get(r.u_id)
+      )
+    )
+  );
+  const requests = rows.map((r, i) => ({
     id: r.id,
     sender_id: r.sender_id,
     receiver_id: r.receiver_id,
     status: r.status,
     created_at: r.created_at,
     updated_at: r.updated_at,
-    sender_profile: profilePublic(
-      {
-        id: r.u_id,
-        full_name: r.full_name,
-        username: r.username,
-        avatar_url: r.avatar_url,
-        email: r.email,
-        bio: r.bio,
-      },
-      presenceMap.get(r.u_id)
-    ),
+    sender_profile: senderProfiles[i],
   }));
   return c.json({ requests });
 });
@@ -177,7 +188,8 @@ friends.get('/', async (c) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const rows = (results ?? []) as any[];
   const presenceMap = await getPresenceMap(c.env, rows.map((r) => r.id));
-  const friendsList = rows.map((r) => ({ id: r.id, profile: profilePublic(r, presenceMap.get(r.id)) }));
+  const profiles = await applyPrivacyToList(c.env, userId, rows.map((r) => profilePublic(r, presenceMap.get(r.id))));
+  const friendsList = rows.map((r, i) => ({ id: r.id, profile: profiles[i] }));
   return c.json({ friends: friendsList });
 });
 
@@ -239,7 +251,9 @@ friends.get('/blocked', async (c) => {
   )
     .bind(userId)
     .all();
-  return c.json({ blocked: (results ?? []).map((r) => profilePublic(r)) });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const blockedProfiles = await applyPrivacyToList(c.env, userId, ((results ?? []) as any[]).map((r) => profilePublic(r)));
+  return c.json({ blocked: blockedProfiles });
 });
 
 export default friends;

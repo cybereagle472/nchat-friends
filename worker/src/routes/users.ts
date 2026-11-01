@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Env, Variables } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { computeIsOnline, getPresence, getPresenceMap } from '../lib/presence';
+import { applyPrivacy, applyPrivacyToList, areFriends, getPrivacySettings } from '../lib/privacy';
 
 const users = new Hono<{ Bindings: Env; Variables: Variables }>();
 users.use('*', requireAuth);
@@ -79,11 +80,20 @@ users.get('/username-available', async (c) => {
 });
 
 users.get('/:id', async (c) => {
+  const viewerId = c.get('userId');
   const id = c.req.param('id');
   const row = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(id).first();
   if (!row) return c.json({ error: 'Not found' }, 404);
   const lastActiveAt = await getPresence(c.env, id);
-  return c.json({ profile: profilePublic(row, lastActiveAt) });
+  let profile = profilePublic(row, lastActiveAt);
+  if (id !== viewerId) {
+    const [settings, isFriend] = await Promise.all([
+      getPrivacySettings(c.env, id),
+      areFriends(c.env, viewerId, id),
+    ]);
+    profile = applyPrivacy(profile, viewerId, settings, isFriend);
+  }
+  return c.json({ profile });
 });
 
 // All profiles except me + blocked users — used for Discover "suggestions".
@@ -102,7 +112,8 @@ users.get('/', async (c) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const rows = (results ?? []) as any[];
   const presenceMap = await getPresenceMap(c.env, rows.map((r) => r.id));
-  return c.json({ profiles: rows.map((r) => profilePublic(r, presenceMap.get(r.id))) });
+  const profiles = await applyPrivacyToList(c.env, userId, rows.map((r) => profilePublic(r, presenceMap.get(r.id))));
+  return c.json({ profiles });
 });
 
 users.post('/presence', async (c) => {

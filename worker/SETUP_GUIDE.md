@@ -275,6 +275,7 @@ npm install                    # once
 npx wrangler login              # once
 npx wrangler d1 create nchat-db # once — then paste id into wrangler.toml
 npm run db:migrate:remote       # once (re-run if you add new migrations later)
+npm run db:migrate:remote:0002  # once, only if your DB predates the Privacy Settings columns
 npx wrangler r2 bucket create nchat-media   # once
 npx wrangler secret put JWT_SECRET          # once
 npm run deploy                  # every time you change worker/src/**

@@ -147,6 +147,15 @@ Pushing this commit automatically triggers a new deploy on Cloudflare
    You should get back `users`, `messages`, `groups`, `friend_requests`,
    `calls`, `statuses`, etc. (21 tables total).
 
+7. If you already ran `0001_init.sql` before (i.e. this isn't a brand new
+   database), also open `worker/migrations/0002_privacy_extra.sql` on
+   GitHub the same way, copy it, paste it into the same Console box, and
+   tap **Run**. It just adds two columns the Privacy Settings screen
+   needs (`about_visibility`, `online_status_enabled`) — safe to run even
+   if you're not sure whether it's already applied, since a second
+   `0001_init.sql` run would fail anyway (tables already exist) so you'd
+   know you're on a fresh database if Step 6 above is the first time.
+
 ---
 
 ## Step 8 — Verify the bindings landed

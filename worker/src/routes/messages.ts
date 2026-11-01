@@ -4,6 +4,7 @@ import { requireAuth } from '../middleware/auth';
 import { newId, nowIso } from '../lib/id';
 import { broadcastToUser } from '../lib/realtime';
 import { getPresenceMap, withPresence } from '../lib/presence';
+import { applyPrivacyToList, getPrivacySettings } from '../lib/privacy';
 
 const messages = new Hono<{ Bindings: Env; Variables: Variables }>();
 messages.use('*', requireAuth);
@@ -63,9 +64,15 @@ messages.get('/with/:otherId', async (c) => {
     .bind(...binds)
     .all();
 
+  // If the other person has turned off read receipts, don't show them that
+  // *you've* read their messages, as one-directional as the Settings
+  // screen describes it ("Show when you've read messages").
+  const otherSettings = await getPrivacySettings(c.env, otherId);
+
   const msgs = (results ?? [])
     .map(messageJson)
     .filter((m) => !(m.deleted_for ?? []).includes(userId))
+    .map((m) => (m.sender_id === userId && !otherSettings.read_receipts ? { ...m, is_read: false } : m))
     .reverse();
 
   return c.json({ messages: msgs });
@@ -86,7 +93,18 @@ messages.get('/chats', async (c) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const rows = (friendRows ?? []) as any[];
   const presenceMap = await getPresenceMap(c.env, rows.map((u) => u.id));
-  for (const u of rows) {
+  const profiles = await applyPrivacyToList(
+    c.env,
+    userId,
+    rows.map((u) =>
+      withPresence(
+        { id: u.id, full_name: u.full_name, username: u.username, avatar_url: u.avatar_url, email: u.email },
+        presenceMap.get(u.id)
+      )
+    )
+  );
+  for (let i = 0; i < rows.length; i++) {
+    const u = rows[i];
     const last = await c.env.DB.prepare(
       `SELECT * FROM messages WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
        ORDER BY created_at DESC LIMIT 1`
@@ -98,14 +116,16 @@ messages.get('/chats', async (c) => {
     )
       .bind(u.id, userId)
       .first<{ n: number }>();
+    let lastMessage = last ? messageJson(last) : undefined;
+    if (lastMessage && lastMessage.sender_id === userId && lastMessage.is_read) {
+      const theirSettings = await getPrivacySettings(c.env, u.id);
+      if (!theirSettings.read_receipts) lastMessage = { ...lastMessage, is_read: false };
+    }
     chats.push({
       user_id: u.id,
       status: 'accepted',
-      profile: withPresence(
-        { id: u.id, full_name: u.full_name, username: u.username, avatar_url: u.avatar_url, email: u.email },
-        presenceMap.get(u.id)
-      ),
-      lastMessage: last ? messageJson(last) : undefined,
+      profile: profiles[i],
+      lastMessage,
       unreadCount: unread?.n ?? 0,
     });
   }
@@ -271,8 +291,14 @@ messages.post('/mark-read', async (c) => {
     await c.env.DB.prepare('UPDATE messages SET is_read = 1 WHERE sender_id = ? AND receiver_id = ?')
       .bind(sender_id, userId)
       .run();
-    // Let the sender's open chat / device know their messages were read.
-    await broadcastToUser(c.env, sender_id, { type: 'message:read', reader_id: userId, message_ids: messageIds });
+    // The reader's (userId's) own Read Receipts setting controls whether the
+    // sender gets told their messages were read — same rule enforced for
+    // the regular history fetch in GET /with/:otherId.
+    const readerSettings = await getPrivacySettings(c.env, userId);
+    if (readerSettings.read_receipts) {
+      // Let the sender's open chat / device know their messages were read.
+      await broadcastToUser(c.env, sender_id, { type: 'message:read', reader_id: userId, message_ids: messageIds });
+    }
   }
 
   return c.json({ success: true });

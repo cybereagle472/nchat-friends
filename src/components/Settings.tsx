@@ -92,9 +92,11 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
   // Load privacy settings
   useEffect(() => {
     const loadPrivacy = async () => {
-      const result = await privacyService.getSettings(currentUser.id);
+      const result = await privacyService.getSettings();
       if (result.success && result.data) {
         setPrivacySettings(result.data);
+      } else {
+        toast.error('Could not load privacy settings.');
       }
     };
     loadPrivacy();
@@ -253,10 +255,16 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
   const handlePrivacyChange = async (key: keyof PrivacySettings, value: PrivacyOption | boolean) => {
     if (!privacySettings) return;
 
+    const previous = privacySettings;
     const updated = { ...privacySettings, [key]: value };
     setPrivacySettings(updated);
 
-    await privacyService.updateSettings(currentUser.id, { [key]: value });
+    const result = await privacyService.updateSettings({ [key]: value });
+    if (!result.success) {
+      // Roll back so the toggle doesn't show a setting that didn't actually save.
+      setPrivacySettings(previous);
+      toast.error('Could not update privacy setting. Please try again.');
+    }
   };
 
   const handleLogout = async () => {
