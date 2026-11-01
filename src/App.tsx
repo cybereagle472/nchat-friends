@@ -3,24 +3,24 @@ import { Toaster, toast } from 'sonner';
 import { MessageCircle, Circle, UsersRound, Compass, Clock } from 'lucide-react';
 import { Auth } from './components/Auth';
 import { Chats } from './components/Chats';
+import { ChatView } from './components/ChatView';
+import { Status } from './components/Status';
+import { Groups } from './components/Groups';
+import { Discover } from './components/Discover';
+import { History } from './components/History';
 
-// Everything below is loaded on demand instead of bundled into the initial
-// download. `Chats` (the default landing tab) and `Auth` (the logged-out
-// landing screen) stay eager above since one of them is needed on every
-// single app load anyway — splitting them out would only add a pointless
-// extra network round trip. Every other screen here (including ChatView,
-// the single largest component in the app) is only needed once the user
-// actually navigates to it, so there's no reason to make every visitor pay
-// for its weight up front.
+// These stay eager (bundled into the initial download) because they're the
+// app's main surfaces — the five bottom-tab screens plus opening a chat —
+// and switching between them has to be instant with zero loading state,
+// the same way WhatsApp's own tabs never show a spinner. Everything below
+// is reached one tap deeper (Settings, a group, creating a group, a call,
+// a profile preview, first-time onboarding) and is loaded on demand
+// instead, then aggressively prefetched in the background right after
+// login so it's normally already cached by the time it's actually opened.
 const ProfileSetup = lazy(() => import('./components/ProfileSetup').then((m) => ({ default: m.ProfileSetup })));
-const ChatView = lazy(() => import('./components/ChatView').then((m) => ({ default: m.ChatView })));
-const Status = lazy(() => import('./components/Status').then((m) => ({ default: m.Status })));
-const Groups = lazy(() => import('./components/Groups').then((m) => ({ default: m.Groups })));
 const GroupChatView = lazy(() => import('./components/GroupChatView').then((m) => ({ default: m.GroupChatView })));
 const GroupInfo = lazy(() => import('./components/GroupInfo').then((m) => ({ default: m.GroupInfo })));
 const CreateGroup = lazy(() => import('./components/CreateGroup').then((m) => ({ default: m.CreateGroup })));
-const Discover = lazy(() => import('./components/Discover').then((m) => ({ default: m.Discover })));
-const History = lazy(() => import('./components/History').then((m) => ({ default: m.History })));
 const Settings = lazy(() => import('./components/Settings').then((m) => ({ default: m.Settings })));
 const CallModal = lazy(() => import('./components/CallModal').then((m) => ({ default: m.CallModal })));
 const ProfileView = lazy(() => import('./components/ProfileView').then((m) => ({ default: m.ProfileView })));
@@ -58,37 +58,19 @@ function AppLoadingScreen() {
   );
 }
 
-// Fallback for switching between already-open-app screens (tabs, a chat, a
-// group, settings, ...). Deliberately small and un-branded — it sits inside
-// the existing app chrome (bottom nav stays put) instead of replacing the
-// whole screen with the splash logo, so a brief chunk load reads as "this
-// is loading" rather than "the app just restarted".
-function InlineLoadingSpinner() {
-  return (
-    <div className="h-full flex items-center justify-center">
-      <div className="w-8 h-8 rounded-full border-2 border-violet-200 border-t-violet-500 animate-spin" />
-    </div>
-  );
-}
-
-// Every screen that's code-split below this point only pays its network
-// cost the first time its chunk is actually requested. Kicking all of them
-// off in the background (once, right after the authenticated app shell has
-// had a chance to render) means that by the time someone taps a tab or
-// opens a chat, the code is already sitting in the browser's cache — so in
-// practice the loading fallback above almost never gets a chance to show.
+// The handful of screens still loaded on demand (one tap deeper than the
+// main tabs/chat) are fetched immediately — not waiting on idle time — the
+// instant the authenticated app shell mounts, so they're already sitting in
+// the browser's cache well before a user could physically read the screen
+// and tap into one of them. That's what lets their <Suspense> fallback stay
+// `null`: with this head start it practically never has anything to show.
 let prefetchedAppScreens = false;
 function prefetchAppScreens() {
   if (prefetchedAppScreens) return;
   prefetchedAppScreens = true;
-  void import('./components/ChatView');
-  void import('./components/Status');
-  void import('./components/Groups');
   void import('./components/GroupChatView');
   void import('./components/GroupInfo');
   void import('./components/CreateGroup');
-  void import('./components/Discover');
-  void import('./components/History');
   void import('./components/Settings');
   void import('./components/CallModal');
   void import('./components/ProfileView');
@@ -434,22 +416,12 @@ function App() {
     setCurrentUser(profile);
   }, []);
 
-  // Warm the other screens' code in the background once the user is in the
-  // app, so switching tabs/opening a chat later doesn't have to wait on a
-  // network fetch. Scheduled on idle time (with a short-timeout fallback
-  // for browsers without requestIdleCallback) so it never competes with the
-  // Chats list's own first paint/data load.
+  // Warm the remaining on-demand screens' code the moment the user is in
+  // the app — not waiting on idle time — so they're already cached well
+  // before anyone could realistically tap into one of them.
   useEffect(() => {
     if (!isAuthenticated || !currentUser) return;
-    const idle = (window as any).requestIdleCallback as
-      | ((cb: () => void) => number)
-      | undefined;
-    if (idle) {
-      const handle = idle(prefetchAppScreens);
-      return () => (window as any).cancelIdleCallback?.(handle);
-    }
-    const timer = setTimeout(prefetchAppScreens, 1500);
-    return () => clearTimeout(timer);
+    prefetchAppScreens();
   }, [isAuthenticated, currentUser]);
 
   // Loading state - Static splash, no spinner
@@ -699,7 +671,7 @@ function MainApp({
 
       {/* Main Content */}
       <div className="flex-1 overflow-hidden relative z-10">
-        <Suspense fallback={<InlineLoadingSpinner />}>
+        <Suspense fallback={null}>
         {showSettings ? (
           <Settings
             currentUser={currentUser}
