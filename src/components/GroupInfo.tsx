@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ArrowLeft,
   Camera,
@@ -42,6 +43,7 @@ export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDele
   const [savingDetails, setSavingDetails] = useState(false);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const [openMemberMenu, setOpenMemberMenu] = useState<string | null>(null);
+  const [memberMenuAnchor, setMemberMenuAnchor] = useState<{ top: number; right: number } | null>(null);
   const [busyMemberId, setBusyMemberId] = useState<string | null>(null);
   const [leaving, setLeaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -51,8 +53,18 @@ export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDele
 
   const myMembership = group.members.find((m) => m.user_id === currentUser.id);
   const isAdmin = myMembership?.role === 'admin';
-  const isMuted = !!myMembership?.is_muted;
+  const serverIsMuted = !!myMembership?.is_muted;
   const adminCount = group.members.filter((m) => m.role === 'admin').length;
+
+  // The mute toggle flips instantly on tap instead of waiting on the
+  // toggle request + the follow-up group refresh to round-trip (that
+  // combined wait is what made it feel laggy). Local state leads; it's
+  // kept in sync with the server value whenever a fresh one arrives, and
+  // rolled back if the toggle request itself fails.
+  const [isMuted, setIsMuted] = useState(serverIsMuted);
+  useEffect(() => {
+    setIsMuted(serverIsMuted);
+  }, [serverIsMuted]);
 
   const handleAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -97,11 +109,13 @@ export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDele
 
   const handleToggleMute = async () => {
     const next = !isMuted;
+    setIsMuted(next); // optimistic — flips immediately, no waiting on the network
     const result = await groupService.toggleMute(group.id, currentUser.id, next);
     if (result.success) {
       toast.success(next ? 'Group muted' : 'Group unmuted');
       onChanged();
     } else {
+      setIsMuted(!next); // revert
       toast.error(result.error || 'Failed to update mute setting');
     }
   };
@@ -155,6 +169,45 @@ export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDele
     } finally {
       setBusyMemberId(null);
     }
+  };
+
+  const handleOpenMemberMenu = (e: React.MouseEvent<HTMLButtonElement>, memberId: string) => {
+    if (openMemberMenu === memberId) {
+      setOpenMemberMenu(null);
+      setMemberMenuAnchor(null);
+      return;
+    }
+    const rect = e.currentTarget.getBoundingClientRect();
+    setMemberMenuAnchor({ top: rect.bottom, right: window.innerWidth - rect.right });
+    setOpenMemberMenu(memberId);
+  };
+
+  const closeMemberMenu = () => {
+    setOpenMemberMenu(null);
+    setMemberMenuAnchor(null);
+  };
+
+  // Keeps the menu fully on-screen regardless of where the button that
+  // opened it happens to sit (rendering it through a portal, anchored by
+  // viewport coordinates captured at open time, sidesteps any ancestor
+  // overflow/transform/stacking-context quirks entirely).
+  const getMemberMenuStyle = (): React.CSSProperties => {
+    const menuWidth = 176; // w-44
+    const margin = 8;
+    let top = memberMenuAnchor?.top ?? 0;
+    let right = memberMenuAnchor?.right ?? 0;
+
+    if (right + menuWidth > window.innerWidth - margin) {
+      right = window.innerWidth - menuWidth - margin;
+    }
+    if (right < margin) right = margin;
+
+    const estimatedHeight = 120;
+    if (top + estimatedHeight > window.innerHeight - margin) {
+      top = window.innerHeight - estimatedHeight - margin;
+    }
+
+    return { position: 'fixed', top, right, width: menuWidth, zIndex: 9999 };
   };
 
   const handleLeaveGroup = async () => {
@@ -479,51 +532,63 @@ export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDele
               )}
 
               {isAdmin && !isSelf && (
-                <div className="relative flex-shrink-0">
-                  <button
-                    onClick={() => setOpenMemberMenu(openMemberMenu === member.user_id ? null : member.user_id)}
-                    disabled={busyMemberId === member.user_id}
-                    className="p-1.5 rounded-lg hover:bg-slate-100 disabled:opacity-50"
-                  >
-                    <MoreVertical className="w-4 h-4 text-slate-400" />
-                  </button>
-                  {openMemberMenu === member.user_id && (
-                    <>
-                      <div className="fixed inset-0 z-40" onClick={() => setOpenMemberMenu(null)} />
-                      <div className="absolute right-0 top-full mt-1 w-44 rounded-xl bg-white shadow-xl border border-slate-100 overflow-hidden z-50">
-                        {member.role === 'admin' ? (
-                          <button
-                            onClick={() => handleDemote(member.user_id)}
-                            className="w-full px-3.5 py-2.5 text-left text-sm text-slate-700 hover:bg-violet-50 flex items-center gap-2"
-                          >
-                            <ShieldMinus className="w-4 h-4 text-slate-500" />
-                            Remove as admin
-                          </button>
-                        ) : (
-                          <button
-                            onClick={() => handlePromote(member.user_id)}
-                            className="w-full px-3.5 py-2.5 text-left text-sm text-slate-700 hover:bg-violet-50 flex items-center gap-2"
-                          >
-                            <ShieldPlus className="w-4 h-4 text-violet-500" />
-                            Make admin
-                          </button>
-                        )}
-                        <button
-                          onClick={() => handleRemoveMember(member.user_id, profile?.full_name || 'this member')}
-                          className="w-full px-3.5 py-2.5 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
-                        >
-                          <UserMinus className="w-4 h-4" />
-                          Remove from group
-                        </button>
-                      </div>
-                    </>
-                  )}
-                </div>
+                <button
+                  onClick={(e) => handleOpenMemberMenu(e, member.user_id)}
+                  disabled={busyMemberId === member.user_id}
+                  className={`flex-shrink-0 p-2 rounded-full border transition-all active:scale-90 disabled:opacity-50 ${
+                    openMemberMenu === member.user_id
+                      ? 'bg-violet-100 border-violet-200'
+                      : 'bg-slate-100 border-slate-200 hover:bg-slate-200'
+                  }`}
+                  aria-label="Member options"
+                >
+                  <MoreVertical className="w-4 h-4 text-slate-600" />
+                </button>
               )}
             </div>
           );
         })}
       </div>
+
+      {openMemberMenu && memberMenuAnchor && (() => {
+        const openMember = group.members.find((m) => m.user_id === openMemberMenu);
+        if (!openMember) return null;
+        return createPortal(
+          <>
+            <div className="fixed inset-0 z-[9998]" onClick={closeMemberMenu} />
+            <div
+              style={getMemberMenuStyle()}
+              className="rounded-xl bg-white shadow-xl border border-slate-100 overflow-hidden animate-in fade-in zoom-in-95 duration-100"
+            >
+              {openMember.role === 'admin' ? (
+                <button
+                  onClick={() => handleDemote(openMember.user_id)}
+                  className="w-full px-3.5 py-2.5 text-left text-sm text-slate-700 hover:bg-violet-50 flex items-center gap-2"
+                >
+                  <ShieldMinus className="w-4 h-4 text-slate-500" />
+                  Remove as admin
+                </button>
+              ) : (
+                <button
+                  onClick={() => handlePromote(openMember.user_id)}
+                  className="w-full px-3.5 py-2.5 text-left text-sm text-slate-700 hover:bg-violet-50 flex items-center gap-2"
+                >
+                  <ShieldPlus className="w-4 h-4 text-violet-500" />
+                  Make admin
+                </button>
+              )}
+              <button
+                onClick={() => handleRemoveMember(openMember.user_id, openMember.profile?.full_name || 'this member')}
+                className="w-full px-3.5 py-2.5 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
+              >
+                <UserMinus className="w-4 h-4" />
+                Remove from group
+              </button>
+            </div>
+          </>,
+          document.body
+        );
+      })()}
 
       {/* Danger zone */}
       <div className="mx-4 mb-6 rounded-2xl bg-white/70 backdrop-blur-xl border border-white/70 overflow-hidden">
