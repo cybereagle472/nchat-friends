@@ -2925,7 +2925,14 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           animation: slide-up 0.3s ease-out;
         }
 
-        /* Glassy Chat Input Styles */
+        /* Glassy Chat Input Styles.
+           The pill itself should read as a single floating element with
+           nothing visually "stuck" behind it — it used to carry a large
+           0 8px 32px purple glow (30% opacity) that, sitting on top of
+           the light chat background, rendered as an obvious soft rounded
+           panel surrounding the pill, looking like a separate container
+           rather than depth on the pill. Kept here as a much tighter,
+           barely-there shadow for a hint of lift, nothing more. */
         .chat-input-glass {
           background: linear-gradient(135deg, rgba(168, 85, 247, 0.9) 0%, rgba(139, 92, 246, 0.9) 50%, rgba(124, 58, 237, 0.9) 100%);
           backdrop-filter: blur(20px);
@@ -2933,9 +2940,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           border-radius: 28px;
           padding: 4px;
           box-shadow:
-            0 8px 32px rgba(168, 85, 247, 0.3),
-            0 0 0 1px rgba(255, 255, 255, 0.1) inset,
-            0 2px 4px rgba(0, 0, 0, 0.1);
+            0 2px 8px rgba(124, 58, 237, 0.18),
+            0 0 0 1px rgba(255, 255, 255, 0.1) inset;
         }
 
         .chat-input-inner {

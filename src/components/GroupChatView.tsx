@@ -475,8 +475,13 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
         </div>
       )}
 
-      {/* Input Area */}
-      <div className="relative z-10 backdrop-blur-2xl bg-white/70 border-t border-white/70 px-3 py-2.5 shadow-lg">
+      {/* Input Area — intentionally transparent (no background/border/
+          shadow of its own): the textarea and buttons below already have
+          their own visuals, wrapping them in a translucent white bar on
+          top of the low-poly chat background made the whole composer
+          read as a separate "container" sitting behind the input instead
+          of the input floating directly on the chat background. */}
+      <div className="relative z-10 px-3 py-2.5 pb-[max(10px,env(safe-area-inset-bottom))]">
         {/* Reply Preview */}
         {replyToMessage && (
           <div className="mb-2 bg-white/90 backdrop-blur-sm rounded-xl px-3 py-2 flex items-start gap-2 border-l-4 border-violet-500">

@@ -122,7 +122,20 @@ export default function LowPolyBackground({ seed = 7 }: { seed?: number }) {
   const triangles = useMemo(() => buildMesh(seed), [seed]);
 
   return (
-    <div className="absolute inset-0 overflow-hidden pointer-events-none select-none" aria-hidden="true">
+    <div
+      className="absolute inset-0 overflow-hidden pointer-events-none select-none"
+      // Fade the mesh out before it reaches the message input bar at the
+      // bottom of the screen. Without this, a triangle facet happening to
+      // land directly behind the input pill reads as an unwanted flat
+      // "container" stuck to it rather than the pill floating on its own
+      // — the input area should always sit on a clean, untextured patch
+      // of the background, regardless of how the mesh above it is seeded.
+      style={{
+        WebkitMaskImage: 'linear-gradient(to bottom, black 0%, black 76%, transparent 94%)',
+        maskImage: 'linear-gradient(to bottom, black 0%, black 76%, transparent 94%)',
+      }}
+      aria-hidden="true"
+    >
       <svg
         className="lowpoly-bg-mesh"
         viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
