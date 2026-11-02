@@ -28,6 +28,41 @@ function isParticipant(call: Pick<CallRow, 'caller_id' | 'receiver_id'>, userId:
   return call.caller_id === userId || call.receiver_id === userId;
 }
 
+// Mints a short-lived Cloudflare Realtime TURN credential for the calling
+// client's RTCPeerConnection. The long-lived TURN key (CF_TURN_KEY_API_TOKEN)
+// must never reach the browser, which is exactly why this exists as a
+// server-side endpoint instead of baking a static credential into the
+// client bundle. If no TURN key is configured yet, this responds with
+// `iceServers: null` rather than an error so the client can fall back to
+// its built-in free STUN/TURN list without the call attempt failing.
+calls.get('/turn-credentials', async (c) => {
+  const keyId = c.env.CF_TURN_KEY_ID;
+  const apiToken = c.env.CF_TURN_KEY_API_TOKEN;
+  if (!keyId || !apiToken) {
+    return c.json({ iceServers: null });
+  }
+
+  try {
+    const res = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate-ice-servers`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        'Content-Type': 'application/json',
+      },
+      // Comfortably longer than the longest call anyone's likely to have —
+      // the credential only needs to outlive this one call, not be reused.
+      body: JSON.stringify({ ttl: 7200 }),
+    });
+    if (!res.ok) {
+      return c.json({ iceServers: null });
+    }
+    const data = await res.json<{ iceServers?: unknown }>();
+    return c.json({ iceServers: data.iceServers ?? null });
+  } catch {
+    return c.json({ iceServers: null });
+  }
+});
+
 calls.post('/', async (c) => {
   const userId = c.get('userId');
   const { receiver_id, call_type, offer_sdp } = await c.req.json().catch(() => ({}));

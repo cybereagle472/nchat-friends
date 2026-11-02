@@ -35,3 +35,14 @@ PUBLIC_API_URL = "https://nchat-friends.usa66486.workers.dev"
 # wrangler secret put JWT_SECRET
 # wrangler secret put VAPID_PUBLIC_KEY
 # wrangler secret put VAPID_PRIVATE_KEY
+#
+# ── Cloudflare Realtime TURN (optional, strongly recommended for calls) ──
+# Without this, calls fall back to a free/unreliable public TURN relay and
+# will often fail to connect when both people are on different networks.
+# 1. Open https://dash.cloudflare.com/?to=/:account/calls and create a TURN
+#    App — this gives you a Key ID and an API Token (not the same as your
+#    Cloudflare account API token).
+# 2. wrangler secret put CF_TURN_KEY_ID
+# 3. wrangler secret put CF_TURN_KEY_API_TOKEN
+# Pricing: $0.05/GB egressed through the relay, with the first 1,000 GB
+# (1 TB) free every month — https://developers.cloudflare.com/realtime/sfu/platform/pricing/

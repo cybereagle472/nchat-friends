@@ -35,9 +35,37 @@ export interface ServiceResult<T = void> {
   error?: string;
 }
 
+// Cloudflare mints short-lived (2 hour) TURN credentials via the Worker's
+// GET /calls/turn-credentials (worker/src/routes/calls.ts) — the long-lived
+// TURN key itself never reaches the browser. Cache the result in memory so
+// a flurry of peer connections in the same session (mute/unmute-induced
+// renegotiation, a redial, etc.) doesn't mint a fresh credential every
+// single time; refresh a little before the real expiry rather than at
+// the exact edge.
+let cloudflareTurnCache: { iceServers: RTCIceServer[]; expiresAt: number } | null = null;
+
+async function fetchCloudflareTurnServers(): Promise<RTCIceServer[]> {
+  const now = Date.now();
+  if (cloudflareTurnCache && cloudflareTurnCache.expiresAt > now) {
+    return cloudflareTurnCache.iceServers;
+  }
+  try {
+    const result = await apiFetch<{ iceServers: RTCIceServer[] | null }>('/calls/turn-credentials');
+    if (!result.iceServers || result.iceServers.length === 0) return [];
+    cloudflareTurnCache = { iceServers: result.iceServers, expiresAt: now + 100 * 60 * 1000 };
+    return result.iceServers;
+  } catch {
+    // Not configured yet (CF_TURN_KEY_ID/CF_TURN_KEY_API_TOKEN unset on the
+    // Worker), or Cloudflare's API was briefly unreachable — fall back
+    // silently to the static STUN/TURN list below rather than failing the
+    // call outright over a missing "nice to have".
+    return [];
+  }
+}
+
 // ICE Server configuration with STUN and TURN servers
 // TURN servers are essential for calls behind NAT/firewalls
-const getIceServers = (): RTCConfiguration => {
+const getIceServers = async (): Promise<RTCConfiguration> => {
   const iceServers: RTCIceServer[] = [
     // Free public STUN servers
     { urls: 'stun:stun.l.google.com:19302' },
@@ -49,6 +77,10 @@ const getIceServers = (): RTCConfiguration => {
     { urls: 'stun:stun.stunprotocol.org:3478' },
     { urls: 'stun:stun.voip.eutelia.it:3478' },
   ];
+
+  // Cloudflare Realtime TURN, if the Worker has a TURN key configured —
+  // this is the reliable relay for calls across different networks/NATs.
+  iceServers.push(...(await fetchCloudflareTurnServers()));
 
   // Add TURN server if configured via environment variables
   // TURN servers relay media when direct P2P connection fails
@@ -97,8 +129,6 @@ const getIceServers = (): RTCConfiguration => {
     iceCandidatePoolSize: 10, // Pre-gather candidates for faster connection
   };
 };
-
-const ICE_SERVERS: RTCConfiguration = getIceServers();
 
 // Wire shape returned by GET /calls/history (see worker/src/routes/calls.ts).
 interface WireCallHistoryRow {
@@ -227,12 +257,12 @@ export const callService = {
   /**
    * Create RTCPeerConnection with proper configuration
    */
-  createPeerConnection(
+  async createPeerConnection(
     onIceCandidate: (candidate: RTCIceCandidate) => void,
     onTrack: (stream: MediaStream) => void,
     onConnectionStateChange?: (state: RTCPeerConnectionState) => void
-  ): RTCPeerConnection {
-    const pc = new RTCPeerConnection(ICE_SERVERS);
+  ): Promise<RTCPeerConnection> {
+    const pc = new RTCPeerConnection(await getIceServers());
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {

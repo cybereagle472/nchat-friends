@@ -224,8 +224,8 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
     return result.data;
   }, [callType]);
 
-  const createPeerConnection = useCallback(() => {
-    const pc = callService.createPeerConnection(
+  const createPeerConnection = useCallback(async () => {
+    const pc = await callService.createPeerConnection(
       (candidate) => {
         const json = candidate.toJSON();
         if (callIdRef.current) {
@@ -397,7 +397,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       setRemoteUser(profile);
 
       await initializeMedia();
-      const pc = createPeerConnection();
+      const pc = await createPeerConnection();
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -459,7 +459,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
 
       await initializeMedia();
 
-      const pc = createPeerConnection();
+      const pc = await createPeerConnection();
 
       if (incomingCall.offer_sdp) {
         await pc.setRemoteDescription(new RTCSessionDescription(incomingCall.offer_sdp));
