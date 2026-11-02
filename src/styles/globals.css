@@ -340,17 +340,20 @@ input:focus, textarea:focus {
   color: inherit;
 }
 
-/* Smooth image loading */
+/* Smooth image loading.
+   The img[loading="lazy"] opacity:0 rule that used to live here (meant to
+   fade a lazy image in once a `.loaded` class was added to it) was dead
+   code with no implementation anywhere in the app — nothing ever added
+   that `.loaded` class. The practical effect was that *every* <img
+   loading="lazy"> in the entire app rendered permanently invisible
+   (opacity: 0 forever), while its box still took up its normal layout
+   space — which is exactly why group chat's photo bubbles looked like an
+   empty "glass" rectangle: the correct image was sitting right there,
+   fully loaded, just invisible. Removed; plain `transition-opacity` below
+   is harmless/decorative on its own and kept for any image that toggles
+   its own opacity via inline styles or a class elsewhere. */
 img {
   @apply transition-opacity duration-300;
-}
-
-img[loading="lazy"] {
-  opacity: 0;
-}
-
-img[loading="lazy"].loaded {
-  opacity: 1;
 }
 /* ===== Shared chat composer, voice-message, and document-bubble styles =====
    Moved out of ChatView.tsx's inline <style> block so GroupChatView.tsx

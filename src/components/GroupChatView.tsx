@@ -791,8 +791,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                     <img
                       src={message.media_url || message.content}
                       alt="Shared image"
-                      className="block cursor-pointer max-w-full max-h-[300px] object-cover"
-                      loading="lazy"
+                      className="block cursor-pointer max-w-full max-h-[300px] object-cover hover:opacity-90 transition-opacity"
                       onClick={() => openMediaViewer('image', message.media_url || message.content)}
                     />
                   ) : (
