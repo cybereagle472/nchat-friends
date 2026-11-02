@@ -2445,6 +2445,14 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
             // screen's spacious layout even though it's the exact same
             // recording.
             <div className="voice-recording-slide-ui">
+              {/* Gradient + shimmer background, separated into its own
+                  layer (with its own overflow: hidden) so the bar itself
+                  can stay overflow: visible — that's what lets the lock
+                  guidance below float slightly above the bar instead of
+                  needing its own row, which is what kept making this
+                  screen so much taller than the locked one. */}
+              <div className="voice-recording-bg" />
+
               {/* Row 1 — duration + live waveform, same visual weight as
                   the locked UI's top row. Doesn't move with the drag;
                   only the cancel hint and the floating mic below do. */}
@@ -2475,16 +2483,34 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                 <span>Release to cancel</span>
               </div>
 
-              {/* Row 2 — lock-to-record guidance, right-aligned to sit
-                  directly above the floating mic button in row 3 and
-                  flush with row 1's own right edge, instead of floating
-                  off to the side. A padlock sits above three chevrons
-                  that continuously animate climbing upward (WhatsApp's
-                  "slide up to lock" cue), so it's obvious what dragging
-                  up does even before the user has started doing it.
-                  lockProgress still drives a real-time lift/brighten/
-                  scale-up on top of that as direct drag feedback. */}
-              <div className="voice-recording-lockrow">
+              {/* Row 2 — slide-to-cancel hint (drags left with the
+                  finger) on the left, floating mic on the right. Kept to
+                  exactly two rows total (same as the locked UI) so this
+                  bar stays just as compact — the lock guidance below
+                  floats above it rather than adding a third row. */}
+              <div className="voice-recording-bottomrow">
+                <div
+                  className="voice-slide-hint-row"
+                  style={{
+                    transform: `translateX(${Math.max(-120, Math.min(0, voiceState.currentX - voiceState.startX))}px)`,
+                    opacity: voiceState.isCancelling ? 0.5 : 1
+                  }}
+                >
+                  <div className={`voice-slide-hint ${voiceState.isCancelling ? 'cancelling' : ''}`}>
+                    <ChevronLeft className="w-4 h-4" />
+                    <ChevronLeft className="w-4 h-4 -ml-2" />
+                    <span>Slide to cancel</span>
+                  </div>
+                </div>
+
+                {/* Lock guidance — a padlock sitting above three chevrons
+                    that continuously animate climbing upward (WhatsApp's
+                    "slide up to lock" cue). Floats directly above the mic
+                    button (same right offset, so the two line up) instead
+                    of taking up its own row, keeping the bar's overall
+                    height the same as the locked UI's. lockProgress still
+                    drives a real-time lift/brighten/scale-up on top of
+                    that as direct drag feedback. */}
                 <div
                   className="voice-lock-indicator"
                   style={{
@@ -2499,24 +2525,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                     <ChevronUp className="voice-lock-arrow" />
                     <ChevronUp className="voice-lock-arrow" />
                     <ChevronUp className="voice-lock-arrow" />
-                  </div>
-                </div>
-              </div>
-
-              {/* Row 3 — slide-to-cancel hint (drags left with the
-                  finger) on the left, floating mic on the right. */}
-              <div className="voice-recording-bottomrow">
-                <div
-                  className="voice-slide-hint-row"
-                  style={{
-                    transform: `translateX(${Math.max(-120, Math.min(0, voiceState.currentX - voiceState.startX))}px)`,
-                    opacity: voiceState.isCancelling ? 0.5 : 1
-                  }}
-                >
-                  <div className={`voice-slide-hint ${voiceState.isCancelling ? 'cancelling' : ''}`}>
-                    <ChevronLeft className="w-4 h-4" />
-                    <ChevronLeft className="w-4 h-4 -ml-2" />
-                    <span>Slide to cancel</span>
                   </div>
                 </div>
 
@@ -3332,13 +3340,20 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           box-shadow: 0 0 0 2px #ffffff;
         }
 
-        /* Voice Recording Slide UI - WhatsApp Style. Two rows now (same
-           shape as the locked recording UI) instead of one cramped line,
-           with generous padding so it carries the same visual weight as
-           the locked screen even though it's showing less content. */
+        /* Voice Recording Slide UI - WhatsApp Style. Same compact two-row
+           shape as the locked recording UI (duration+waveform, then
+           cancel-hint+mic) so the bar carries the same visual weight and
+           height — the lock guidance floats above it rather than adding
+           a third row that would make the whole thing noticeably taller. */
         .voice-recording-slide-ui {
           position: relative;
-          padding: 16px 18px 18px;
+          padding: 12px 16px 14px;
+        }
+
+        .voice-recording-bg {
+          position: absolute;
+          inset: 0;
+          z-index: -1;
           background: linear-gradient(135deg, rgba(168, 85, 247, 0.95) 0%, rgba(139, 92, 246, 0.95) 50%, rgba(124, 58, 237, 0.95) 100%);
           overflow: hidden;
         }
@@ -3347,24 +3362,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           display: flex;
           align-items: center;
           gap: 14px;
-          margin-bottom: 6px;
-        }
-
-        /* Lock guidance row — sits between the duration/waveform row and
-           the mic row, right-aligned with both of them (same right
-           padding as the rest of the bar) so the padlock + climbing
-           chevrons land directly above the floating mic button instead
-           of off to its side. */
-        .voice-recording-lockrow {
-          display: flex;
-          justify-content: flex-end;
-          align-items: flex-end;
-          min-height: 58px;
-          margin-bottom: 2px;
-          /* Matches the floating mic's own right:18px offset below, so
-             the lock pillar's right edge lines up with the mic's right
-             edge instead of sitting further out past it. */
-          padding-right: 18px;
+          margin-bottom: 8px;
         }
 
         .voice-cancel-zone {
@@ -3434,6 +3432,10 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           height: 36px;
           min-width: 0;
           overflow: hidden;
+          /* Leaves the floating lock guidance (see .voice-lock-indicator)
+             a clean, empty patch of background to sit in above the mic,
+             instead of bars running underneath it. */
+          padding-right: 48px;
         }
 
         .voice-waveform-bar {
@@ -3471,16 +3473,20 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
 
         /* Lock guidance — padlock sitting above three chevrons that
            continuously "climb" upward, one after another, to cue the
-           swipe-up-to-lock gesture the way WhatsApp's does. Lives in its
-           own row (see .voice-recording-lockrow) directly above the mic
-           button rather than floating off to its side; lockProgress then
-           layers a live lift/brighten/scale-up on top via its own
-           transform as the user actually drags up. */
+           swipe-up-to-lock gesture the way WhatsApp's does. Floats
+           directly above the mic button (same right offset, right: 18px,
+           as .voice-mic-float below) instead of taking up its own row —
+           that's what keeps this bar the same compact height as the
+           locked UI. lockProgress layers a live lift/brighten/scale-up
+           on top via its own transform as the user actually drags up. */
         .voice-lock-indicator {
+          position: absolute;
+          right: 18px;
+          bottom: 56px;
           display: flex;
           flex-direction: column;
           align-items: center;
-          gap: 4px;
+          gap: 3px;
           transition: transform 0.08s linear, opacity 0.08s linear;
         }
 
@@ -3488,8 +3494,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           display: flex;
           align-items: center;
           justify-content: center;
-          width: 30px;
-          height: 30px;
+          width: 26px;
+          height: 26px;
           background: rgba(255, 255, 255, 0.22);
           border-radius: 50%;
           color: white;
@@ -3500,13 +3506,13 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           display: flex;
           flex-direction: column;
           align-items: center;
-          height: 22px;
+          height: 16px;
         }
 
         .voice-lock-arrow {
-          width: 13px;
-          height: 13px;
-          margin-top: -5px;
+          width: 11px;
+          height: 11px;
+          margin-top: -4px;
           color: rgba(255, 255, 255, 0.85);
           animation: lock-arrow-climb 1.4s ease-in-out infinite;
         }
@@ -3801,15 +3807,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           }
         }
 
-        /* Voice Recording Enhanced Animation */
-        .voice-recording-slide-ui {
-          position: relative;
-          padding: 16px 18px 18px;
-          background: linear-gradient(135deg, rgba(168, 85, 247, 0.98) 0%, rgba(139, 92, 246, 0.98) 50%, rgba(124, 58, 237, 0.98) 100%);
-          overflow: hidden;
-        }
-
-        .voice-recording-slide-ui::before {
+        /* Voice Recording Enhanced Animation — layered onto the
+           background div (see .voice-recording-bg above), not the bar
+           itself, so the bar can stay overflow: visible and let the lock
+           guidance float slightly above it. */
+        .voice-recording-bg::before {
           content: '';
           position: absolute;
           inset: 0;
