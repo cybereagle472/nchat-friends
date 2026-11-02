@@ -1,4 +1,4 @@
-import { ArrowLeft, MoreVertical, Phone, Video, Send, Plus, X, Image as ImageIcon, FileText, Film, Mic, CheckCheck, Play, Pause, Lock, Trash2, ChevronLeft, UserX } from 'lucide-react';
+import { ArrowLeft, MoreVertical, Phone, Video, Send, Plus, X, Image as ImageIcon, FileText, Film, Mic, CheckCheck, Play, Pause, Lock, Trash2, ChevronLeft, ChevronUp, UserX } from 'lucide-react';
 import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react';
 import { chatService } from '../services/chatService';
 import { mediaService } from '../services/mediaService';
@@ -2437,8 +2437,33 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
               </div>
             </div>
           ) : (
-            // Slide to Cancel Mode - WhatsApp Style
+            // Slide to Cancel Mode - WhatsApp Style. Deliberately built as
+            // the same two-row shape as the locked UI below (duration +
+            // waveform on top, controls/guidance on the bottom) instead of
+            // squeezing everything into one cramped line — the single-row
+            // version used to look flat and thin next to the locked
+            // screen's spacious layout even though it's the exact same
+            // recording.
             <div className="voice-recording-slide-ui">
+              {/* Row 1 — duration + live waveform, same visual weight as
+                  the locked UI's top row. Doesn't move with the drag;
+                  only the cancel hint and the floating mic below do. */}
+              <div className="voice-recording-toprow">
+                <div className="voice-duration">
+                  <div className="voice-recording-dot" />
+                  <span>{formatDuration(voiceState.duration)}</span>
+                </div>
+                <div className="voice-waveform-container">
+                  {voiceState.waveformData.slice(-28).map((value, i) => (
+                    <div
+                      key={i}
+                      className="voice-waveform-bar"
+                      style={{ height: `${Math.max(4, value * 32)}px` }}
+                    />
+                  ))}
+                </div>
+              </div>
+
               {/* Cancel Zone - appears when sliding left */}
               <div
                 className={`voice-cancel-zone ${voiceState.isCancelling ? 'active' : ''}`}
@@ -2450,64 +2475,58 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                 <span>Release to cancel</span>
               </div>
 
-              {/* Main recording UI */}
-              <div
-                className="voice-recording-content"
-                style={{
-                  transform: `translateX(${Math.max(-120, Math.min(0, voiceState.currentX - voiceState.startX))}px)`,
-                  opacity: voiceState.isCancelling ? 0.5 : 1
-                }}
-              >
-                {/* Slide to cancel hint */}
-                <div className={`voice-slide-hint ${voiceState.isCancelling ? 'cancelling' : ''}`}>
-                  <ChevronLeft className="w-4 h-4" />
-                  <ChevronLeft className="w-4 h-4 -ml-2" />
-                  <span>Slide to cancel</span>
-                </div>
-
-                {/* Real-time Waveform */}
-                <div className="voice-waveform-container">
-                  {voiceState.waveformData.slice(-25).map((value, i) => (
-                    <div
-                      key={i}
-                      className="voice-waveform-bar"
-                      style={{ height: `${Math.max(4, value * 28)}px` }}
-                    />
-                  ))}
-                </div>
-
-                {/* Duration & Lock */}
-                <div className="voice-recording-right">
-                  <div className="voice-duration">
-                    <div className="voice-recording-dot" />
-                    <span>{formatDuration(voiceState.duration)}</span>
+              {/* Row 2 — slide-to-cancel hint (drags left with the
+                  finger) on the left, lock-to-record guidance + the
+                  floating mic on the right. */}
+              <div className="voice-recording-bottomrow">
+                <div
+                  className="voice-slide-hint-row"
+                  style={{
+                    transform: `translateX(${Math.max(-120, Math.min(0, voiceState.currentX - voiceState.startX))}px)`,
+                    opacity: voiceState.isCancelling ? 0.5 : 1
+                  }}
+                >
+                  <div className={`voice-slide-hint ${voiceState.isCancelling ? 'cancelling' : ''}`}>
+                    <ChevronLeft className="w-4 h-4" />
+                    <ChevronLeft className="w-4 h-4 -ml-2" />
+                    <span>Slide to cancel</span>
                   </div>
+                </div>
 
-                  {/* Lock indicator - swipe up to lock. Slides up and
-                      brightens as the user drags toward the threshold, so
-                      the gesture has clear visual feedback instead of
-                      snapping on/off with no warning. */}
+                {/* Lock guidance — a padlock sitting above three chevrons
+                    that continuously animate climbing upward (WhatsApp's
+                    "slide up to lock" cue), so it's obvious what dragging
+                    up does even before the user has started doing it.
+                    lockProgress still drives a real-time lift/brighten/
+                    scale-up on top of that as direct drag feedback. */}
+                <div className="voice-lock-indicator-wrap">
                   <div
-                    className="voice-lock-hint"
+                    className="voice-lock-indicator"
                     style={{
-                      transform: `translateY(${-voiceState.lockProgress * 10}px)`,
-                      opacity: 0.55 + voiceState.lockProgress * 0.45
+                      transform: `translateY(${-voiceState.lockProgress * 14}px) scale(${1 + voiceState.lockProgress * 0.1})`,
+                      opacity: 0.65 + voiceState.lockProgress * 0.35
                     }}
                   >
-                    <ChevronLeft className="w-3 h-3 rotate-90 -mb-1 opacity-70" />
-                    <Lock className="w-3.5 h-3.5" />
+                    <div className="voice-lock-circle">
+                      <Lock className="w-3.5 h-3.5" />
+                    </div>
+                    <div className="voice-lock-arrows">
+                      <ChevronUp className="voice-lock-arrow" />
+                      <ChevronUp className="voice-lock-arrow" />
+                      <ChevronUp className="voice-lock-arrow" />
+                    </div>
                   </div>
                 </div>
-              </div>
 
-              {/* Floating mic button that follows finger */}
-              <div
-                className={`voice-mic-float ${voiceState.isCancelling ? 'cancelling' : ''}`}
-                style={{
-                  transform: `translateX(${Math.max(-120, Math.min(0, voiceState.currentX - voiceState.startX))}px)`
-                }}
-              >
-                <Mic className="w-5 h-5" />
+                {/* Floating mic button that follows finger */}
+                <div
+                  className={`voice-mic-float ${voiceState.isCancelling ? 'cancelling' : ''}`}
+                  style={{
+                    transform: `translateY(-50%) translateX(${Math.max(-120, Math.min(0, voiceState.currentX - voiceState.startX))}px)`
+                  }}
+                >
+                  <Mic className="w-5 h-5" />
+                </div>
               </div>
             </div>
           )}
@@ -3311,17 +3330,27 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           box-shadow: 0 0 0 2px #ffffff;
         }
 
-        /* Voice Recording Slide UI - WhatsApp Style */
+        /* Voice Recording Slide UI - WhatsApp Style. Two rows now (same
+           shape as the locked recording UI) instead of one cramped line,
+           with generous padding so it carries the same visual weight as
+           the locked screen even though it's showing less content. */
         .voice-recording-slide-ui {
           position: relative;
-          padding: 12px 16px;
+          padding: 16px 18px 18px;
           background: linear-gradient(135deg, rgba(168, 85, 247, 0.95) 0%, rgba(139, 92, 246, 0.95) 50%, rgba(124, 58, 237, 0.95) 100%);
           overflow: hidden;
         }
 
+        .voice-recording-toprow {
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          margin-bottom: 14px;
+        }
+
         .voice-cancel-zone {
           position: absolute;
-          left: 16px;
+          left: 18px;
           top: 50%;
           transform: translateY(-50%);
           display: flex;
@@ -3338,10 +3367,19 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           opacity: 1;
         }
 
-        .voice-recording-content {
+        .voice-recording-bottomrow {
+          position: relative;
           display: flex;
           align-items: center;
-          gap: 12px;
+          min-height: 48px;
+          /* Reserve room on the right for the lock guidance + floating
+             mic so the sliding hint never runs underneath them. */
+          padding-right: 76px;
+        }
+
+        .voice-slide-hint-row {
+          display: flex;
+          align-items: center;
           transition: transform 0.05s ease-out, opacity 0.15s ease;
         }
 
@@ -3350,8 +3388,9 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           align-items: center;
           gap: 2px;
           flex-shrink: 0;
-          color: rgba(255, 255, 255, 0.7);
-          font-size: 12px;
+          color: rgba(255, 255, 255, 0.75);
+          font-size: 13px;
+          font-weight: 500;
           animation: slide-hint 1.5s ease-in-out infinite;
         }
 
@@ -3372,9 +3411,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           flex: 1;
           display: flex;
           align-items: center;
-          justify-content: center;
-          gap: 2px;
-          height: 32px;
+          gap: 3px;
+          height: 36px;
           min-width: 0;
           overflow: hidden;
         }
@@ -3382,32 +3420,26 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
         .voice-waveform-bar {
           width: 3px;
           flex-shrink: 0;
-          background: rgba(255, 255, 255, 0.8);
+          background: rgba(255, 255, 255, 0.85);
           border-radius: 2px;
           transition: height 0.05s ease;
           min-height: 4px;
         }
 
-        .voice-recording-right {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          flex-shrink: 0;
-        }
-
         .voice-duration {
           display: flex;
           align-items: center;
-          gap: 6px;
+          gap: 7px;
           color: white;
-          font-size: 15px;
+          font-size: 16px;
           font-weight: 600;
           font-variant-numeric: tabular-nums;
+          flex-shrink: 0;
         }
 
         .voice-recording-dot {
-          width: 8px;
-          height: 8px;
+          width: 9px;
+          height: 9px;
           border-radius: 50%;
           background: #ef4444;
           animation: recording-pulse 1s ease-in-out infinite;
@@ -3418,25 +3450,69 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           50% { opacity: 0.5; transform: scale(0.85); }
         }
 
-        .voice-lock-hint {
+        /* Lock guidance — padlock sitting above three chevrons that
+           continuously "climb" upward, one after another, to cue the
+           swipe-up-to-lock gesture the way WhatsApp's does. Positioned
+           absolutely within the bottom row, vertically centered there via
+           the wrapper; the inner element then layers the live
+           lockProgress feedback (lift/brighten/scale) on top via its own
+           transform, so the two never fight over the same property. */
+        .voice-lock-indicator-wrap {
+          position: absolute;
+          right: 56px;
+          top: 50%;
+          transform: translateY(-50%);
+        }
+
+        .voice-lock-indicator {
           display: flex;
           flex-direction: column;
           align-items: center;
-          justify-content: center;
-          width: 32px;
-          height: 32px;
-          background: rgba(255, 255, 255, 0.2);
-          border-radius: 50%;
-          color: rgba(255, 255, 255, 0.8);
-          /* Position/opacity are driven live by how far the user has
-             dragged up toward the lock threshold (see lockProgress), this
-             transition just smooths out the per-frame updates. */
+          gap: 4px;
           transition: transform 0.08s linear, opacity 0.08s linear;
+        }
+
+        .voice-lock-circle {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 30px;
+          height: 30px;
+          background: rgba(255, 255, 255, 0.22);
+          border-radius: 50%;
+          color: white;
+          box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.25) inset;
+        }
+
+        .voice-lock-arrows {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          height: 22px;
+        }
+
+        .voice-lock-arrow {
+          width: 13px;
+          height: 13px;
+          margin-top: -5px;
+          color: rgba(255, 255, 255, 0.85);
+          animation: lock-arrow-climb 1.4s ease-in-out infinite;
+        }
+
+        .voice-lock-arrow:nth-child(1) { animation-delay: 0.3s; }
+        .voice-lock-arrow:nth-child(2) { animation-delay: 0.15s; }
+        .voice-lock-arrow:nth-child(3) { animation-delay: 0s; }
+
+        @keyframes lock-arrow-climb {
+          0% { opacity: 0; transform: translateY(7px); }
+          35% { opacity: 1; transform: translateY(0); }
+          70% { opacity: 0.9; transform: translateY(-3px); }
+          100% { opacity: 0; transform: translateY(-9px); }
         }
 
         .voice-mic-float {
           position: absolute;
-          right: 16px;
+          right: 18px;
           top: 50%;
           transform: translateY(-50%);
           width: 48px;
@@ -3716,7 +3792,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
         /* Voice Recording Enhanced Animation */
         .voice-recording-slide-ui {
           position: relative;
-          padding: 12px 16px;
+          padding: 16px 18px 18px;
           background: linear-gradient(135deg, rgba(168, 85, 247, 0.98) 0%, rgba(139, 92, 246, 0.98) 50%, rgba(124, 58, 237, 0.98) 100%);
           overflow: hidden;
         }
