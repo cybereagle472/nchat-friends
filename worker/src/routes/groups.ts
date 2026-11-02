@@ -61,6 +61,7 @@ function groupMessageJson(row: any) {
     type: row.type,
     media_url: row.media_url ?? undefined,
     thumbnail_url: row.thumbnail_url ?? undefined,
+    duration: row.duration ?? undefined,
     client_message_id: row.client_message_id ?? undefined,
     reply_to: row.reply_to ?? undefined,
     is_edited: !!row.is_edited,
@@ -356,6 +357,7 @@ groups.post('/:id/messages', async (c) => {
     type: body.type ?? 'text',
     media_url: body.media_url ?? null,
     thumbnail_url: body.thumbnail_url ?? null,
+    duration: body.duration ?? null,
     client_message_id: body.client_message_id ?? null,
     reply_to: body.reply_to ?? null,
     is_edited: 0,
@@ -368,8 +370,8 @@ groups.post('/:id/messages', async (c) => {
 
   await Promise.all([
     c.env.DB.prepare(
-      `INSERT INTO group_messages (id, group_id, sender_id, content, type, media_url, thumbnail_url, client_message_id, reply_to, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO group_messages (id, group_id, sender_id, content, type, media_url, thumbnail_url, duration, client_message_id, reply_to, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         id,
@@ -379,6 +381,7 @@ groups.post('/:id/messages', async (c) => {
         body.type ?? 'text',
         body.media_url ?? null,
         body.thumbnail_url ?? null,
+        body.duration ?? null,
         body.client_message_id ?? null,
         body.reply_to ?? null,
         created_at

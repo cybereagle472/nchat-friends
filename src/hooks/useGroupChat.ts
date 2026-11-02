@@ -178,7 +178,9 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
         senderId: userId,
         content,
         type,
-        replyToId: extras.replyToId
+        replyToId: extras.replyToId,
+        duration: extras.duration,
+        waveform: extras.waveform
       });
 
       if (result.data) {

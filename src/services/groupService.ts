@@ -35,6 +35,11 @@ export interface SendGroupMessageParams {
   type?: GroupMessage['type'];
   replyToId?: string;
   clientMessageId?: string;
+  /** Voice message length in seconds (mirrors chatService's 1:1 param). */
+  duration?: number;
+  /** Downsampled waveform string, stored server-side in thumbnail_url
+   *  (same reuse-the-column trick as 1:1 messages — see chatService). */
+  waveform?: string;
 }
 
 export interface GroupWithMembers extends Group {
@@ -266,7 +271,7 @@ class GroupService {
    * Send group message
    */
   async sendMessage(params: SendGroupMessageParams): Promise<ServiceResult<{ message: GroupMessage; clientMessageId: string; isOffline: boolean }>> {
-    const { groupId, senderId, content, type = 'text', replyToId } = params;
+    const { groupId, senderId, content, type = 'text', replyToId, duration, waveform } = params;
 
     if (!content.trim() && type === 'text') {
       return { success: false, error: 'Message content is required' };
@@ -280,6 +285,8 @@ class GroupService {
         body: JSON.stringify({
           content: content.trim(),
           type,
+          duration,
+          thumbnail_url: waveform,
           reply_to: replyToId,
           client_message_id: clientMessageId
         })

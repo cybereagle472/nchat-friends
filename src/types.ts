@@ -178,6 +178,9 @@ export interface GroupMessage {
   sender_profile?: UserProfile;
   is_edited?: boolean;
   edited_at?: string;
+  media_url?: string;
+  thumbnail_url?: string;
+  duration?: string;
 }
 
 export interface FriendRequest {
