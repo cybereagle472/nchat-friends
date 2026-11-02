@@ -2475,9 +2475,36 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                 <span>Release to cancel</span>
               </div>
 
-              {/* Row 2 — slide-to-cancel hint (drags left with the
-                  finger) on the left, lock-to-record guidance + the
-                  floating mic on the right. */}
+              {/* Row 2 — lock-to-record guidance, right-aligned to sit
+                  directly above the floating mic button in row 3 and
+                  flush with row 1's own right edge, instead of floating
+                  off to the side. A padlock sits above three chevrons
+                  that continuously animate climbing upward (WhatsApp's
+                  "slide up to lock" cue), so it's obvious what dragging
+                  up does even before the user has started doing it.
+                  lockProgress still drives a real-time lift/brighten/
+                  scale-up on top of that as direct drag feedback. */}
+              <div className="voice-recording-lockrow">
+                <div
+                  className="voice-lock-indicator"
+                  style={{
+                    transform: `translateY(${-voiceState.lockProgress * 14}px) scale(${1 + voiceState.lockProgress * 0.1})`,
+                    opacity: 0.65 + voiceState.lockProgress * 0.35
+                  }}
+                >
+                  <div className="voice-lock-circle">
+                    <Lock className="w-3.5 h-3.5" />
+                  </div>
+                  <div className="voice-lock-arrows">
+                    <ChevronUp className="voice-lock-arrow" />
+                    <ChevronUp className="voice-lock-arrow" />
+                    <ChevronUp className="voice-lock-arrow" />
+                  </div>
+                </div>
+              </div>
+
+              {/* Row 3 — slide-to-cancel hint (drags left with the
+                  finger) on the left, floating mic on the right. */}
               <div className="voice-recording-bottomrow">
                 <div
                   className="voice-slide-hint-row"
@@ -2490,31 +2517,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                     <ChevronLeft className="w-4 h-4" />
                     <ChevronLeft className="w-4 h-4 -ml-2" />
                     <span>Slide to cancel</span>
-                  </div>
-                </div>
-
-                {/* Lock guidance — a padlock sitting above three chevrons
-                    that continuously animate climbing upward (WhatsApp's
-                    "slide up to lock" cue), so it's obvious what dragging
-                    up does even before the user has started doing it.
-                    lockProgress still drives a real-time lift/brighten/
-                    scale-up on top of that as direct drag feedback. */}
-                <div className="voice-lock-indicator-wrap">
-                  <div
-                    className="voice-lock-indicator"
-                    style={{
-                      transform: `translateY(${-voiceState.lockProgress * 14}px) scale(${1 + voiceState.lockProgress * 0.1})`,
-                      opacity: 0.65 + voiceState.lockProgress * 0.35
-                    }}
-                  >
-                    <div className="voice-lock-circle">
-                      <Lock className="w-3.5 h-3.5" />
-                    </div>
-                    <div className="voice-lock-arrows">
-                      <ChevronUp className="voice-lock-arrow" />
-                      <ChevronUp className="voice-lock-arrow" />
-                      <ChevronUp className="voice-lock-arrow" />
-                    </div>
                   </div>
                 </div>
 
@@ -3345,7 +3347,24 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           display: flex;
           align-items: center;
           gap: 14px;
-          margin-bottom: 14px;
+          margin-bottom: 6px;
+        }
+
+        /* Lock guidance row — sits between the duration/waveform row and
+           the mic row, right-aligned with both of them (same right
+           padding as the rest of the bar) so the padlock + climbing
+           chevrons land directly above the floating mic button instead
+           of off to its side. */
+        .voice-recording-lockrow {
+          display: flex;
+          justify-content: flex-end;
+          align-items: flex-end;
+          min-height: 58px;
+          margin-bottom: 2px;
+          /* Matches the floating mic's own right:18px offset below, so
+             the lock pillar's right edge lines up with the mic's right
+             edge instead of sitting further out past it. */
+          padding-right: 18px;
         }
 
         .voice-cancel-zone {
@@ -3372,9 +3391,9 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           display: flex;
           align-items: center;
           min-height: 48px;
-          /* Reserve room on the right for the lock guidance + floating
-             mic so the sliding hint never runs underneath them. */
-          padding-right: 76px;
+          /* Reserve room on the right for the floating mic so the
+             sliding hint never runs underneath it. */
+          padding-right: 70px;
         }
 
         .voice-slide-hint-row {
@@ -3452,18 +3471,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
 
         /* Lock guidance — padlock sitting above three chevrons that
            continuously "climb" upward, one after another, to cue the
-           swipe-up-to-lock gesture the way WhatsApp's does. Positioned
-           absolutely within the bottom row, vertically centered there via
-           the wrapper; the inner element then layers the live
-           lockProgress feedback (lift/brighten/scale) on top via its own
-           transform, so the two never fight over the same property. */
-        .voice-lock-indicator-wrap {
-          position: absolute;
-          right: 56px;
-          top: 50%;
-          transform: translateY(-50%);
-        }
-
+           swipe-up-to-lock gesture the way WhatsApp's does. Lives in its
+           own row (see .voice-recording-lockrow) directly above the mic
+           button rather than floating off to its side; lockProgress then
+           layers a live lift/brighten/scale-up on top via its own
+           transform as the user actually drags up. */
         .voice-lock-indicator {
           display: flex;
           flex-direction: column;
