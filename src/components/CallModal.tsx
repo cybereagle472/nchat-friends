@@ -863,31 +863,42 @@ function SlideToAnswer({ onAnswer }: { onAnswer: () => void }) {
   const fillRef = useRef<HTMLDivElement>(null);
   const hintRef = useRef<HTMLDivElement>(null);
   const dragXRef = useRef(0);
+  const trackWidthRef = useRef(1);
   const maxDragRef = useRef(1);
   const originXRef = useRef(0);
   const draggingRef = useRef(false);
   const completedRef = useRef(false);
+  // Coalesces pointermove into at most one DOM write per animation frame.
+  // Pointer events can fire well above display refresh rate (high-polling
+  // touch/mouse hardware easily hits 120-240Hz); writing styles on every
+  // single one does strictly wasted work the compositor throws away
+  // anyway, and that extra work is exactly what was eating into frame
+  // budget and making the drag look like it was skipping/lagging behind
+  // the finger instead of tracking it 1:1.
+  const rafRef = useRef<number | null>(null);
 
   const HANDLE_SIZE = 56;
 
-  // Writes straight to the already-mounted DOM nodes instead of going
-  // through React state + re-render on every single pointermove — that
-  // round trip is what made dragging feel laggy, since pointermove can
-  // fire far faster than React can usefully reconcile a component tree
-  // for. Direct style mutation tracks the finger 1:1 with zero lag,
-  // regardless of device.
+  // Pure transform-based positioning (translate3d + scaleX) — never
+  // touches `width`, `left`, or anything else that forces layout. Layout
+  // properties force the browser to re-measure the whole box tree before
+  // it can even get to painting, which is the single biggest source of
+  // per-frame jank in drag gestures; transform/opacity changes are
+  // compositor-only and can be handled entirely on the GPU thread, so
+  // they stay smooth even if the main thread is briefly busy.
   const applyPosition = (x: number, animate: boolean) => {
     const handle = handleRef.current;
     const fill = fillRef.current;
     const hint = hintRef.current;
-    const transition = animate ? 'transform 200ms ease' : 'none';
+    const transition = animate ? 'transform 180ms cubic-bezier(0.22, 1, 0.36, 1)' : 'none';
     if (handle) {
       handle.style.transition = transition;
-      handle.style.transform = `translateX(${x}px)`;
+      handle.style.transform = `translate3d(${x}px, 0, 0)`;
     }
     if (fill) {
-      fill.style.transition = animate ? 'width 200ms ease' : 'none';
-      fill.style.width = `${x + HANDLE_SIZE / 2}px`;
+      fill.style.transition = transition;
+      const scale = (x + HANDLE_SIZE / 2) / trackWidthRef.current;
+      fill.style.transform = `scaleX(${Math.min(1, Math.max(0, scale))})`;
     }
     if (hint) {
       const progress = maxDragRef.current > 0 ? x / maxDragRef.current : 0;
@@ -895,11 +906,35 @@ function SlideToAnswer({ onAnswer }: { onAnswer: () => void }) {
     }
   };
 
-  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (completedRef.current) return;
+  const recalcTrack = () => {
     const track = trackRef.current;
     if (!track) return;
+    trackWidthRef.current = Math.max(1, track.clientWidth);
     maxDragRef.current = Math.max(1, track.clientWidth - HANDLE_SIZE);
+  };
+
+  useEffect(() => {
+    recalcTrack();
+    applyPosition(0, false);
+    window.addEventListener('resize', recalcTrack);
+    return () => {
+      window.removeEventListener('resize', recalcTrack);
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const scheduleApply = () => {
+    if (rafRef.current != null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      applyPosition(dragXRef.current, false);
+    });
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (completedRef.current) return;
+    recalcTrack();
     originXRef.current = e.clientX - dragXRef.current;
     e.currentTarget.setPointerCapture(e.pointerId);
     draggingRef.current = true;
@@ -909,12 +944,16 @@ function SlideToAnswer({ onAnswer }: { onAnswer: () => void }) {
     if (!draggingRef.current || completedRef.current) return;
     const next = Math.min(Math.max(0, e.clientX - originXRef.current), maxDragRef.current);
     dragXRef.current = next;
-    applyPosition(next, false);
+    scheduleApply();
   };
 
   const finishDrag = () => {
     if (completedRef.current || !draggingRef.current) return;
     draggingRef.current = false;
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
     if (dragXRef.current / maxDragRef.current > 0.7) {
       completedRef.current = true;
       dragXRef.current = maxDragRef.current;
@@ -931,11 +970,12 @@ function SlideToAnswer({ onAnswer }: { onAnswer: () => void }) {
       ref={trackRef}
       className="relative h-14 w-full max-w-sm rounded-full bg-white/15 backdrop-blur-sm overflow-hidden select-none touch-none"
     >
-      {/* Fill trailing the handle */}
+      {/* Fill trailing the handle, scaled from the left edge instead of
+          resized, so it's a pure compositor transform like the handle. */}
       <div
         ref={fillRef}
-        className="absolute inset-y-0 left-0 bg-green-500/30 rounded-full pointer-events-none"
-        style={{ width: `${HANDLE_SIZE / 2}px` }}
+        className="absolute inset-0 bg-green-500/30 rounded-full pointer-events-none origin-left will-change-transform"
+        style={{ transform: `scaleX(${HANDLE_SIZE / 2 / trackWidthRef.current})` }}
       />
       {/* Hint text, fades out as the handle covers it */}
       <div
@@ -953,7 +993,7 @@ function SlideToAnswer({ onAnswer }: { onAnswer: () => void }) {
         onPointerMove={handlePointerMove}
         onPointerUp={finishDrag}
         onPointerCancel={finishDrag}
-        className="absolute top-0 left-0 w-14 h-14 rounded-full bg-green-500 flex items-center justify-center text-white shadow-lg shadow-green-500/40 touch-none !transition-none"
+        className="absolute top-0 left-0 w-14 h-14 rounded-full bg-green-500 flex items-center justify-center text-white shadow-lg shadow-green-500/40 touch-none will-change-transform"
       >
         <Phone className="w-6 h-6" />
       </button>
