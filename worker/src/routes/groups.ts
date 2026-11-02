@@ -488,4 +488,50 @@ groups.post('/messages/:messageId/reaction', async (c) => {
   return c.json({ reactions });
 });
 
+// POST /groups/:id/typing — ephemeral group typing indicator, no DB write.
+// Mirrors /messages/typing exactly but fans out to every *other* member of
+// the group (never the sender — there's no reason for a client to ever see
+// its own "is typing" echo), so every open group chat window and the
+// groups list both update instantly.
+groups.post('/:id/typing', async (c) => {
+  const userId = c.get('userId');
+  const groupId = c.req.param('id');
+  const membership = await getMembership(c.env, groupId, userId);
+  if (!membership) return c.json({ error: 'Not a member of this group' }, 403);
+
+  const { is_typing } = await c.req.json().catch(() => ({}));
+  const memberIds = (await memberIdsOf(c.env, groupId)).filter((id) => id !== userId);
+
+  await broadcastToGroup(
+    c.env,
+    groupId,
+    { type: 'group-typing', group_id: groupId, sender_id: userId, is_typing: !!is_typing },
+    memberIds
+  );
+
+  return c.json({ success: true });
+});
+
+// POST /groups/:id/recording — ephemeral "recording a voice message"
+// indicator for groups. Mirrors /messages/recording exactly, as its own
+// event type so clients can show the distinct mic/"recording audio" state.
+groups.post('/:id/recording', async (c) => {
+  const userId = c.get('userId');
+  const groupId = c.req.param('id');
+  const membership = await getMembership(c.env, groupId, userId);
+  if (!membership) return c.json({ error: 'Not a member of this group' }, 403);
+
+  const { is_recording } = await c.req.json().catch(() => ({}));
+  const memberIds = (await memberIdsOf(c.env, groupId)).filter((id) => id !== userId);
+
+  await broadcastToGroup(
+    c.env,
+    groupId,
+    { type: 'group-recording', group_id: groupId, sender_id: userId, is_recording: !!is_recording },
+    memberIds
+  );
+
+  return c.json({ success: true });
+});
+
 export default groups;

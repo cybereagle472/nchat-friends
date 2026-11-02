@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   ArrowLeft,
   Phone,
@@ -29,6 +29,19 @@ import { mediaService } from '../services/mediaService';
 import { VoiceMessageBubble, DocumentBubble, downsampleWaveform } from './ChatView';
 import { GroupMessageActions, GroupReactionsDisplay } from './GroupMessageActions';
 import { useKeyboardInset } from '../hooks/useKeyboardInset';
+import { typingService } from '../services/typingService';
+
+// Tiny debounce helper — same shape as the one ChatView.tsx keeps privately,
+// duplicated here rather than shared so the two screens' typing/recording
+// wiring stay fully independent (same reasoning as the voice-recording
+// gesture system above).
+function debounce<T extends (...args: never[]) => void>(fn: T, delay: number): T {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  return ((...args: Parameters<T>) => {
+    if (timeout) clearTimeout(timeout);
+    timeout = setTimeout(() => fn(...args), delay);
+  }) as T;
+}
 
 // Voice Recording State — mirrors ChatView's VoiceRecordingState exactly
 // (see ChatView.tsx for the full, heavily-commented history of this
@@ -160,6 +173,44 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
     userId: currentUser.id
   });
 
+  // Typing / recording indicators — mirrors ChatView's isTyping/
+  // isContactRecording exactly, except a group can have more than one
+  // member typing or recording at once, so these are Sets of member ids
+  // rather than a single boolean.
+  const [typingUserIds, setTypingUserIds] = useState<Set<string>>(new Set());
+  const [recordingUserIds, setRecordingUserIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    const typingSubscription = typingService.subscribeToGroupTyping(
+      currentUser.id,
+      group.id,
+      (userId, isTyping) => {
+        setTypingUserIds(prev => {
+          const next = new Set(prev);
+          if (isTyping) next.add(userId); else next.delete(userId);
+          return next;
+        });
+      }
+    );
+
+    const recordingSubscription = typingService.subscribeToGroupRecording(
+      currentUser.id,
+      group.id,
+      (userId, isRecording) => {
+        setRecordingUserIds(prev => {
+          const next = new Set(prev);
+          if (isRecording) next.add(userId); else next.delete(userId);
+          return next;
+        });
+      }
+    );
+
+    return () => {
+      typingSubscription.unsubscribe();
+      recordingSubscription.unsubscribe();
+    };
+  }, [currentUser.id, group.id]);
+
   // Scroll to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -175,8 +226,9 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
     if (!text || isSending) return;
 
     setMessageText('');
+    typingService.sendGroupStoppedTyping(currentUser.id, group.id);
     await sendMessage(text);
-  }, [messageText, isSending, sendMessage]);
+  }, [messageText, isSending, sendMessage, currentUser.id, group.id]);
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -184,6 +236,24 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
       handleSendMessage();
     }
   };
+
+  // "Stopped typing" fires once, 2s after the last keystroke — same
+  // debounce shape as ChatView's debouncedStopTyping. sendGroupTyping
+  // itself is debounced internally (at most once every 500ms), so it's
+  // called directly on every keystroke rather than behind an extra
+  // debounce, keeping the very first "is typing" signal instant.
+  const debouncedStopGroupTyping = useMemo(
+    () => debounce(() => {
+      typingService.sendGroupStoppedTyping(currentUser.id, group.id);
+    }, 2000),
+    [currentUser.id, group.id]
+  );
+
+  const handleMessageTextChange = useCallback((value: string) => {
+    setMessageText(value);
+    typingService.sendGroupTyping(currentUser.id, group.id);
+    debouncedStopGroupTyping();
+  }, [currentUser.id, group.id, debouncedStopGroupTyping]);
 
   // Generalized upload handler for photos/videos/files, mirroring
   // ChatView's handleFileUpload(file, type).
@@ -268,11 +338,16 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
         durationRef.current = duration;
         return { ...prev, duration };
       });
-      // Note: unlike 1:1 chat, groups have no realtime "recording audio..."
-      // broadcast infra yet, so there's no heartbeat call here — other
-      // members simply won't see a live recording indicator for now.
+
+      // Re-send "recording" every second as a heartbeat while this keeps
+      // running — same reasoning as ChatView's 1:1 heartbeat: the other
+      // members' indicator (typingService.subscribeToGroupRecording)
+      // auto-expires 3s after the last signal as a dropped-connection
+      // safety net, so a recording longer than ~3s needs refreshing well
+      // inside that window to stay visible for its entire real length.
+      typingService.sendGroupRecording(currentUser.id, group.id);
     }, 1000);
-  }, []);
+  }, [currentUser.id, group.id]);
 
   const resumeRecording = useCallback(() => {
     if (mediaRecorderRef.current?.state === 'paused') {
@@ -398,6 +473,12 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
 
       updateWaveform();
       startDurationTimer();
+
+      // Let the other group members know a voice message is being
+      // recorded — same realtime mechanism as the group typing indicator,
+      // its own event type so the chat header / groups list can show
+      // "recording audio..." instead of typing dots.
+      typingService.sendGroupRecording(currentUser.id, group.id);
     } catch (error) {
       console.error('Error starting recording:', error);
       alert('Could not access microphone. Please allow microphone access and try again.');
@@ -418,6 +499,13 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
 
   const stopRecording = (cancel: boolean = false) => {
     isRecordingActiveRef.current = false;
+
+    // Tell the other group members recording has ended, whether it's being
+    // sent or cancelled — their "recording audio..." indicator shouldn't
+    // outlive the actual recording (it also auto-expires after a few
+    // seconds on their end as a safety net, but this makes it disappear
+    // instantly).
+    typingService.sendGroupStoppedRecording(currentUser.id, group.id);
 
     lastRecordingRef.current = { duration: Math.max(1, durationRef.current), waveform: fullWaveformRef.current };
 
@@ -621,6 +709,27 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
     const profile = memberProfiles[senderId];
     return profile?.avatar_url;
   };
+
+  // Turns a set of member ids into a WhatsApp-style "Alice is typing" /
+  // "Alice and Bob are typing" / "Alice and 2 others are typing" label —
+  // recording takes priority over typing, same as the 1:1 indicator and
+  // the Chats list's per-friend preview (a member who's doing both only
+  // shows as "recording audio").
+  const describeActivity = (userIds: Set<string>): string => {
+    const names = Array.from(userIds).map(id => getSenderName(id));
+    if (names.length === 0) return '';
+    if (names.length === 1) return names[0];
+    if (names.length === 2) return `${names[0]} and ${names[1]}`;
+    return `${names[0]} and ${names.length - 1} others`;
+  };
+
+  const activeRecordingUserIds = recordingUserIds;
+  const activeTypingUserIds = useMemo(() => {
+    if (recordingUserIds.size === 0) return typingUserIds;
+    const next = new Set(typingUserIds);
+    recordingUserIds.forEach(id => next.delete(id));
+    return next;
+  }, [typingUserIds, recordingUserIds]);
 
   // Message Action Handlers
   const handleMessageLongPress = useCallback((message: GroupMessageWithStatus, position: { x: number; y: number }) => {
@@ -954,9 +1063,30 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
             </div>
             <div className="flex-1 min-w-0">
               <h2 className="font-semibold text-sm truncate">{group.name}</h2>
-              <p className="text-xs text-white/70 truncate">
-                {members.length} members
-                {!isOnline && ' • Offline'}
+              <p
+                key={activeRecordingUserIds.size > 0 ? 'recording' : activeTypingUserIds.size > 0 ? 'typing' : 'status'}
+                className="text-xs text-white/70 truncate animate-fade-in"
+              >
+                {activeRecordingUserIds.size > 0 ? (
+                  <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle max-w-full truncate">
+                    <Mic className="w-3 h-3 recording-indicator-mic shrink-0" strokeWidth={2.5} />
+                    {describeActivity(activeRecordingUserIds)} recording audio
+                  </span>
+                ) : activeTypingUserIds.size > 0 ? (
+                  <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle max-w-full truncate">
+                    {describeActivity(activeTypingUserIds)} typing
+                    <span className="flex items-end gap-0.5 h-2 shrink-0">
+                      <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '0ms' }} />
+                      <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '150ms' }} />
+                      <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '300ms' }} />
+                    </span>
+                  </span>
+                ) : (
+                  <>
+                    {members.length} members
+                    {!isOnline && ' • Offline'}
+                  </>
+                )}
               </p>
             </div>
           </button>
@@ -1275,7 +1405,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                 type="text"
                 placeholder="Type a message..."
                 value={messageText}
-                onChange={(e) => setMessageText(e.target.value)}
+                onChange={(e) => handleMessageTextChange(e.target.value)}
                 onKeyPress={handleKeyPress}
                 onFocus={() => {
                   setTimeout(() => {

@@ -1,7 +1,8 @@
-import { useState } from 'react';
-import { Users, Plus, Search, ChevronRight } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Users, Plus, Search, ChevronRight, Mic } from 'lucide-react';
 import { GroupWithMembers } from '../services/groupService';
 import { UserProfile } from '../types';
+import { typingService } from '../services/typingService';
 
 interface GroupsProps {
   currentUser: UserProfile;
@@ -12,6 +13,135 @@ interface GroupsProps {
 
 export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: GroupsProps) {
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Typing/recording previews for every group row — same reconciliation
+  // pattern as Chats.tsx's per-friend typing subscriptions (diff instead of
+  // rebuild, keyed off a stable sorted-ids string rather than the whole
+  // `groups` array, which gets a fresh reference on practically every live
+  // update). The one structural difference from Chats.tsx is that a group
+  // can have more than one member typing/recording at once, so each group
+  // id maps to a Set of active member ids instead of a single boolean.
+  const [typingByGroup, setTypingByGroup] = useState<Map<string, Set<string>>>(new Map());
+  const [recordingByGroup, setRecordingByGroup] = useState<Map<string, Set<string>>>(new Map());
+  const typingSubscriptionsRef = useRef<Map<string, { unsubscribe: () => void }>>(new Map());
+  const recordingSubscriptionsRef = useRef<Map<string, { unsubscribe: () => void }>>(new Map());
+
+  const groupIdsKey = groups.map(group => group.id).sort().join(',');
+
+  useEffect(() => {
+    const groupIds = groupIdsKey ? groupIdsKey.split(',') : [];
+    const groupIdSet = new Set(groupIds);
+    const subscriptions = typingSubscriptionsRef.current;
+
+    subscriptions.forEach((sub, groupId) => {
+      if (!groupIdSet.has(groupId)) {
+        sub.unsubscribe();
+        subscriptions.delete(groupId);
+        setTypingByGroup(prev => {
+          if (!prev.has(groupId)) return prev;
+          const next = new Map(prev);
+          next.delete(groupId);
+          return next;
+        });
+      }
+    });
+
+    groupIds.forEach(groupId => {
+      if (!subscriptions.has(groupId)) {
+        const subscription = typingService.subscribeToGroupTyping(
+          currentUser.id,
+          groupId,
+          (userId, isTyping) => {
+            setTypingByGroup(prev => {
+              const next = new Map(prev);
+              const current = new Set(next.get(groupId));
+              if (isTyping) current.add(userId); else current.delete(userId);
+              next.set(groupId, current);
+              return next;
+            });
+          }
+        );
+        subscriptions.set(groupId, subscription);
+      }
+    });
+  }, [currentUser.id, groupIdsKey]);
+
+  useEffect(() => {
+    const groupIds = groupIdsKey ? groupIdsKey.split(',') : [];
+    const groupIdSet = new Set(groupIds);
+    const subscriptions = recordingSubscriptionsRef.current;
+
+    subscriptions.forEach((sub, groupId) => {
+      if (!groupIdSet.has(groupId)) {
+        sub.unsubscribe();
+        subscriptions.delete(groupId);
+        setRecordingByGroup(prev => {
+          if (!prev.has(groupId)) return prev;
+          const next = new Map(prev);
+          next.delete(groupId);
+          return next;
+        });
+      }
+    });
+
+    groupIds.forEach(groupId => {
+      if (!subscriptions.has(groupId)) {
+        const subscription = typingService.subscribeToGroupRecording(
+          currentUser.id,
+          groupId,
+          (userId, isRecording) => {
+            setRecordingByGroup(prev => {
+              const next = new Map(prev);
+              const current = new Set(next.get(groupId));
+              if (isRecording) current.add(userId); else current.delete(userId);
+              next.set(groupId, current);
+              return next;
+            });
+          }
+        );
+        subscriptions.set(groupId, subscription);
+      }
+    });
+  }, [currentUser.id, groupIdsKey]);
+
+  // Unmount-only cleanup — intentionally not tied to `groups`/currentUser.id
+  // for the same reconciliation reasons as Chats.tsx.
+  useEffect(() => {
+    return () => {
+      typingSubscriptionsRef.current.forEach(sub => sub.unsubscribe());
+      typingSubscriptionsRef.current.clear();
+      recordingSubscriptionsRef.current.forEach(sub => sub.unsubscribe());
+      recordingSubscriptionsRef.current.clear();
+    };
+  }, []);
+
+  // Turn a group's active typing/recording member ids into a short,
+  // WhatsApp-style label using that group's own member profiles (already
+  // loaded on the `group` object, so no extra lookups are needed) —
+  // recording takes priority over typing for a member doing both.
+  const getActivity = useCallback((group: GroupWithMembers): { kind: 'recording' | 'typing'; label: string } | null => {
+    const recordingIds = recordingByGroup.get(group.id);
+    const typingIds = typingByGroup.get(group.id);
+
+    const activeRecording = recordingIds && recordingIds.size > 0 ? recordingIds : null;
+    const activeTyping = !activeRecording && typingIds && typingIds.size > 0
+      ? new Set(Array.from(typingIds).filter(id => !recordingIds?.has(id)))
+      : null;
+
+    const ids = activeRecording ?? (activeTyping && activeTyping.size > 0 ? activeTyping : null);
+    if (!ids || ids.size === 0) return null;
+
+    const names = Array.from(ids).map(
+      id => group.members.find(m => m.user_id === id)?.profile?.full_name?.split(' ')[0] || 'Someone'
+    );
+    const label = names.length === 1
+      ? names[0]
+      : names.length === 2
+        ? `${names[0]} and ${names[1]}`
+        : `${names[0]} and ${names.length - 1} others`;
+
+    return { kind: activeRecording ? 'recording' : 'typing', label };
+  }, [recordingByGroup, typingByGroup]);
 
   const formatTime = (timestamp: string) => {
     const date = new Date(timestamp);
@@ -89,7 +219,9 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
             )}
           </div>
         ) : (
-          filteredGroups.map((group, index) => (
+          filteredGroups.map((group, index) => {
+            const activity = getActivity(group);
+            return (
             <button
               key={group.id}
               onClick={() => onOpenGroup(group)}
@@ -120,7 +252,21 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
 
                 <div className="flex items-center gap-2">
                   <p className="text-xs text-slate-500 truncate flex-1">
-                    {group.lastMessage ? (
+                    {activity ? (
+                      <span className="inline-flex items-center gap-1.5 text-violet-600 font-medium">
+                        {activity.kind === 'recording' && (
+                          <Mic className="w-3 h-3 recording-indicator-mic shrink-0" strokeWidth={2.5} />
+                        )}
+                        <span className="truncate">
+                          {activity.label} {activity.kind === 'recording' ? 'recording audio' : 'typing'}
+                        </span>
+                        <span className="flex items-end gap-0.5 h-2 shrink-0">
+                          <span className="w-1 h-1 bg-violet-500 rounded-full typing-dot" style={{ animationDelay: '0ms' }} />
+                          <span className="w-1 h-1 bg-violet-500 rounded-full typing-dot" style={{ animationDelay: '150ms' }} />
+                          <span className="w-1 h-1 bg-violet-500 rounded-full typing-dot" style={{ animationDelay: '300ms' }} />
+                        </span>
+                      </span>
+                    ) : group.lastMessage ? (
                       <>
                         <span className="font-medium text-slate-600">
                           {group.lastMessage.sender_id === currentUser.id
@@ -148,7 +294,8 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
 
               <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-violet-500 transition-colors flex-shrink-0" />
             </button>
-          ))
+            );
+          })
         )}
       </div>
     </div>
