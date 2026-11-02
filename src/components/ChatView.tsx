@@ -1567,8 +1567,23 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
         durationRef.current = duration;
         return { ...prev, duration };
       });
+
+      // Re-send "recording" every second as a heartbeat while this keeps
+      // running. The contact's indicator (typingService.subscribeToRecording)
+      // auto-expires 3s after the last signal it received as a safety net
+      // for a dropped connection — without a heartbeat, that meant a real
+      // recording longer than ~3s made their "recording audio" indicator
+      // vanish on its own well before the recording actually stopped. This
+      // keeps it refreshed every second — comfortably inside that 3s
+      // window — so it stays visible for the recording's *entire* real
+      // length, no matter how long that turns out to be, and still
+      // self-heals the same way if the connection genuinely drops. The
+      // explicit "stopped recording" call in stopRecording (sent the
+      // instant the mic button is released) is what makes it disappear
+      // instantly rather than waiting out this interval.
+      typingService.sendRecording(currentUser.id, contact.user_id);
     }, 1000);
-  }, []);
+  }, [currentUser.id, contact.user_id]);
 
   // Pause/resume a *locked* recording in place (same clip, same upload at
   // the end) — mirrors WhatsApp's locked-recording pause button. Recording
