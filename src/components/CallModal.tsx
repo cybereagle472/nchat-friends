@@ -12,6 +12,25 @@ interface CallModalProps {
   onClose: () => void;
 }
 
+// Setting `srcObject` plus the `autoPlay` attribute is usually enough, but
+// on some mobile browsers a stream attached asynchronously well after the
+// gesture that started the call (which is exactly when a WebRTC track
+// shows up — it depends on signaling/ICE finishing, not on anything the
+// user just tapped) doesn't reliably auto-start: the element just sits
+// there attached but never actually playing, with no visible error. This
+// is the one documented case of a real-device test where the far side's
+// video (and possibly audio) looked connected but never actually rendered.
+// Explicitly calling .play() covers that gap; the rejection is swallowed
+// since autoPlay already covers the common case and a thrown/rejected
+// promise here would otherwise surface as an unhandled rejection for
+// something that isn't actually fatal to the call.
+function playSafely(el: HTMLMediaElement | null) {
+  el?.play().catch(() => {
+    /* Autoplay can still be blocked in rare cases; nothing actionable to
+       do about it here, and the call itself isn't broken by it. */
+  });
+}
+
 // No one answers within this long → treat it as a missed call rather than
 // ringing forever.
 const RING_TIMEOUT_MS = 45_000;
@@ -42,6 +61,13 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  // Audio-only calls never render the <video> element that `remoteVideoRef`
+  // points to (it only exists in the video-call layout below), so the
+  // incoming audio track had nowhere to actually play — the call could
+  // connect, the timer would run, but neither side ever heard anything.
+  // This hidden <audio> element is always mounted for audio calls
+  // specifically so there's always somewhere for the remote track to go.
+  const remoteAudioRef = useRef<HTMLAudioElement>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const callIdRef = useRef<string | null>(null);
@@ -150,6 +176,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
     localStreamRef.current = result.data;
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = result.data;
+      playSafely(localVideoRef.current);
     }
 
     return result.data;
@@ -170,8 +197,17 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
         }
       },
       (stream) => {
+        // Only one of these two refs is ever actually mounted for a given
+        // call (video calls render the <video>, audio calls render the
+        // hidden <audio>), so this never double-plays the same stream
+        // through two elements at once.
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = stream;
+          playSafely(remoteVideoRef.current);
+        }
+        if (remoteAudioRef.current) {
+          remoteAudioRef.current.srcObject = stream;
+          playSafely(remoteAudioRef.current);
         }
       },
       (state) => {
@@ -270,8 +306,18 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
         await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
         remoteDescriptionSetRef.current = true;
         await flushPendingRemoteCandidates(pc);
-        setCallState('connecting');
-        startConnectingTimeout();
+        // On a fast/local network, ICE can finish connecting *during* the
+        // awaits above (applying a backlog of already-queued remote
+        // candidates can be enough on its own) — if that already flipped
+        // the state to 'connected' via the peer connection's own state
+        // handler, don't stomp it back to 'connecting' here. This is
+        // exactly how one side could show "Connected" with the timer
+        // already running while the other side's screen stayed on
+        // "Connecting..." forever despite the call actually working.
+        if (!everConnectedRef.current) {
+          setCallState('connecting');
+          startConnectingTimeout();
+        }
       },
       onCallEnded: (id, status) => {
         if (id !== callId || endedRef.current) return;
@@ -384,18 +430,49 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await callService.answerCall(incomingCall.id, answer);
 
-      setCallState('connecting');
-      startConnectingTimeout();
+      // This was previously called without checking its result at all —
+      // if the POST actually failed server-side (most commonly a 409
+      // because the caller had already hung up right as Accept was
+      // tapped), the code just carried on as if it had succeeded, leaving
+      // this side showing "Connecting..." against a caller who was never
+      // actually told we answered and so never sends an SDP/ICE exchange
+      // back. That silent-failure gap is one way the two sides' screens
+      // could end up disagreeing about whether the call ever connected.
+      const answerResult = await callService.answerCall(incomingCall.id, answer);
+      if (!answerResult.success) {
+        // Most likely the call is simply already over on the other end —
+        // nothing left to connect to, so just close quietly rather than
+        // reporting anything back (there's no one left to report it to).
+        endedRef.current = true;
+        cleanupCall();
+        setTimeout(onClose, 1000);
+        return;
+      }
+
+      // Same guard as the caller's onCallAnswered handler — ICE/DTLS can
+      // genuinely finish while the `answerCall` request above was still in
+      // flight (everything it needed, including the caller's queued
+      // candidates, was already applied just before this), so don't
+      // overwrite an already-'connected' state back to 'connecting'.
+      if (!everConnectedRef.current) {
+        setCallState('connecting');
+        startConnectingTimeout();
+      }
       // Already subscribed to signaling since the ringing screen appeared
       // (see the mount effect below) — no need to subscribe again here.
     } catch (err: any) {
       console.error('Error answering call:', err);
       setError('Failed to answer call');
-      // Let the caller know we couldn't actually pick up, instead of
-      // leaving them stuck on "ringing" indefinitely.
-      await callService.endCall(incomingCall.id, 'declined');
+      // This is a genuine local failure (camera/mic error, a bad offer,
+      // etc.) — we never actually managed to join, which is a dropped
+      // call, not a deliberate decline. Reporting it as 'declined' here
+      // used to make the caller's screen say "declined" for something
+      // that had nothing to do with anyone actually rejecting the call.
+      endedRef.current = true;
+      if (callIdRef.current) {
+        await callService.endCall(callIdRef.current, 'ended');
+      }
       cleanupCall();
       setTimeout(onClose, 2000);
     }
@@ -448,24 +525,35 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [calleeId, incomingCall]);
 
+  // Toggles every audio/video track this call actually has, rather than
+  // just whatever's on localStreamRef — on at least one real-device test
+  // the Mute button visibly flipped its own icon but didn't actually stop
+  // sending audio, which points at the local MediaStream's track not being
+  // the exact same instance the peer connection's sender was still sending
+  // (possible on some mobile browsers when a device is swapped/recreated
+  // mid-setup). Walking the RTCPeerConnection's own senders directly, in
+  // addition to the local stream, means the one actually being transmitted
+  // always gets toggled too, regardless of which reference ends up stale.
   const toggleMute = () => {
-    if (localStreamRef.current) {
-      const audioTrack = localStreamRef.current.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled;
-        setIsMuted(!audioTrack.enabled);
-      }
-    }
+    const nextMuted = !isMuted;
+    const audioTracks = new Set<MediaStreamTrack>();
+    localStreamRef.current?.getAudioTracks().forEach((t) => audioTracks.add(t));
+    peerConnectionRef.current?.getSenders().forEach((sender) => {
+      if (sender.track?.kind === 'audio') audioTracks.add(sender.track);
+    });
+    audioTracks.forEach((t) => { t.enabled = !nextMuted; });
+    setIsMuted(nextMuted);
   };
 
   const toggleVideo = () => {
-    if (localStreamRef.current) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.enabled = !videoTrack.enabled;
-        setIsVideoOff(!videoTrack.enabled);
-      }
-    }
+    const nextVideoOff = !isVideoOff;
+    const videoTracks = new Set<MediaStreamTrack>();
+    localStreamRef.current?.getVideoTracks().forEach((t) => videoTracks.add(t));
+    peerConnectionRef.current?.getSenders().forEach((sender) => {
+      if (sender.track?.kind === 'video') videoTracks.add(sender.track);
+    });
+    videoTracks.forEach((t) => { t.enabled = !nextVideoOff; });
+    setIsVideoOff(nextVideoOff);
   };
 
   const toggleSpeaker = () => {
@@ -562,6 +650,13 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       ) : (
         /* Audio Call View */
         <div className="relative w-full h-full flex flex-col">
+          {/* Not visible by design — this is purely so the remote party's
+              audio track has an element to actually play through. Without
+              it, an audio call could reach "Connected" and run its timer
+              with neither side ever hearing anything, since nothing was
+              ever attached to the incoming audio track. */}
+          <audio ref={remoteAudioRef} autoPlay playsInline />
+
           {/* Background Pattern */}
           <div className="absolute inset-0 overflow-hidden">
             <div className="absolute top-1/4 left-1/2 -translate-x-1/2 w-[600px] h-[600px] rounded-full bg-gradient-to-br from-violet-500/20 to-purple-600/20 blur-3xl" />
