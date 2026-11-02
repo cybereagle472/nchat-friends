@@ -143,6 +143,44 @@ interface WireCallHistoryRow {
   other_profile?: UserProfile;
 }
 
+// Tunes each sender's encoding so audio stays clear even when video is
+// competing for the same (often limited, mobile) connection — without
+// this, a congested link naturally lets video eat into the bandwidth
+// audio needs, which shows up as choppy/garbled/noisy-sounding audio.
+// Giving audio a healthy floor and explicit network priority, and capping
+// video's ceiling, keeps voice quality consistent regardless of video.
+function prioritizeAudioQuality(pc: RTCPeerConnection) {
+  pc.getSenders().forEach((sender) => {
+    if (!sender.track) return;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+      }
+      const encoding = params.encodings[0] as RTCRtpEncodingParameters & {
+        priority?: string;
+        networkPriority?: string;
+      };
+      if (sender.track.kind === 'audio') {
+        encoding.maxBitrate = 64_000; // plenty of headroom for clear Opus voice
+        encoding.priority = 'high';
+        encoding.networkPriority = 'high';
+      } else if (sender.track.kind === 'video') {
+        encoding.maxBitrate = 900_000; // enough for a decent 720p picture, capped so it can't crowd out audio
+        encoding.priority = 'medium';
+        encoding.networkPriority = 'medium';
+      }
+      sender.setParameters(params).catch(() => {
+        /* Some browsers reject setParameters before the first negotiation
+           completes — harmless, the call still works without this tuning. */
+      });
+    } catch {
+      // getParameters/setParameters encoding tuning isn't supported
+      // everywhere (notably older WebViews) — nothing more to do here.
+    }
+  });
+}
+
 export const callService = {
   /**
    * Initiate a call. The offer must already be created (createPeerConnection
@@ -257,6 +295,15 @@ export const callService = {
   /**
    * Create RTCPeerConnection with proper configuration
    */
+  /**
+   * Re-balance sender bitrates so audio stays clear/smooth even when video
+   * is competing for bandwidth. Call this once local tracks have actually
+   * been added to the peer connection.
+   */
+  prioritizeAudioQuality(pc: RTCPeerConnection) {
+    prioritizeAudioQuality(pc);
+  },
+
   async createPeerConnection(
     onIceCandidate: (candidate: RTCIceCandidate) => void,
     onTrack: (stream: MediaStream) => void,
@@ -315,9 +362,37 @@ export const callService = {
     callType: 'audio' | 'video'
   ): Promise<ServiceResult<MediaStream>> {
     try {
+      // Plain `audio: true` leaves it up to the browser/OS whether to
+      // actually apply noise suppression, echo cancellation and gain
+      // control (defaults vary a lot across Android OEMs/browsers — some
+      // ship fairly weak defaults). Asking for all three explicitly as
+      // `ideal` gets the strongest available processing without failing
+      // the call on a device that can't honor one of them. The legacy
+      // `goog*` properties are non-standard Chrome-only extensions that
+      // tend to meaningfully improve mobile mic quality further where
+      // they're supported; unsupported properties are simply ignored
+      // rather than rejected, so this is safe everywhere else.
       const constraints: MediaStreamConstraints = {
-        audio: true,
+        audio: {
+          echoCancellation: { ideal: true },
+          noiseSuppression: { ideal: true },
+          autoGainControl: { ideal: true },
+          channelCount: { ideal: 1 },
+          ...({
+            googEchoCancellation: true,
+            googNoiseSuppression: true,
+            googAutoGainControl: true,
+            googHighpassFilter: true,
+            googTypingNoiseDetection: true,
+          } as MediaTrackConstraints),
+        },
         video: callType === 'video'
+          ? {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 30, max: 30 },
+            }
+          : false,
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);

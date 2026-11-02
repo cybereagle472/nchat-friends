@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Phone, PhoneOff, Mic, MicOff, Video, VideoOff, Volume2, RotateCcw, X } from 'lucide-react';
+import { Phone, PhoneOff, Mic, MicOff, Video, VideoOff, Volume2, RotateCcw, X, ChevronsRight } from 'lucide-react';
 import { callService } from '../services/callService';
 import { profileService } from '../services/profileService';
 import { UserProfile, Call } from '../types';
@@ -33,34 +33,59 @@ function playSafely(el: HTMLMediaElement | null) {
 
 // The Speaker button used to only toggle its own highlighted look — it
 // never actually changed where audio played, so audio calls always came
-// out of the loud external speaker regardless of the button's state. This
-// routes playback to the earpiece-like output by default and only to the
-// loud speaker once the user actually asks for it, using the standard
-// Audio Output Devices API (`setSinkId`). Device labels aren't perfectly
-// standardized across phones/browsers, so this matches on common
-// name patterns and simply leaves the current output alone if it can't
-// confidently tell which device is which (better than guessing wrong).
-// Support varies by platform — notably Safari/iOS does not implement
-// `setSinkId` at all, so this call is a no-op there and the OS's own
-// default behavior applies instead.
+// out of the loud external speaker regardless of the button's state.
+//
+// IMPORTANT, confirmed platform limitation: on Android, Chrome (and every
+// Chromium-based browser) does not expose any way for a web page to pick
+// the earpiece — Google's own Chromium team closed this exact feature
+// request as "Won't Fix" (the platform doesn't let a web app route
+// different audio streams to different outputs independently; see
+// issues.chromium.org/issues/41276355). enumerateDevices() on Android
+// Chrome returns at most a single generic "Default" audiooutput entry, so
+// there is nothing to actually switch to — audio/video calls in ANY
+// browser on Android always play through the loud speaker, full stop.
+// This is a dead end that cannot be fixed from this codebase; the only
+// way around it is a native app (or a wrapped app with a native WebRTC
+// plugin) that can call Android's AudioManager directly.
+//
+// iOS Safari/WebKit takes a different, genuinely usable approach: it
+// doesn't support setSinkId either, but exposes navigator.audioSession
+// (iOS 16.4+) to declare the page as doing a voice call, which is what
+// actually makes the OS prefer the earpiece; setSinkId to the specific
+// "receiver" device (once that session type is active) then picks
+// between the two. Desktop Chrome/Edge/Firefox have real, distinct
+// output devices (e.g. headphones vs. built-in speakers) where
+// setSinkId works as documented.
 async function applyAudioOutput(el: HTMLMediaElement | null, speakerOn: boolean) {
+  // iOS: this is what actually flips the OS's preferred route — setSinkId
+  // alone does nothing there without it first. Safe to call
+  // unconditionally; it's a no-op on every other platform.
+  const audioSession = (navigator as any).audioSession;
+  if (audioSession) {
+    try {
+      audioSession.type = speakerOn ? 'auto' : 'play-and-record';
+    } catch {
+      /* Unsupported iOS/Safari version — ignore. */
+    }
+  }
+
   if (!el || typeof (el as any).setSinkId !== 'function') return;
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const outputs = devices.filter((d) => d.kind === 'audiooutput');
-    const earpiece = outputs.find((d) => /ear\s?piece|receiver/i.test(d.label));
+    const earpiece = outputs.find((d) => /ear.?piece|receiver|handset/i.test(d.label));
     const speaker = outputs.find((d) => /speaker/i.test(d.label));
     const target = speakerOn ? speaker : earpiece;
     if (target) {
       await (el as any).setSinkId(target.deviceId);
     } else if (speakerOn) {
       // Couldn't positively identify a named speaker device — the system
-      // default output is the loud speaker on most mobile browsers, so
-      // that still satisfies "speaker on".
+      // default output is the loud speaker on virtually every platform,
+      // so that still satisfies "speaker on".
       await (el as any).setSinkId('');
     }
-    // If earpiece couldn't be identified, leave the current output as-is
-    // rather than risk forcing it to the wrong device.
+    // If earpiece couldn't be identified (the normal case on Android —
+    // see above), leave the current output as-is rather than guess wrong.
   } catch {
     // enumerateDevices()/setSinkId() unsupported or blocked — nothing more
     // that can be done from here; the call itself still works fine.
@@ -297,6 +322,10 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       localStreamRef.current.getTracks().forEach((track) => {
         pc.addTrack(track, localStreamRef.current!);
       });
+      // Keep audio clear/smooth even when video is also running by giving
+      // it priority and a bandwidth floor, and capping video so it can't
+      // crowd audio out on a constrained connection.
+      callService.prioritizeAudioQuality(pc);
     }
 
     peerConnectionRef.current = pc;
@@ -803,28 +832,107 @@ function IncomingCallControls({
   onAnswer: () => void;
 }) {
   return (
-    <div className="flex items-center justify-center gap-16">
+    <div className="flex flex-col items-center gap-8 w-full">
       {/* Decline Button */}
       <div className="flex flex-col items-center gap-2">
         <button
           onClick={onDecline}
-          className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 active:scale-95 transition-all"
+          className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 hover:scale-105 active:scale-90 active:shadow-red-500/70 transition-all duration-150"
         >
           <PhoneOff className="w-7 h-7" />
         </button>
         <span className="text-white/70 text-sm">Decline</span>
       </div>
 
-      {/* Answer Button */}
-      <div className="flex flex-col items-center gap-2">
-        <button
-          onClick={onAnswer}
-          className="w-16 h-16 rounded-full bg-green-500 flex items-center justify-center text-white shadow-lg shadow-green-500/40 hover:bg-green-600 active:scale-95 transition-all animate-pulse"
-        >
-          <Phone className="w-7 h-7" />
-        </button>
-        <span className="text-white/70 text-sm">Accept</span>
+      {/* Slide to answer */}
+      <SlideToAnswer onAnswer={onAnswer} />
+    </div>
+  );
+}
+
+// Slide-to-answer gesture control. A plain tappable button answered the
+// call the instant it was touched, with barely any visible feedback that
+// anything had happened — easy to trigger by accident and didn't feel
+// like a deliberate action. Dragging the handle all the way across gives
+// continuous, obvious visual feedback the whole time (the handle follows
+// your finger exactly, the track fills in as you go) and makes answering
+// a clear, intentional gesture instead of a single ambiguous tap.
+function SlideToAnswer({ onAnswer }: { onAnswer: () => void }) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const [dragX, setDragX] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const [completed, setCompleted] = useState(false);
+  const maxDragRef = useRef(1);
+  const originXRef = useRef(0);
+
+  const HANDLE_SIZE = 56;
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (completed) return;
+    const track = trackRef.current;
+    if (!track) return;
+    maxDragRef.current = Math.max(1, track.clientWidth - HANDLE_SIZE);
+    originXRef.current = e.clientX - dragX;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setDragging(true);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (!dragging || completed) return;
+    const next = Math.min(Math.max(0, e.clientX - originXRef.current), maxDragRef.current);
+    setDragX(next);
+  };
+
+  const finishDrag = () => {
+    if (completed) return;
+    setDragging(false);
+    if (dragX / maxDragRef.current > 0.7) {
+      setCompleted(true);
+      setDragX(maxDragRef.current);
+      onAnswer();
+    } else {
+      setDragX(0);
+    }
+  };
+
+  const progress = maxDragRef.current > 0 ? dragX / maxDragRef.current : 0;
+
+  return (
+    <div
+      ref={trackRef}
+      className="relative h-14 w-full max-w-sm rounded-full bg-white/15 backdrop-blur-sm overflow-hidden select-none touch-none"
+    >
+      {/* Fill trailing the handle */}
+      <div
+        className="absolute inset-y-0 left-0 bg-green-500/30 rounded-full pointer-events-none"
+        style={{
+          width: `${dragX + HANDLE_SIZE / 2}px`,
+          transition: dragging ? 'none' : 'width 200ms ease',
+        }}
+      />
+      {/* Hint text, fades out as the handle covers it */}
+      <div
+        className="absolute inset-0 flex items-center justify-center gap-1 text-white/80 text-sm font-medium pointer-events-none"
+        style={{ opacity: Math.max(0, 1 - progress * 1.6) }}
+      >
+        <span>Slide to answer</span>
+        <ChevronsRight className="w-4 h-4 animate-pulse" />
       </div>
+      {/* Draggable handle */}
+      <button
+        aria-label="Slide to answer call"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={finishDrag}
+        onPointerCancel={finishDrag}
+        className="absolute top-0 left-0 w-14 h-14 rounded-full bg-green-500 flex items-center justify-center text-white shadow-lg shadow-green-500/40 touch-none"
+        style={{
+          transform: `translateX(${dragX}px)`,
+          transition: dragging ? 'none' : 'transform 200ms ease',
+        }}
+      >
+        <Phone className="w-6 h-6" />
+      </button>
     </div>
   );
 }
@@ -849,7 +957,7 @@ function AudioCallControls({
       <div className="flex flex-col items-center gap-2">
         <button
           onClick={onToggleMute}
-          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all active:scale-95 ${
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-150 hover:scale-105 active:scale-90 ${
             isMuted
               ? 'bg-white text-slate-900'
               : 'bg-white/15 backdrop-blur-sm text-white hover:bg-white/25'
@@ -864,7 +972,7 @@ function AudioCallControls({
       <div className="flex flex-col items-center gap-2">
         <button
           onClick={onEndCall}
-          className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 active:scale-95 transition-all"
+          className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 hover:scale-105 active:scale-90 active:shadow-red-500/70 transition-all duration-150"
         >
           <PhoneOff className="w-7 h-7" />
         </button>
@@ -875,7 +983,7 @@ function AudioCallControls({
       <div className="flex flex-col items-center gap-2">
         <button
           onClick={onToggleSpeaker}
-          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all active:scale-95 ${
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-150 hover:scale-105 active:scale-90 ${
             isSpeakerOn
               ? 'bg-white text-slate-900'
               : 'bg-white/15 backdrop-blur-sm text-white hover:bg-white/25'
@@ -910,7 +1018,7 @@ function VideoCallControls({
       {/* Flip Camera */}
       <button
         onClick={onFlipCamera}
-        className="w-12 h-12 rounded-full bg-white/15 backdrop-blur-sm flex items-center justify-center text-white hover:bg-white/25 active:scale-95 transition-all"
+        className="w-12 h-12 rounded-full bg-white/15 backdrop-blur-sm flex items-center justify-center text-white hover:bg-white/25 hover:scale-105 active:scale-90 transition-all duration-150"
       >
         <RotateCcw className="w-5 h-5" />
       </button>
@@ -918,7 +1026,7 @@ function VideoCallControls({
       {/* Toggle Video */}
       <button
         onClick={onToggleVideo}
-        className={`w-12 h-12 rounded-full flex items-center justify-center transition-all active:scale-95 ${
+        className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-150 hover:scale-105 active:scale-90 ${
           isVideoOff
             ? 'bg-white text-slate-900'
             : 'bg-white/15 backdrop-blur-sm text-white hover:bg-white/25'
@@ -930,7 +1038,7 @@ function VideoCallControls({
       {/* Toggle Mute */}
       <button
         onClick={onToggleMute}
-        className={`w-12 h-12 rounded-full flex items-center justify-center transition-all active:scale-95 ${
+        className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-150 hover:scale-105 active:scale-90 ${
           isMuted
             ? 'bg-white text-slate-900'
             : 'bg-white/15 backdrop-blur-sm text-white hover:bg-white/25'
@@ -942,7 +1050,7 @@ function VideoCallControls({
       {/* End Call */}
       <button
         onClick={onEndCall}
-        className="w-14 h-14 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 active:scale-95 transition-all"
+        className="w-14 h-14 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 hover:scale-105 active:scale-90 active:shadow-red-500/70 transition-all duration-150"
       >
         <PhoneOff className="w-6 h-6" />
       </button>
