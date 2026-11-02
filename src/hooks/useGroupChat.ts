@@ -66,15 +66,26 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
 
   const messagesSubRef = useRef<GroupSubscription | null>(null);
   const membersSubRef = useRef<GroupSubscription | null>(null);
+  const readReceiptSubRef = useRef<GroupSubscription | null>(null);
   const oldestMessageRef = useRef<string | null>(null);
+
+  // Per-member "read up to" timestamps (ISO strings), used to derive the
+  // double-check "read by everyone" tick on messages *I* sent. Seeded from
+  // each member's last_read_at (groupWithMembers() on the Worker) and kept
+  // live by subscribeToGroupReadReceipts below — no refetch needed when
+  // someone reads the chat while it's open.
+  const [readStates, setReadStates] = useState<Record<string, string>>({});
 
   const applyMembers = useCallback((memberList: GroupMember[]) => {
     setMembers(memberList);
     const profileMap: Record<string, UserProfile> = {};
+    const readMap: Record<string, string> = {};
     memberList.forEach((m) => {
       if (m.profile) profileMap[m.user_id] = m.profile;
+      if (m.last_read_at) readMap[m.user_id] = m.last_read_at;
     });
     setMemberProfiles((prev) => ({ ...prev, ...profileMap }));
+    setReadStates((prev) => ({ ...prev, ...readMap }));
   }, []);
 
   // Setup connectivity listeners
@@ -366,6 +377,15 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
           return prev;
         });
         onNewMessage?.(newMessage);
+
+        // Keep advancing my read high-water-mark while the chat stays
+        // open, same as ChatView does for 1:1 — otherwise my last_read_at
+        // would freeze at "whenever I opened this screen" and every
+        // message that arrives afterwards would still count as unread the
+        // moment I leave, even though I was looking right at it.
+        if (newMessage.sender_id !== userId) {
+          markAsRead();
+        }
       },
       (updatedMessage) => {
         setMessages(prev => prev.map(m =>
@@ -377,6 +397,13 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
         setMessages(prev => prev.map(m =>
           m.id === deletedMessageId ? { ...m, is_deleted: true, content: 'This message was deleted' } : m
         ));
+      }
+    );
+
+    readReceiptSubRef.current = groupService.subscribeToGroupReadReceipts(
+      groupId,
+      (readerId, readAt) => {
+        setReadStates(prev => ({ ...prev, [readerId]: readAt }));
       }
     );
 
@@ -401,12 +428,28 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
     return () => {
       messagesSubRef.current?.unsubscribe();
       membersSubRef.current?.unsubscribe();
+      readReceiptSubRef.current?.unsubscribe();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupId, userId]);
 
-  // Filter out deleted messages for current user
-  const filteredMessages = messages.filter(m => !m.deleted_for?.includes(userId || ''));
+  // Filter out deleted messages for current user, and derive the
+  // double-check "read by everyone" tick on my own sent messages from the
+  // live readStates map — a message is read once every *other* current
+  // member's last known read timestamp is at or after it was sent. (Other
+  // members' own incoming messages don't carry a meaningful is_read here;
+  // the UI only ever renders this for the current user's own bubbles.)
+  const otherMemberIds = members.filter(m => m.user_id !== userId).map(m => m.user_id);
+  const filteredMessages = messages
+    .filter(m => !m.deleted_for?.includes(userId || ''))
+    .map(m => {
+      if (m.sender_id !== userId) return m;
+      const isRead = otherMemberIds.length > 0 && otherMemberIds.every(id => {
+        const readAt = readStates[id];
+        return !!readAt && readAt >= m.created_at;
+      });
+      return isRead === m.is_read ? m : { ...m, is_read: isRead };
+    });
 
   return {
     messages: filteredMessages,

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Users, Plus, Search, ChevronRight, Mic } from 'lucide-react';
+import { Users, Plus, Search, ChevronRight, Mic, Check, CheckCheck } from 'lucide-react';
 import { GroupWithMembers } from '../services/groupService';
 import { UserProfile } from '../types';
 import { typingService } from '../services/typingService';
@@ -268,6 +268,13 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
                       </span>
                     ) : group.lastMessage ? (
                       <>
+                        {group.lastMessage.sender_id === currentUser.id && (
+                          group.lastMessage.is_read ? (
+                            <CheckCheck className="inline w-3.5 h-3.5 text-sky-500 mr-1 align-text-bottom" strokeWidth={2.5} />
+                          ) : (
+                            <Check className="inline w-3.5 h-3.5 text-slate-400 mr-1 align-text-bottom" strokeWidth={2.5} />
+                          )
+                        )}
                         <span className="font-medium text-slate-600">
                           {group.lastMessage.sender_id === currentUser.id
                             ? 'You'

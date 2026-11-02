@@ -570,6 +570,15 @@ function MainApp({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChat?.user_id]);
 
+  // Same instant-zero treatment for a group's unread badge the moment its
+  // chat is opened — mirrors the 1:1 effect right above.
+  useEffect(() => {
+    if (selectedGroup?.id) {
+      appData.markGroupRead(selectedGroup.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedGroup?.id]);
+
   // `selectedChat` is a snapshot taken at the moment a chat was opened (from
   // the Chats list, Discover, or history), so its `profile` (online status,
   // avatar, etc.) would otherwise stay frozen for as long as the chat stays

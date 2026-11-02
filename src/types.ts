@@ -159,6 +159,11 @@ export interface GroupMember {
   role: 'admin' | 'member';
   is_muted?: boolean;
   joined_at: string;
+  // ISO timestamp of the last time this member opened the group chat.
+  // Undefined if they've never read it, or if they've disabled their
+  // read-receipts privacy setting (in which case it's hidden from
+  // everyone but themselves — see worker/src/routes/groups.ts).
+  last_read_at?: string;
   profile?: UserProfile;
 }
 

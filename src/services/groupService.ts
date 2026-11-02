@@ -373,13 +373,20 @@ class GroupService {
   }
 
   /**
-   * Mark messages as read. Group messages don't track per-user read
-   * receipts server-side (would need its own table) — kept as a no-op so
-   * existing call sites keep working without implying a feature that
-   * doesn't exist.
+   * Mark a group as read as of now (POST /groups/:id/read). Updates this
+   * member's read high-water-mark server-side (worker/migrations/
+   * 0004_group_read_state.sql) — drives both the Groups list unread badge
+   * and, once broadcast out via subscribeToGroupReadReceipts, the
+   * double-check "read" tick on messages this user has sent.
    */
-  async markAsRead(_groupId: string, _userId: string): Promise<ServiceResult<void>> {
-    return { success: true };
+  async markAsRead(groupId: string, _userId: string): Promise<ServiceResult<void>> {
+    try {
+      await apiFetch(`/groups/${groupId}/read`, { method: 'POST' });
+      return { success: true };
+    } catch (err) {
+      console.error('[GroupService] markAsRead error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to mark group as read') };
+    }
   }
 
   /**
@@ -469,6 +476,24 @@ class GroupService {
     );
 
     return { unsubscribe: () => subs.forEach((s) => s.unsubscribe()) };
+  }
+
+  /**
+   * Subscribe to "member X has read this group up to now" events (POST
+   * /groups/:id/read on the Worker). Only fires for members who have read
+   * receipts enabled — see that route for the privacy rule. The caller is
+   * responsible for turning a stream of these into "is my message read by
+   * everyone" (see useGroupChat.ts).
+   */
+  subscribeToGroupReadReceipts(
+    groupId: string,
+    onRead: (userId: string, readAt: string) => void
+  ): GroupSubscription {
+    const sub = realtimeClient.on('group-message:read', (payload) => {
+      if (payload?.group_id !== groupId) return;
+      onRead(payload.reader_id, payload.read_at);
+    });
+    return { unsubscribe: () => sub.unsubscribe() };
   }
 }
 

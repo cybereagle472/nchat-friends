@@ -3,6 +3,7 @@ import type { Env, Variables } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { newId, nowIso } from '../lib/id';
 import { broadcastToUser } from '../lib/realtime';
+import { getPrivacySettings } from '../lib/privacy';
 
 const groups = new Hono<{ Bindings: Env; Variables: Variables }>();
 groups.use('*', requireAuth);
@@ -32,9 +33,19 @@ async function broadcastToGroup(env: Env, groupId: string, payload: unknown, mem
 async function groupWithMembers(env: Env, groupId: string): Promise<any | null> {
   const group = await env.DB.prepare('SELECT * FROM groups WHERE id = ?').bind(groupId).first<any>();
   if (!group) return null;
+  // last_read_at/read_receipts are LEFT JOINed so a member who has never
+  // opened the chat (no group_read_state row) or has no privacy_settings
+  // row yet (defaults to read_receipts = 1, same default as lib/privacy.ts)
+  // still comes back as a normal member rather than being dropped.
   const { results: memberRows } = await env.DB.prepare(
-    `SELECT gm.*, u.full_name, u.username, u.avatar_url, u.email FROM group_members gm
-     JOIN users u ON u.id = gm.user_id WHERE gm.group_id = ?`
+    `SELECT gm.*, u.full_name, u.username, u.avatar_url, u.email,
+            grs.last_read_at AS last_read_at,
+            COALESCE(ps.read_receipts, 1) AS read_receipts
+     FROM group_members gm
+     JOIN users u ON u.id = gm.user_id
+     LEFT JOIN group_read_state grs ON grs.group_id = gm.group_id AND grs.user_id = gm.user_id
+     LEFT JOIN privacy_settings ps ON ps.user_id = gm.user_id
+     WHERE gm.group_id = ?`
   )
     .bind(groupId)
     .all<any>();
@@ -46,9 +57,27 @@ async function groupWithMembers(env: Env, groupId: string): Promise<any | null> 
       role: m.role,
       is_muted: !!m.is_muted,
       joined_at: m.joined_at,
+      // A member who has disabled read receipts never exposes their read
+      // status to anyone else — same opt-out rule 1:1 chat already
+      // enforces for its own read receipts (see POST /messages/mark-read).
+      last_read_at: m.read_receipts ? (m.last_read_at ?? undefined) : undefined,
       profile: { id: m.user_id, full_name: m.full_name, username: m.username, avatar_url: m.avatar_url, email: m.email },
     })),
   };
+}
+
+/**
+ * Has every *other* current member of this group read a message sent by
+ * `senderId` at `createdAt`? Mirrors the double-check tick semantics 1:1
+ * chat already has, generalized to "read by everyone" for a group.
+ * `members` must already carry the privacy-masked `last_read_at` from
+ * groupWithMembers() above.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function isReadByAllOthers(members: any[], senderId: string, createdAt: string): boolean {
+  const others = members.filter((m) => m.user_id !== senderId);
+  if (others.length === 0) return false;
+  return others.every((m) => m.last_read_at && m.last_read_at >= createdAt);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -70,6 +99,7 @@ function groupMessageJson(row: any) {
     deleted_for: row.deleted_for ? JSON.parse(row.deleted_for) : undefined,
     reactions: row.reactions ? JSON.parse(row.reactions) : undefined,
     created_at: row.created_at,
+    is_read: undefined as boolean | undefined,
   };
 }
 
@@ -85,13 +115,15 @@ groups.post('/', async (c) => {
     .run();
 
   const allMembers: string[] = Array.from(new Set([userId, ...(memberIds as string[])]));
+  const joinedAt = created_at;
   await c.env.DB.batch(
     allMembers.map((uid) =>
-      c.env.DB.prepare('INSERT INTO group_members (id, group_id, user_id, role) VALUES (?, ?, ?, ?)').bind(
+      c.env.DB.prepare('INSERT INTO group_members (id, group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?, ?)').bind(
         newId(),
         groupId,
         uid,
-        uid === userId ? 'admin' : 'member'
+        uid === userId ? 'admin' : 'member',
+        joinedAt
       )
     )
   );
@@ -115,15 +147,43 @@ groups.get('/', async (c) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   for (const g of (groupRows ?? []) as any[]) {
     const full = await groupWithMembers(c.env, g.id);
-    const lastMessage = await c.env.DB.prepare(
+    const lastMessageRow = await c.env.DB.prepare(
       'SELECT * FROM group_messages WHERE group_id = ? ORDER BY created_at DESC LIMIT 1'
     )
       .bind(g.id)
       .first();
 
+    let lastMessage = lastMessageRow ? groupMessageJson(lastMessageRow) : undefined;
+    // The double-check tick on the list preview only ever applies to a
+    // message *I* sent — same rule as the in-chat bubble.
+    if (lastMessage && lastMessage.sender_id === userId) {
+      lastMessage = { ...lastMessage, is_read: isReadByAllOthers(full.members, userId, lastMessage.created_at) };
+    }
+
+    // Unread badge: every message not sent by me since I last read this
+    // group (or since I joined, if I've never read it — so a brand new
+    // member doesn't get hit with years of pre-existing history as
+    // "unread"). Read my *own* last_read_at straight from the table rather
+    // than off `full.members` — that list privacy-masks last_read_at for
+    // members who've disabled read receipts, and that must never apply to
+    // my own unread count, only to what *other* people can see of mine.
+    const myMembership = full.members.find((m: { user_id: string }) => m.user_id === userId);
+    const myReadState = await c.env.DB.prepare(
+      'SELECT last_read_at FROM group_read_state WHERE group_id = ? AND user_id = ?'
+    )
+      .bind(g.id, userId)
+      .first<{ last_read_at: string }>();
+    const since = myReadState?.last_read_at || myMembership?.joined_at || '1970-01-01T00:00:00.000Z';
+    const unreadRow = await c.env.DB.prepare(
+      'SELECT COUNT(*) AS cnt FROM group_messages WHERE group_id = ? AND sender_id != ? AND created_at > ?'
+    )
+      .bind(g.id, userId, since)
+      .first<{ cnt: number }>();
+
     groupsWithMembers.push({
       ...full,
-      lastMessage: lastMessage ? groupMessageJson(lastMessage) : undefined,
+      lastMessage,
+      unreadCount: unreadRow?.cnt ?? 0,
     });
   }
   return c.json({ groups: groupsWithMembers });
@@ -162,13 +222,15 @@ groups.post('/:id/members', async (c) => {
   const newIds = (memberIds as string[]).filter((uid) => uid);
   if (newIds.length === 0) return c.json({ success: true });
 
+  const joinedAt = nowIso();
   await c.env.DB.batch(
     newIds.map((uid) =>
-      c.env.DB.prepare('INSERT OR IGNORE INTO group_members (id, group_id, user_id, role) VALUES (?, ?, ?, ?)').bind(
+      c.env.DB.prepare('INSERT OR IGNORE INTO group_members (id, group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?, ?)').bind(
         newId(),
         groupId,
         uid,
-        'member'
+        'member',
+        joinedAt
       )
     )
   );
@@ -530,6 +592,43 @@ groups.post('/:id/recording', async (c) => {
     { type: 'group-recording', group_id: groupId, sender_id: userId, is_recording: !!is_recording },
     memberIds
   );
+
+  return c.json({ success: true });
+});
+
+// POST /groups/:id/read — mark every message in this group as read by me,
+// up to now. Two effects, same as 1:1's POST /messages/mark-read:
+//   1. Always persists my own last_read_at (group_read_state), which is
+//      what drives *my own* unread badge in the Groups list — purely
+//      private bookkeeping, unaffected by anyone's read-receipts setting.
+//   2. Only broadcasts `group-message:read` (so other open chats/lists can
+//      flip a double-check tick on live) when *my* read_receipts privacy
+//      setting is enabled — if it's off, other members never learn I read
+//      anything, exactly like the 1:1 opt-out.
+groups.post('/:id/read', async (c) => {
+  const userId = c.get('userId');
+  const groupId = c.req.param('id');
+  const membership = await getMembership(c.env, groupId, userId);
+  if (!membership) return c.json({ error: 'Not a member of this group' }, 403);
+
+  const readAt = nowIso();
+  await c.env.DB.prepare(
+    `INSERT INTO group_read_state (group_id, user_id, last_read_at) VALUES (?, ?, ?)
+     ON CONFLICT(group_id, user_id) DO UPDATE SET last_read_at = excluded.last_read_at`
+  )
+    .bind(groupId, userId, readAt)
+    .run();
+
+  const readerSettings = await getPrivacySettings(c.env, userId);
+  if (readerSettings.read_receipts) {
+    const memberIds = (await memberIdsOf(c.env, groupId)).filter((id) => id !== userId);
+    await broadcastToGroup(
+      c.env,
+      groupId,
+      { type: 'group-message:read', group_id: groupId, reader_id: userId, read_at: readAt },
+      memberIds
+    );
+  }
 
   return c.json({ success: true });
 });

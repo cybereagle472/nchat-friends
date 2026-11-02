@@ -507,6 +507,23 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
     }
   }, [userId, updateData]);
 
+  // Instantly zero a group's unread badge the moment it's opened — same
+  // reasoning as markChatRead above: GroupChatView's own
+  // groupService.markAsRead() call races the next debounced groups
+  // refetch (up to 45s away), which would otherwise leave a stale badge
+  // showing on a group the user is already looking at.
+  const markGroupRead = useCallback((groupId: string) => {
+    updateData((prev) => {
+      const idx = prev.groups.findIndex(g => g.id === groupId);
+      if (idx === -1) return {};
+      const group = prev.groups[idx];
+      if (!group.unreadCount) return {};
+      const nextGroups = [...prev.groups];
+      nextGroups[idx] = { ...group, unreadCount: 0 };
+      return { groups: nextGroups };
+    });
+  }, [updateData]);
+
   const refreshRequests = useCallback(async () => {
     const [requestsResult, allProfiles, friendsResult] = await Promise.all([
       friendService.getRequests(userId),
@@ -744,6 +761,7 @@ export function useAppData(userId: string, activeChatUserId?: string | null) {
     refreshRequests,
     refreshCallHistory,
     markChatRead,
+    markGroupRead,
     addSentRequest,
     reload: loadAllData
   };
