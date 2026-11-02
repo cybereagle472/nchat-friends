@@ -42,16 +42,43 @@ media.post('/upload', requireAuth, async (c) => {
 
 // GET /media/file/:key — public read (replaces a public Supabase Storage bucket).
 // If you need private media, add requireAuth + an ownership check here instead.
+//
+// Serves byte-range requests (HTTP 206 Partial Content), which this used to
+// skip entirely — every request got the whole object back with a plain 200,
+// no `Accept-Ranges` header at all. That silently breaks exactly the kind
+// of seeking a voice-message/video scrubber depends on: a browser can only
+// jump to an unbuffered position in an <audio>/<video> element by asking the
+// server for that specific byte range. Without Accept-Ranges advertising
+// support for that, the browser has no choice but to treat the file as
+// unseekable until the *entire* thing has downloaded, which is exactly why
+// this looked fine on whichever side already had the file fully buffered
+// (e.g. the sender, moments after uploading it) and broken/unresponsive on
+// whichever side was still fetching it fresh — nothing to do with being the
+// sender or receiver specifically, just whichever side's copy wasn't fully
+// downloaded yet. R2 natively understands a `Range` header passed straight
+// through, so this is mostly just relaying it and shaping the response per
+// the HTTP spec (206 + Content-Range on a successful range request).
 media.get('/file/*', async (c) => {
   const key = c.req.path.replace(/^\/media\/file\//, '');
-  const obj = await c.env.MEDIA.get(key);
-  if (!obj) return c.json({ error: 'Not found' }, 404);
+  const object = await c.env.MEDIA.get(key, { range: c.req.raw.headers });
+  if (!object) return c.json({ error: 'Not found' }, 404);
 
   const headers = new Headers();
-  obj.writeHttpMetadata(headers);
-  headers.set('etag', obj.httpEtag);
+  object.writeHttpMetadata(headers);
+  headers.set('etag', object.httpEtag);
   headers.set('cache-control', 'public, max-age=31536000, immutable');
-  return new Response(obj.body, { headers });
+  headers.set('accept-ranges', 'bytes');
+
+  const range = object.range;
+  let status = 200;
+  if (range && 'offset' in range) {
+    const offset = range.offset ?? 0;
+    const length = range.length ?? object.size - offset;
+    headers.set('content-range', `bytes ${offset}-${offset + length - 1}/${object.size}`);
+    status = 206;
+  }
+
+  return new Response(object.body, { headers, status });
 });
 
 media.delete('/file/*', requireAuth, async (c) => {
