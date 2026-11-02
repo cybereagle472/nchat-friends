@@ -366,6 +366,18 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
   // same bars in a brighter color, revealed left-to-right via clip-path as
   // playback advances — painted directly via this ref, not React state.
   const overlayRef = useRef<HTMLDivElement>(null);
+  // Shared between the mount effect's Infinity-duration workaround and
+  // seekTo() below, so the two can't silently stomp on each other's writes
+  // to audio.currentTime. desiredTimeRef always holds "where the playhead
+  // should actually end up" — kept current by normal playback checkpoints
+  // *and* by explicit seeks — and is what the workaround restores to once
+  // its forced discovery seek resolves, instead of a stale snapshot taken
+  // before the user's tap had a chance to apply. fixingInfiniteDurationRef
+  // lets seekTo know the workaround currently has an out-of-range seek
+  // in flight, so it only records the intended position (desiredTimeRef)
+  // rather than also writing audio.currentTime itself and racing it.
+  const desiredTimeRef = useRef(0);
+  const fixingInfiniteDurationRef = useRef(false);
   const bars = VOICE_WAVEFORM_BARS;
   const audioUrl = message.media_url || message.content;
 
@@ -461,15 +473,23 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
     // a huge out-of-range time, which makes the browser scan to the real
     // end of the data and recompute a correct, finite duration, then snap
     // back to where playback actually was.
-    let fixingInfiniteDuration = false;
     const fixInfiniteDuration = () => {
-      if (fixingInfiniteDuration || isFinite(audio.duration)) return;
-      fixingInfiniteDuration = true;
-      const resumeAt = audio.currentTime;
+      if (fixingInfiniteDurationRef.current || isFinite(audio.duration)) return;
+      fixingInfiniteDurationRef.current = true;
       const onFixed = () => {
         audio.removeEventListener('timeupdate', onFixed);
-        audio.currentTime = resumeAt;
-        fixingInfiniteDuration = false;
+        // Restore to desiredTimeRef — whatever position is actually
+        // *wanted* right now — rather than a snapshot of currentTime taken
+        // before this forced seek started. That snapshot used to silently
+        // win a race against a tap-to-seek that happened while this was
+        // still resolving in the background (which, for a voice message
+        // whose metadata just finished loading, is a very common moment
+        // for someone to immediately tap somewhere on the waveform): the
+        // seek would land fine for an instant, then get stomped back to 0
+        // the moment this callback fired, which looked exactly like
+        // "seeking does nothing, it just plays from the start."
+        audio.currentTime = desiredTimeRef.current;
+        fixingInfiniteDurationRef.current = false;
         if (isFinite(audio.duration)) setDuration(audio.duration);
       };
       audio.addEventListener('timeupdate', onFixed);
@@ -481,7 +501,7 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
       // sitting near the very end of the clip on purpose — skip painting
       // from it so the waveform doesn't flash to "finished" for a frame
       // before snapping back to where playback really is.
-      if (fixingInfiniteDuration) return;
+      if (fixingInfiniteDurationRef.current) return;
       if (!isFinite(audio.duration)) {
         fixInfiniteDuration();
         return;
@@ -492,6 +512,11 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
         setCurrentTime(audio.currentTime);
         setDuration(audio.duration);
         paintProgress(ratio);
+        // Track genuine, non-workaround playhead movement too, so if the
+        // Infinity-duration fix ever kicks in later mid-playback it has an
+        // accurate "resume here" position rather than only ever knowing
+        // about explicit seeks.
+        desiredTimeRef.current = audio.currentTime;
       }
     };
 
@@ -610,9 +635,19 @@ const VoiceMessageBubble = memo(function VoiceMessageBubble({
       // whatever the <audio> element itself currently believes, so fall
       // back to it instead of giving up.
       const effectiveDuration = audio.duration && isFinite(audio.duration) ? audio.duration : knownDuration;
-      if (effectiveDuration && isFinite(effectiveDuration) && effectiveDuration > 0) {
-        audio.currentTime = clampedRatio * effectiveDuration;
-      }
+      if (!(effectiveDuration && isFinite(effectiveDuration) && effectiveDuration > 0)) return;
+      const target = clampedRatio * effectiveDuration;
+      // Always record the intended position first...
+      desiredTimeRef.current = target;
+      // ...but if the Infinity-duration workaround currently has its own
+      // out-of-range seek in flight (see fixInfiniteDuration above), don't
+      // also assign audio.currentTime here: the two writes race, and
+      // whichever happens to apply last wins by accident. That workaround
+      // reads desiredTimeRef the moment it resolves, so updating it above
+      // is enough to land this seek correctly once that settles — no need
+      // to fight over audio.currentTime in the meantime.
+      if (fixingInfiniteDurationRef.current) return;
+      audio.currentTime = target;
     };
 
     if (audio.readyState >= 1) {
