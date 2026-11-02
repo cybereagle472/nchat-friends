@@ -859,43 +859,72 @@ function IncomingCallControls({
 // a clear, intentional gesture instead of a single ambiguous tap.
 function SlideToAnswer({ onAnswer }: { onAnswer: () => void }) {
   const trackRef = useRef<HTMLDivElement>(null);
-  const [dragX, setDragX] = useState(0);
-  const [dragging, setDragging] = useState(false);
-  const [completed, setCompleted] = useState(false);
+  const handleRef = useRef<HTMLButtonElement>(null);
+  const fillRef = useRef<HTMLDivElement>(null);
+  const hintRef = useRef<HTMLDivElement>(null);
+  const dragXRef = useRef(0);
   const maxDragRef = useRef(1);
   const originXRef = useRef(0);
+  const draggingRef = useRef(false);
+  const completedRef = useRef(false);
 
   const HANDLE_SIZE = 56;
 
-  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (completed) return;
-    const track = trackRef.current;
-    if (!track) return;
-    maxDragRef.current = Math.max(1, track.clientWidth - HANDLE_SIZE);
-    originXRef.current = e.clientX - dragX;
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setDragging(true);
-  };
-
-  const handlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (!dragging || completed) return;
-    const next = Math.min(Math.max(0, e.clientX - originXRef.current), maxDragRef.current);
-    setDragX(next);
-  };
-
-  const finishDrag = () => {
-    if (completed) return;
-    setDragging(false);
-    if (dragX / maxDragRef.current > 0.7) {
-      setCompleted(true);
-      setDragX(maxDragRef.current);
-      onAnswer();
-    } else {
-      setDragX(0);
+  // Writes straight to the already-mounted DOM nodes instead of going
+  // through React state + re-render on every single pointermove — that
+  // round trip is what made dragging feel laggy, since pointermove can
+  // fire far faster than React can usefully reconcile a component tree
+  // for. Direct style mutation tracks the finger 1:1 with zero lag,
+  // regardless of device.
+  const applyPosition = (x: number, animate: boolean) => {
+    const handle = handleRef.current;
+    const fill = fillRef.current;
+    const hint = hintRef.current;
+    const transition = animate ? 'transform 200ms ease' : 'none';
+    if (handle) {
+      handle.style.transition = transition;
+      handle.style.transform = `translateX(${x}px)`;
+    }
+    if (fill) {
+      fill.style.transition = animate ? 'width 200ms ease' : 'none';
+      fill.style.width = `${x + HANDLE_SIZE / 2}px`;
+    }
+    if (hint) {
+      const progress = maxDragRef.current > 0 ? x / maxDragRef.current : 0;
+      hint.style.opacity = String(Math.max(0, 1 - progress * 1.6));
     }
   };
 
-  const progress = maxDragRef.current > 0 ? dragX / maxDragRef.current : 0;
+  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (completedRef.current) return;
+    const track = trackRef.current;
+    if (!track) return;
+    maxDragRef.current = Math.max(1, track.clientWidth - HANDLE_SIZE);
+    originXRef.current = e.clientX - dragXRef.current;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    draggingRef.current = true;
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (!draggingRef.current || completedRef.current) return;
+    const next = Math.min(Math.max(0, e.clientX - originXRef.current), maxDragRef.current);
+    dragXRef.current = next;
+    applyPosition(next, false);
+  };
+
+  const finishDrag = () => {
+    if (completedRef.current || !draggingRef.current) return;
+    draggingRef.current = false;
+    if (dragXRef.current / maxDragRef.current > 0.7) {
+      completedRef.current = true;
+      dragXRef.current = maxDragRef.current;
+      applyPosition(maxDragRef.current, true);
+      onAnswer();
+    } else {
+      dragXRef.current = 0;
+      applyPosition(0, true);
+    }
+  };
 
   return (
     <div
@@ -904,32 +933,27 @@ function SlideToAnswer({ onAnswer }: { onAnswer: () => void }) {
     >
       {/* Fill trailing the handle */}
       <div
+        ref={fillRef}
         className="absolute inset-y-0 left-0 bg-green-500/30 rounded-full pointer-events-none"
-        style={{
-          width: `${dragX + HANDLE_SIZE / 2}px`,
-          transition: dragging ? 'none' : 'width 200ms ease',
-        }}
+        style={{ width: `${HANDLE_SIZE / 2}px` }}
       />
       {/* Hint text, fades out as the handle covers it */}
       <div
+        ref={hintRef}
         className="absolute inset-0 flex items-center justify-center gap-1 text-white/80 text-sm font-medium pointer-events-none"
-        style={{ opacity: Math.max(0, 1 - progress * 1.6) }}
       >
         <span>Slide to answer</span>
         <ChevronsRight className="w-4 h-4 animate-pulse" />
       </div>
       {/* Draggable handle */}
       <button
+        ref={handleRef}
         aria-label="Slide to answer call"
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={finishDrag}
         onPointerCancel={finishDrag}
-        className="absolute top-0 left-0 w-14 h-14 rounded-full bg-green-500 flex items-center justify-center text-white shadow-lg shadow-green-500/40 touch-none"
-        style={{
-          transform: `translateX(${dragX}px)`,
-          transition: dragging ? 'none' : 'transform 200ms ease',
-        }}
+        className="absolute top-0 left-0 w-14 h-14 rounded-full bg-green-500 flex items-center justify-center text-white shadow-lg shadow-green-500/40 touch-none !transition-none"
       >
         <Phone className="w-6 h-6" />
       </button>

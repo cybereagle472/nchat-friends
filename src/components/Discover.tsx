@@ -355,7 +355,7 @@ export function Discover({
                       className="relative disabled:cursor-default"
                       aria-label="View profile"
                     >
-                      <div className="w-14 h-14 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
+                      <div className="w-14 h-14 rounded-full bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
                         {friend.profile.avatar_url ? (
                           <img src={friend.profile.avatar_url} alt={friend.profile.full_name} className="w-full h-full object-cover" />
                         ) : (
@@ -430,7 +430,7 @@ export function Discover({
                       <button
                         onClick={() => request.sender_profile && onViewProfile?.(request.sender_id, request.sender_profile)}
                         disabled={!onViewProfile || !request.sender_profile}
-                        className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 overflow-hidden disabled:cursor-default"
+                        className="w-12 h-12 rounded-full bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 overflow-hidden disabled:cursor-default"
                         aria-label="View profile"
                       >
                         {request.sender_profile?.avatar_url ? (
@@ -539,7 +539,7 @@ export function Discover({
                           className="relative disabled:cursor-default"
                           aria-label="View profile"
                         >
-                          <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
+                          <div className="w-12 h-12 rounded-full bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
                             {user.profile.avatar_url ? (
                               <img
                                 src={user.profile.avatar_url}

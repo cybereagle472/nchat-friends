@@ -131,7 +131,7 @@ export function History({ history, onCall, onMessage, onViewProfile }: HistoryPr
               <button
                 onClick={() => onViewProfile?.(item.userId, { id: item.userId, email: '', full_name: item.name, avatar_url: item.avatar })}
                 disabled={!onViewProfile}
-                className={`w-12 h-12 rounded-xl flex items-center justify-center text-xl flex-shrink-0 shadow-md group-hover:scale-105 transition-transform duration-300 overflow-hidden disabled:cursor-default ${
+                className={`w-12 h-12 rounded-full flex items-center justify-center text-xl flex-shrink-0 shadow-md group-hover:scale-105 transition-transform duration-300 overflow-hidden disabled:cursor-default ${
                   item.direction === 'missed'
                     ? 'bg-gradient-to-br from-red-400 to-rose-400 shadow-red-500/20'
                     : 'bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 shadow-purple-500/20'
