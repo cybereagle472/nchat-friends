@@ -43,6 +43,12 @@ npx wrangler secret put JWT_SECRET
 # Optional, only needed once push notifications are wired up:
 npx wrangler secret put VAPID_PUBLIC_KEY
 npx wrangler secret put VAPID_PRIVATE_KEY
+
+# Optional, but strongly recommended so calls reliably connect across
+# different networks (see "Cloudflare Realtime TURN" in wrangler.toml for
+# where to get these two values):
+npx wrangler secret put CF_TURN_KEY_ID
+npx wrangler secret put CF_TURN_KEY_API_TOKEN
 ```
 
 ## 3. Deploy
