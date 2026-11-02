@@ -31,6 +31,42 @@ function playSafely(el: HTMLMediaElement | null) {
   });
 }
 
+// The Speaker button used to only toggle its own highlighted look — it
+// never actually changed where audio played, so audio calls always came
+// out of the loud external speaker regardless of the button's state. This
+// routes playback to the earpiece-like output by default and only to the
+// loud speaker once the user actually asks for it, using the standard
+// Audio Output Devices API (`setSinkId`). Device labels aren't perfectly
+// standardized across phones/browsers, so this matches on common
+// name patterns and simply leaves the current output alone if it can't
+// confidently tell which device is which (better than guessing wrong).
+// Support varies by platform — notably Safari/iOS does not implement
+// `setSinkId` at all, so this call is a no-op there and the OS's own
+// default behavior applies instead.
+async function applyAudioOutput(el: HTMLMediaElement | null, speakerOn: boolean) {
+  if (!el || typeof (el as any).setSinkId !== 'function') return;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const outputs = devices.filter((d) => d.kind === 'audiooutput');
+    const earpiece = outputs.find((d) => /ear\s?piece|receiver/i.test(d.label));
+    const speaker = outputs.find((d) => /speaker/i.test(d.label));
+    const target = speakerOn ? speaker : earpiece;
+    if (target) {
+      await (el as any).setSinkId(target.deviceId);
+    } else if (speakerOn) {
+      // Couldn't positively identify a named speaker device — the system
+      // default output is the loud speaker on most mobile browsers, so
+      // that still satisfies "speaker on".
+      await (el as any).setSinkId('');
+    }
+    // If earpiece couldn't be identified, leave the current output as-is
+    // rather than risk forcing it to the wrong device.
+  } catch {
+    // enumerateDevices()/setSinkId() unsupported or blocked — nothing more
+    // that can be done from here; the call itself still works fine.
+  }
+}
+
 // No one answers within this long → treat it as a missed call rather than
 // ringing forever.
 const RING_TIMEOUT_MS = 45_000;
@@ -54,6 +90,8 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
   const [callState, setCallState] = useState<'initiating' | 'ringing' | 'connecting' | 'connected' | 'ended' | 'declined' | 'missed' | 'failed'>('initiating');
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(callType === 'audio');
+  // Audio calls should default to the earpiece, like a normal phone call —
+  // not the loud external speaker — until the user explicitly taps Speaker.
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
   const [callDuration, setCallDuration] = useState(0);
   const [error, setError] = useState('');
@@ -85,6 +123,10 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
   // failure message) from "was connected and then the network dropped"
   // (just end the call normally, like any other hangup mid-call).
   const everConnectedRef = useRef(false);
+  // Mirrors isSpeakerOn for the ontrack callback below, which is created
+  // once inside createPeerConnection and would otherwise close over a
+  // stale value instead of picking up later taps of the Speaker button.
+  const isSpeakerOnRef = useRef(false);
 
   const clearRingTimeout = useCallback(() => {
     if (ringTimeoutRef.current) {
@@ -208,6 +250,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
         if (remoteAudioRef.current) {
           remoteAudioRef.current.srcObject = stream;
           playSafely(remoteAudioRef.current);
+          applyAudioOutput(remoteAudioRef.current, isSpeakerOnRef.current);
         }
       },
       (state) => {
@@ -557,8 +600,10 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
   };
 
   const toggleSpeaker = () => {
-    setIsSpeakerOn(!isSpeakerOn);
-    // In a real implementation, you'd switch audio output here
+    const next = !isSpeakerOn;
+    isSpeakerOnRef.current = next;
+    setIsSpeakerOn(next);
+    applyAudioOutput(remoteAudioRef.current, next);
   };
 
   const formatDuration = (seconds: number) => {
