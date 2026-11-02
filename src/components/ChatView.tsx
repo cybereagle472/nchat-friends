@@ -2221,11 +2221,6 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                 <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle max-w-full truncate">
                   <Mic className="w-3 h-3 recording-indicator-mic shrink-0" strokeWidth={2.5} />
                   recording audio
-                  <span className="flex items-end gap-0.5 h-2 shrink-0">
-                    <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '0ms' }} />
-                    <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '150ms' }} />
-                    <span className="w-1 h-1 bg-green-300 rounded-full typing-dot" style={{ animationDelay: '300ms' }} />
-                  </span>
                 </span>
               ) : isTyping ? (
                 <span className="inline-flex items-center gap-1.5 text-green-300 font-medium align-middle max-w-full truncate">
