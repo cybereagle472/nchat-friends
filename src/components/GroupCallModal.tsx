@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Phone, PhoneOff, Mic, MicOff, Video, VideoOff, Volume2, X, Users } from 'lucide-react';
 import { callService } from '../services/callService';
-import { groupCallService, GroupCallSession } from '../services/groupCallService';
+import { groupCallService, GroupCallSession, GroupCallParticipantBrief } from '../services/groupCallService';
 import { profileService } from '../services/profileService';
 import { playSafely, applyAudioOutput } from '../lib/webrtcMedia';
 import { UserProfile } from '../types';
@@ -43,6 +43,7 @@ interface Signal {
   offer_sdp?: RTCSessionDescriptionInit;
   answer_sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
+  request_offer?: boolean;
 }
 
 export function GroupCallModal({ currentUser, callType, group, incomingCall, onClose }: GroupCallModalProps) {
@@ -304,9 +305,32 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
     [addToRoster, getOrCreatePeerConnection]
   );
 
+  // Idempotent wrapper around offerTo — safe to call from two independent
+  // triggers (the server's opportunistic participant-joined notification,
+  // and the new joiner's own guaranteed request_offer nudge below)
+  // without risking two separate RTCPeerConnections getting created for
+  // the same peer. peerConnectionsRef alone isn't enough to guard that:
+  // getOrCreatePeerConnection only populates it after an await (the ICE
+  // server fetch), so both triggers can pass the "not in the map yet"
+  // check before either has actually finished creating one. Reserving
+  // the peer id here, synchronously, before any await runs, closes that
+  // gap the same way a mutex would.
+  const offerInFlightRef = useRef<Set<string>>(new Set());
+  const ensureOfferTo = useCallback(
+    (peerId: string) => {
+      if (peerConnectionsRef.current.has(peerId) || offerInFlightRef.current.has(peerId)) return;
+      offerInFlightRef.current.add(peerId);
+      offerTo(peerId).finally(() => offerInFlightRef.current.delete(peerId));
+    },
+    [offerTo]
+  );
+
   const handleIncomingSignal = useCallback(
     async (from: string, signal: Signal) => {
-      if (signal.offer_sdp) {
+      if (signal.request_offer) {
+        await addToRoster(from);
+        ensureOfferTo(from);
+      } else if (signal.offer_sdp) {
         await addToRoster(from);
         const pc = await getOrCreatePeerConnection(from);
         await pc.setRemoteDescription(new RTCSessionDescription(signal.offer_sdp));
@@ -337,7 +361,7 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
         }
       }
     },
-    [addToRoster, flushPendingRemoteCandidates, getOrCreatePeerConnection]
+    [addToRoster, ensureOfferTo, flushPendingRemoteCandidates, getOrCreatePeerConnection]
   );
 
   const subscribeFullEvents = useCallback(
@@ -346,7 +370,11 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
       eventSubRef.current = groupCallService.subscribeToGroupCallEvents(callId, {
         onParticipantJoined: (userId) => {
           if (userId === currentUser.id) return;
-          offerTo(userId);
+          // Opportunistic fast path — ensureOfferTo also covers the
+          // guaranteed request_offer nudge below, so whichever of the two
+          // actually arrives (this one has a real race; see sendSignal's
+          // request_offer doc) ends up doing the work exactly once.
+          ensureOfferTo(userId);
         },
         onSignal: (from, signal) => {
           if (from === currentUser.id) return;
@@ -363,7 +391,7 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
         },
       });
     },
-    [cleanupAll, currentUser.id, dropPeer, handleIncomingSignal, offerTo, onClose]
+    [cleanupAll, currentUser.id, dropPeer, ensureOfferTo, handleIncomingSignal, onClose]
   );
 
   const initializeMedia = useCallback(async () => {
@@ -373,6 +401,13 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
       throw new Error(result.error);
     }
     localStreamRef.current = result.data;
+    // The local preview <video> only exists once modalState flips to
+    // 'in-call' (it's part of the tile grid, not the ringing/initiating
+    // screens) — this runs well before that, so localVideoRef.current is
+    // still null here. The effect below attaches it for real once that
+    // element actually mounts; this is just the fast path for the rare
+    // case the ref is already there (e.g. a future caller of this that
+    // doesn't gate the tile grid the same way).
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = result.data;
       playSafely(localVideoRef.current);
@@ -380,11 +415,45 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
     return result.data;
   }, [callType]);
 
+  // Attaches the already-captured local stream to the preview tile once it
+  // actually mounts (see initializeMedia's comment above for why it can't
+  // just be done there) — without this, your own camera preview stayed
+  // blank for the entire call even though everyone else could see you fine
+  // (the MediaStream itself was always captured and sent correctly; only
+  // the local on-screen preview element was missing it).
+  useEffect(() => {
+    if (modalState === 'in-call' && localVideoRef.current && localStreamRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current;
+      playSafely(localVideoRef.current);
+    }
+  }, [modalState]);
+
   const startDurationTimer = useCallback(() => {
     if (!durationIntervalRef.current) {
       durationIntervalRef.current = setInterval(() => setCallDuration((p) => p + 1), 1000);
     }
   }, []);
+
+  // Runs the instant we know our own call id, for both starting a call and
+  // joining one — and in that exact order: subscribe to events FIRST,
+  // before anything else (including the roster bookkeeping below, which
+  // involves awaited profile lookups and would otherwise widen the
+  // window). Then nudge every already-joined participant with
+  // request_offer as a guaranteed fallback alongside the server's own
+  // opportunistic participant-joined notification to them — see
+  // sendSignal's request_offer doc for exactly why that notification
+  // alone isn't reliable enough on its own to be the only path.
+  const connectToExistingParticipants = useCallback(
+    async (callId: string, participants: GroupCallParticipantBrief[]) => {
+      subscribeFullEvents(callId);
+      for (const p of participants) {
+        profileCacheRef.current.set(p.userId, { id: p.userId, email: '', full_name: p.fullName, avatar_url: p.avatarUrl } as UserProfile);
+        await addToRoster(p.userId);
+      }
+      await Promise.all(participants.map((p) => groupCallService.sendSignal(callId, p.userId, { request_offer: true })));
+    },
+    [addToRoster, subscribeFullEvents]
+  );
 
   const startOutgoingCall = useCallback(async () => {
     if (!group) return;
@@ -402,13 +471,7 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
         return;
       }
       callIdRef.current = result.data.call.id;
-      // Participants already in the call (none yet for a brand new call)
-      // will each independently offer toward us — we just wait.
-      for (const p of result.data.participants) {
-        profileCacheRef.current.set(p.userId, { id: p.userId, email: '', full_name: p.fullName, avatar_url: p.avatarUrl } as UserProfile);
-        await addToRoster(p.userId);
-      }
-      subscribeFullEvents(result.data.call.id);
+      await connectToExistingParticipants(result.data.call.id, result.data.participants);
       setModalState('in-call');
       startDurationTimer();
     } catch (err) {
@@ -418,7 +481,7 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
       cleanupAll();
       setTimeout(onClose, 2000);
     }
-  }, [addToRoster, callType, cleanupAll, group, initializeMedia, onClose, startDurationTimer, subscribeFullEvents]);
+  }, [callType, cleanupAll, connectToExistingParticipants, group, initializeMedia, onClose, startDurationTimer]);
 
   const acceptIncomingCall = useCallback(async () => {
     if (!incomingCall) return;
@@ -436,11 +499,7 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
         return;
       }
       callIdRef.current = incomingCall.id;
-      for (const p of result.data.participants) {
-        profileCacheRef.current.set(p.userId, { id: p.userId, email: '', full_name: p.fullName, avatar_url: p.avatarUrl } as UserProfile);
-        await addToRoster(p.userId);
-      }
-      subscribeFullEvents(incomingCall.id);
+      await connectToExistingParticipants(incomingCall.id, result.data.participants);
       setModalState('in-call');
       startDurationTimer();
     } catch (err) {
@@ -449,7 +508,7 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
       cleanupAll();
       setTimeout(onClose, 2000);
     }
-  }, [addToRoster, cleanupAll, incomingCall, initializeMedia, onClose, startDurationTimer, subscribeFullEvents]);
+  }, [cleanupAll, connectToExistingParticipants, incomingCall, initializeMedia, onClose, startDurationTimer]);
 
   const declineIncomingCall = useCallback(async () => {
     if (incomingCall) {

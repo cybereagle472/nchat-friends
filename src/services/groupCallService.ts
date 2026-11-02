@@ -130,11 +130,28 @@ export const groupCallService = {
     }
   },
 
-  /** Directed signal (SDP offer/answer or an ICE candidate) to exactly one other participant. */
+  /**
+   * Directed signal to exactly one other participant: an SDP offer/answer,
+   * an ICE candidate, or `request_offer` — a joiner sends this to every
+   * already-joined participant right after subscribing to call events, as
+   * a guaranteed fallback alongside the server's own "someone joined"
+   * notification to them (see groupCalls.ts's joinCall). That
+   * notification alone has a real race: it can arrive before the
+   * recipient's own join/start request has even round-tripped back to
+   * finish subscribing, so it gets silently missed and no offer is ever
+   * made. `request_offer` can't have that problem — whoever receives it
+   * has necessarily been subscribed since *their own* join finished,
+   * which already happened before this joiner could possibly exist.
+   */
   async sendSignal(
     callId: string,
     to: string,
-    signal: { offer_sdp?: RTCSessionDescriptionInit; answer_sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
+    signal: {
+      offer_sdp?: RTCSessionDescriptionInit;
+      answer_sdp?: RTCSessionDescriptionInit;
+      candidate?: RTCIceCandidateInit;
+      request_offer?: boolean;
+    }
   ): Promise<ServiceResult> {
     try {
       await apiFetch(`/group-calls/${callId}/signal`, {
@@ -162,7 +179,10 @@ export const groupCallService = {
     callId: string,
     callbacks: {
       onParticipantJoined?: (userId: string) => void;
-      onSignal?: (from: string, signal: { offer_sdp?: RTCSessionDescriptionInit; answer_sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }) => void;
+      onSignal?: (
+        from: string,
+        signal: { offer_sdp?: RTCSessionDescriptionInit; answer_sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit; request_offer?: boolean }
+      ) => void;
       onParticipantLeft?: (userId: string) => void;
       onParticipantDeclined?: (userId: string) => void;
       onCallEnded?: () => void;
@@ -178,6 +198,7 @@ export const groupCallService = {
             offer_sdp: payload.offer_sdp,
             answer_sdp: payload.answer_sdp,
             candidate: payload.candidate,
+            request_offer: payload.request_offer,
           });
         }
       }),
