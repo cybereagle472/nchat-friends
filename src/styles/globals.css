@@ -194,6 +194,40 @@
   animation: recordingMicPulse 1s ease-in-out infinite;
 }
 
+/* Animated low-poly chat background (see LowPolyBackground.tsx). The mesh
+   is rendered oversized (112%) and recentered so the slow pan/rotate/scale
+   below never reveals an edge of the SVG. Per-triangle opacity "twinkle"
+   is handled separately inside the SVG itself via native <animate> tags —
+   this transform is the only thing animating here, kept to one GPU layer
+   so it costs nothing next to an actively-scrolling message list. */
+.lowpoly-bg-mesh {
+  width: 112%;
+  height: 112%;
+  margin-left: -6%;
+  margin-top: -6%;
+  display: block;
+  animation: lowpolyDrift 55s ease-in-out infinite alternate;
+  will-change: transform;
+}
+
+@keyframes lowpolyDrift {
+  0% {
+    transform: translate(0%, 0%) rotate(0deg) scale(1);
+  }
+  50% {
+    transform: translate(-1.6%, 1.1%) rotate(0.7deg) scale(1.035);
+  }
+  100% {
+    transform: translate(1.6%, -1.1%) rotate(-0.7deg) scale(1.02);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lowpoly-bg-mesh {
+    animation: none;
+  }
+}
+
 @keyframes scaleIn {
   from {
     transform: scale(0.92);

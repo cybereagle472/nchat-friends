@@ -18,6 +18,7 @@ import {
 import { useGroupChat, GroupMessageWithStatus } from '../hooks/useGroupChat';
 import { GroupWithMembers, groupService } from '../services/groupService';
 import { UserProfile, GroupMessage } from '../types';
+import LowPolyBackground from './LowPolyBackground';
 import { mediaService } from '../services/mediaService';
 import { GroupMessageActions, GroupReactionsDisplay } from './GroupMessageActions';
 import { useKeyboardInset } from '../hooks/useKeyboardInset';
@@ -371,9 +372,14 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
   return (
     <div
       ref={chatRootRef}
-      className="h-full flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50"
+      className="h-full flex flex-col relative bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50"
       style={keyboardInset > 0 ? { paddingBottom: keyboardInset } : undefined}
     >
+      {/* Animated low-poly chat background, same treatment as the 1:1
+          chat screen (ChatView) — a different fixed seed just so the two
+          screen types don't render the exact same mesh. */}
+      <LowPolyBackground seed={23} />
+
       {/* Header */}
       <div className="relative z-20 backdrop-blur-2xl bg-gradient-to-r from-violet-500/95 via-purple-500/95 to-fuchsia-500/95 text-white px-3 py-3 shadow-xl shadow-purple-500/20">
         <div className="flex items-center gap-3">
@@ -431,7 +437,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-3 py-4">
+      <div className="relative z-10 flex-1 overflow-y-auto px-3 py-4">
         {isLoading && messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full">
             <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-violet-400 to-purple-400 flex items-center justify-center mb-4 animate-pulse">
@@ -464,13 +470,13 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
 
       {/* Error Banner */}
       {error && (
-        <div className="px-4 py-2 bg-red-100 border-t border-red-200">
+        <div className="relative z-10 px-4 py-2 bg-red-100 border-t border-red-200">
           <p className="text-xs text-red-600">{error}</p>
         </div>
       )}
 
       {/* Input Area */}
-      <div className="backdrop-blur-2xl bg-white/70 border-t border-white/70 px-3 py-2.5 shadow-lg">
+      <div className="relative z-10 backdrop-blur-2xl bg-white/70 border-t border-white/70 px-3 py-2.5 shadow-lg">
         {/* Reply Preview */}
         {replyToMessage && (
           <div className="mb-2 bg-white/90 backdrop-blur-sm rounded-xl px-3 py-2 flex items-start gap-2 border-l-4 border-violet-500">
