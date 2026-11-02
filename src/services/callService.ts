@@ -247,9 +247,32 @@ export const callService = {
     };
 
     if (onConnectionStateChange) {
-      pc.onconnectionstatechange = () => {
-        onConnectionStateChange(pc.connectionState);
+      // `connectionState` (combined ICE + DTLS state) is the modern,
+      // preferred signal, but it's a newer addition to the spec than
+      // `iceConnectionState` and isn't equally reliable everywhere — on
+      // some mobile browsers/WebViews it can sit on 'connecting' and never
+      // actually flip to 'connected' even once media is already flowing,
+      // which is exactly what leaves the call UI stuck on "Connecting..."
+      // forever with nothing actually wrong with the call itself. Watching
+      // `iceConnectionState` too and reporting whichever of the two
+      // reaches a terminal state first means the UI still updates
+      // correctly even on a browser where `connectionState` alone never
+      // fires.
+      const reportState = () => {
+        const cs = pc.connectionState;
+        const ics = pc.iceConnectionState;
+        if (cs === 'connected' || ics === 'connected' || ics === 'completed') {
+          onConnectionStateChange('connected');
+        } else if (cs === 'failed' || ics === 'failed') {
+          onConnectionStateChange('failed');
+        } else if (cs === 'disconnected' || ics === 'disconnected') {
+          onConnectionStateChange('disconnected');
+        } else {
+          onConnectionStateChange(cs);
+        }
       };
+      pc.onconnectionstatechange = reportState;
+      pc.oniceconnectionstatechange = reportState;
     }
 
     return pc;

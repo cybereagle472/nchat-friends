@@ -16,8 +16,23 @@ interface CallModalProps {
 // ringing forever.
 const RING_TIMEOUT_MS = 45_000;
 
+// Both sides exchanged their SDP answer and are now trying to actually
+// establish the WebRTC connection (ICE + DTLS). If that hasn't finished
+// within this long, something's genuinely stuck (most commonly both ends
+// are behind NAT/firewalls that need a TURN relay to talk, and no relay
+// managed to work) — rather than leaving "Connecting..." on screen forever
+// with no way to tell it's never going to finish, give up and say so.
+const CONNECTING_TIMEOUT_MS = 20_000;
+
+// `iceConnectionState`/`connectionState` dipping to 'disconnected' is often
+// just a brief blip (a missed STUN keepalive, a momentary network switch)
+// that recovers on its own a second later — ending the call the instant
+// that happens is more aggressive than necessary. Give it a short grace
+// window to self-heal before actually treating it as a real failure.
+const DISCONNECT_GRACE_MS = 6_000;
+
 export function CallModal({ calleeId, callType, incomingCall, onClose }: CallModalProps) {
-  const [callState, setCallState] = useState<'initiating' | 'ringing' | 'connecting' | 'connected' | 'ended' | 'declined' | 'missed'>('initiating');
+  const [callState, setCallState] = useState<'initiating' | 'ringing' | 'connecting' | 'connected' | 'ended' | 'declined' | 'missed' | 'failed'>('initiating');
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(callType === 'audio');
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
@@ -32,16 +47,37 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
   const callIdRef = useRef<string | null>(null);
   const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const ringTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disconnectGraceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const eventSubRef = useRef<{ unsubscribe: () => void } | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const remoteDescriptionSetRef = useRef(false);
   const endedRef = useRef(false);
+  // Whether the call ever actually reached 'connected' at least once —
+  // distinguishes "never managed to connect at all" (show the explicit
+  // failure message) from "was connected and then the network dropped"
+  // (just end the call normally, like any other hangup mid-call).
+  const everConnectedRef = useRef(false);
 
   const clearRingTimeout = useCallback(() => {
     if (ringTimeoutRef.current) {
       clearTimeout(ringTimeoutRef.current);
       ringTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearConnectingTimeout = useCallback(() => {
+    if (connectingTimeoutRef.current) {
+      clearTimeout(connectingTimeoutRef.current);
+      connectingTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearDisconnectGrace = useCallback(() => {
+    if (disconnectGraceRef.current) {
+      clearTimeout(disconnectGraceRef.current);
+      disconnectGraceRef.current = null;
     }
   }, []);
 
@@ -62,6 +98,8 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
     }
 
     clearRingTimeout();
+    clearConnectingTimeout();
+    clearDisconnectGrace();
 
     if (eventSubRef.current) {
       eventSubRef.current.unsubscribe();
@@ -71,7 +109,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
     pendingCandidatesRef.current = [];
     pendingRemoteCandidatesRef.current = [];
     remoteDescriptionSetRef.current = false;
-  }, [clearRingTimeout]);
+  }, [clearRingTimeout, clearConnectingTimeout, clearDisconnectGrace]);
 
   // status defaults to 'ended' (a normal hangup); pass 'missed' for an
   // unanswered outgoing call or 'declined' when actively rejecting one.
@@ -84,6 +122,22 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
     cleanupCall();
     setCallState(status);
     setTimeout(onClose, 1500);
+  }, [callDuration, cleanupCall, onClose]);
+
+  // Both sides answered but the actual media connection never came
+  // together (see CONNECTING_TIMEOUT_MS) — tell the backend it's over
+  // (recorded as a normal 'ended' call, same as any other hangup) but show
+  // a clear "couldn't connect" message locally instead of silently closing
+  // or leaving "Connecting..." on screen with no explanation.
+  const failConnection = useCallback(async () => {
+    if (endedRef.current) return;
+    endedRef.current = true;
+    if (callIdRef.current) {
+      await callService.endCall(callIdRef.current, 'ended', callDuration);
+    }
+    cleanupCall();
+    setCallState('failed');
+    setTimeout(onClose, 2500);
   }, [callDuration, cleanupCall, onClose]);
 
   const initializeMedia = useCallback(async () => {
@@ -122,15 +176,39 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       },
       (state) => {
         if (state === 'connected') {
+          everConnectedRef.current = true;
           clearRingTimeout();
+          clearConnectingTimeout();
+          clearDisconnectGrace();
           setCallState('connected');
           if (!durationIntervalRef.current) {
             durationIntervalRef.current = setInterval(() => {
               setCallDuration((prev) => prev + 1);
             }, 1000);
           }
-        } else if (state === 'failed' || state === 'disconnected') {
-          endCall('ended');
+        } else if (state === 'failed') {
+          clearDisconnectGrace();
+          if (everConnectedRef.current) {
+            endCall('ended');
+          } else {
+            failConnection();
+          }
+        } else if (state === 'disconnected') {
+          // Don't react to the very first blip — a missed keepalive or a
+          // brief network switch is common and usually recovers on its
+          // own within a second or two. Only treat it as a real failure
+          // if it's still disconnected once the grace window elapses (the
+          // 'connected' branch above cancels this if it recovers first).
+          if (!disconnectGraceRef.current) {
+            disconnectGraceRef.current = setTimeout(() => {
+              disconnectGraceRef.current = null;
+              if (everConnectedRef.current) {
+                endCall('ended');
+              } else {
+                failConnection();
+              }
+            }, DISCONNECT_GRACE_MS);
+          }
         }
       }
     );
@@ -144,7 +222,18 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
 
     peerConnectionRef.current = pc;
     return pc;
-  }, [clearRingTimeout, endCall]);
+  }, [clearRingTimeout, clearConnectingTimeout, clearDisconnectGrace, endCall, failConnection]);
+
+  // Arms (or re-arms) the "give up if this never actually connects" timer
+  // — called the moment both sides have exchanged SDP and are waiting on
+  // ICE/DTLS to finish, from both the caller's and callee's code paths.
+  const startConnectingTimeout = useCallback(() => {
+    clearConnectingTimeout();
+    connectingTimeoutRef.current = setTimeout(() => {
+      connectingTimeoutRef.current = null;
+      if (!everConnectedRef.current) failConnection();
+    }, CONNECTING_TIMEOUT_MS);
+  }, [clearConnectingTimeout, failConnection]);
 
   // Apply any ICE candidates that arrived before we had a peer connection
   // (or before its remote description was set) ready to accept them.
@@ -182,6 +271,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
         remoteDescriptionSetRef.current = true;
         await flushPendingRemoteCandidates(pc);
         setCallState('connecting');
+        startConnectingTimeout();
       },
       onCallEnded: (id, status) => {
         if (id !== callId || endedRef.current) return;
@@ -208,7 +298,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
         }
       },
     });
-  }, [cleanupCall, flushPendingRemoteCandidates, onClose]);
+  }, [cleanupCall, flushPendingRemoteCandidates, onClose, startConnectingTimeout]);
 
   const initiateCall = useCallback(async () => {
     if (!calleeId) return;
@@ -297,6 +387,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       await callService.answerCall(incomingCall.id, answer);
 
       setCallState('connecting');
+      startConnectingTimeout();
       // Already subscribed to signaling since the ringing screen appeared
       // (see the mount effect below) — no need to subscribe again here.
     } catch (err: any) {
@@ -308,7 +399,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       cleanupCall();
       setTimeout(onClose, 2000);
     }
-  }, [cleanupCall, createPeerConnection, flushPendingRemoteCandidates, incomingCall, initializeMedia, onClose, remoteUser]);
+  }, [cleanupCall, createPeerConnection, flushPendingRemoteCandidates, incomingCall, initializeMedia, onClose, remoteUser, startConnectingTimeout]);
 
   const declineCall = useCallback(async () => {
     if (incomingCall) {
@@ -398,6 +489,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
       case 'ended': return 'Call ended';
       case 'declined': return incomingCall ? 'Call declined' : `${remoteUser?.full_name || 'They'} declined`;
       case 'missed': return 'No answer';
+      case 'failed': return 'Couldn\u2019t connect \u2014 check your connection';
       default: return '';
     }
   };
@@ -455,7 +547,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
           <div className="absolute bottom-0 left-0 right-0 p-6 pb-10 safe-area-inset-bottom">
             {incomingCall && callState === 'ringing' ? (
               <IncomingCallControls onDecline={declineCall} onAnswer={answerCall} />
-            ) : callState === 'ended' || callState === 'declined' || callState === 'missed' ? null : (
+            ) : callState === 'ended' || callState === 'declined' || callState === 'missed' || callState === 'failed' ? null : (
               <VideoCallControls
                 isMuted={isMuted}
                 isVideoOff={isVideoOff}
@@ -533,7 +625,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
               <p className={`text-lg ${
                 callState === 'connected'
                   ? 'text-green-400 font-semibold tabular-nums'
-                  : error
+                  : error || callState === 'failed'
                     ? 'text-red-400'
                     : 'text-white/70'
               }`}>
@@ -546,7 +638,7 @@ export function CallModal({ calleeId, callType, incomingCall, onClose }: CallMod
           <div className="px-6 pb-12 safe-area-inset-bottom relative z-10">
             {incomingCall && callState === 'ringing' ? (
               <IncomingCallControls onDecline={declineCall} onAnswer={answerCall} />
-            ) : callState === 'ended' || callState === 'declined' || callState === 'missed' ? null : (
+            ) : callState === 'ended' || callState === 'declined' || callState === 'missed' || callState === 'failed' ? null : (
               <AudioCallControls
                 isMuted={isMuted}
                 isSpeakerOn={isSpeakerOn}
