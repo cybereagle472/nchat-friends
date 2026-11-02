@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
 import { Toaster, toast } from 'sonner';
 import { MessageCircle, Circle, UsersRound, Compass, Clock } from 'lucide-react';
 import { Auth } from './components/Auth';
@@ -23,6 +23,7 @@ const GroupInfo = lazy(() => import('./components/GroupInfo').then((m) => ({ def
 const CreateGroup = lazy(() => import('./components/CreateGroup').then((m) => ({ default: m.CreateGroup })));
 const Settings = lazy(() => import('./components/Settings').then((m) => ({ default: m.Settings })));
 const CallModal = lazy(() => import('./components/CallModal').then((m) => ({ default: m.CallModal })));
+const GroupCallModal = lazy(() => import('./components/GroupCallModal').then((m) => ({ default: m.GroupCallModal })));
 const ProfileView = lazy(() => import('./components/ProfileView').then((m) => ({ default: m.ProfileView })));
 import { authService, ProfileResolution } from './services/authService';
 import { profileService } from './services/profileService';
@@ -34,6 +35,7 @@ import {
   getCachedUserProfile,
 } from './lib/apiClient';
 import { callService } from './services/callService';
+import { groupCallService, GroupCallSession } from './services/groupCallService';
 import { GroupWithMembers } from './services/groupService';
 import { UserProfile, Contact, Call } from './types';
 import { realtimeClient } from './lib/realtimeClient';
@@ -74,6 +76,7 @@ function prefetchAppScreens() {
   void import('./components/CreateGroup');
   void import('./components/Settings');
   void import('./components/CallModal');
+  void import('./components/GroupCallModal');
   void import('./components/ProfileView');
 }
 
@@ -82,6 +85,13 @@ interface CallState {
   calleeId?: string;
   callType: 'audio' | 'video';
   incomingCall?: Call;
+}
+
+interface GroupCallState {
+  active: boolean;
+  group?: GroupWithMembers;
+  callType: 'audio' | 'video';
+  incomingCall?: GroupCallSession;
 }
 
 function App() {
@@ -107,6 +117,19 @@ function App() {
     active: false,
     callType: 'audio'
   });
+  const [groupCallState, setGroupCallState] = useState<GroupCallState>({
+    active: false,
+    callType: 'audio'
+  });
+  // No call-waiting support for either kind of call — both of the
+  // incoming-call subscriptions below need to know if the *other* kind is
+  // already active before ringing a second one in on top of it, without
+  // forcing either subscription effect to re-run every time the other
+  // one's state changes.
+  const anyCallActiveRef = useRef(false);
+  useEffect(() => {
+    anyCallActiveRef.current = callState.active || groupCallState.active;
+  }, [callState.active, groupCallState.active]);
 
   // Applies the result of authService.resolveProfileState to app state.
   // Shared by the background reconciliation below and by the SIGNED_IN
@@ -291,9 +314,14 @@ function App() {
     const unsubscribe = callService.subscribeToIncomingCalls((callSession) => {
       if (callSession.status !== 'initiated' && callSession.status !== 'ringing') return;
 
-      // No call-waiting support: if we're already on a call, automatically
-      // decline the new one instead of silently dropping it (which would
-      // otherwise leave the second caller ringing forever with no feedback).
+      // No call-waiting support (1:1 or group): if we're already on a
+      // call of either kind, automatically decline the new one instead of
+      // silently dropping it (which would otherwise leave the second
+      // caller ringing forever with no feedback).
+      if (anyCallActiveRef.current) {
+        callService.endCall(callSession.id, 'declined');
+        return;
+      }
       setCallState((prev) => {
         if (prev.active) {
           callService.endCall(callSession.id, 'declined');
@@ -313,6 +341,37 @@ function App() {
           active: true,
           callType: callSession.callType,
           incomingCall
+        };
+      });
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [currentUser?.id]);
+
+  // Subscribe to incoming group calls — mirrors the 1:1 subscription
+  // immediately above (same shared personal-room transport, same
+  // no-call-waiting rule), but rings in GroupCallModal instead of CallModal.
+  useEffect(() => {
+    if (!currentUser?.id) return;
+
+    const unsubscribe = groupCallService.subscribeToIncomingGroupCalls((call) => {
+      if (call.status !== 'active') return;
+
+      if (anyCallActiveRef.current) {
+        groupCallService.declineCall(call.id);
+        return;
+      }
+      setGroupCallState((prev) => {
+        if (prev.active) {
+          groupCallService.declineCall(call.id);
+          return prev;
+        }
+        return {
+          active: true,
+          callType: call.callType,
+          incomingCall: call
         };
       });
     });
@@ -363,6 +422,24 @@ function App() {
 
   const handleCloseCall = useCallback(() => {
     setCallState({
+      active: false,
+      callType: 'audio'
+    });
+  }, []);
+
+  // group is passed explicitly (rather than reading selectedGroup here)
+  // so this stays correct even if it's ever wired to a group row outside
+  // the currently-open chat.
+  const handleGroupCall = useCallback((group: GroupWithMembers, type: 'voice' | 'video') => {
+    setGroupCallState({
+      active: true,
+      group,
+      callType: type === 'voice' ? 'audio' : 'video'
+    });
+  }, []);
+
+  const handleCloseGroupCall = useCallback(() => {
+    setGroupCallState({
       active: false,
       callType: 'audio'
     });
@@ -485,10 +562,13 @@ function App() {
       setShowCreateGroup={setShowCreateGroup}
       showSettings={showSettings}
       callState={callState}
+      groupCallState={groupCallState}
       handleOpenChat={handleOpenChat}
       handleBackToChats={handleBackToChats}
       handleCall={handleCall}
       handleCloseCall={handleCloseCall}
+      handleGroupCall={handleGroupCall}
+      handleCloseGroupCall={handleCloseGroupCall}
       handleOpenGroup={handleOpenGroup}
       handleBackFromGroup={handleBackFromGroup}
       handleGroupCreated={handleGroupCreated}
@@ -512,10 +592,13 @@ function MainApp({
   setShowCreateGroup,
   showSettings,
   callState,
+  groupCallState,
   handleOpenChat,
   handleBackToChats,
   handleCall,
   handleCloseCall,
+  handleGroupCall,
+  handleCloseGroupCall,
   handleOpenGroup,
   handleBackFromGroup,
   handleGroupCreated,
@@ -534,10 +617,13 @@ function MainApp({
   setShowCreateGroup: (show: boolean) => void;
   showSettings: boolean;
   callState: CallState;
+  groupCallState: GroupCallState;
   handleOpenChat: (contact: Contact) => void;
   handleBackToChats: () => void;
   handleCall: (userId: string, type: 'voice' | 'video') => void;
   handleCloseCall: () => void;
+  handleGroupCall: (group: GroupWithMembers, type: 'voice' | 'video') => void;
+  handleCloseGroupCall: () => void;
   handleOpenGroup: (group: GroupWithMembers) => void;
   handleBackFromGroup: () => void;
   handleGroupCreated: (groupId: string) => void;
@@ -722,6 +808,7 @@ function MainApp({
             currentUser={currentUser}
             group={liveSelectedGroup}
             onBack={handleBackFromGroup}
+            onGroupCall={(type) => handleGroupCall(liveSelectedGroup, type)}
             onManageGroup={handleManageGroup}
           />
         ) : showCreateGroup ? (
@@ -894,6 +981,19 @@ function MainApp({
             callType={callState.callType}
             incomingCall={callState.incomingCall}
             onClose={handleCloseCall}
+          />
+        </Suspense>
+      )}
+
+      {/* Group Call Modal */}
+      {groupCallState.active && (
+        <Suspense fallback={null}>
+          <GroupCallModal
+            currentUser={currentUser}
+            group={groupCallState.group}
+            callType={groupCallState.callType}
+            incomingCall={groupCallState.incomingCall}
+            onClose={handleCloseGroupCall}
           />
         </Suspense>
       )}

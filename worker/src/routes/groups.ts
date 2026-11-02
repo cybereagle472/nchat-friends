@@ -8,14 +8,17 @@ import { getPrivacySettings } from '../lib/privacy';
 const groups = new Hono<{ Bindings: Env; Variables: Variables }>();
 groups.use('*', requireAuth);
 
-async function getMembership(env: Env, groupId: string, userId: string) {
+// Exported for worker/src/routes/groupCalls.ts, which needs the same
+// "is this user actually in this group" / "who's in this group" checks a
+// group call has to run before letting someone ring, join or signal it.
+export async function getMembership(env: Env, groupId: string, userId: string) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return env.DB.prepare('SELECT * FROM group_members WHERE group_id = ? AND user_id = ?')
     .bind(groupId, userId)
     .first<any>();
 }
 
-async function memberIdsOf(env: Env, groupId: string): Promise<string[]> {
+export async function memberIdsOf(env: Env, groupId: string): Promise<string[]> {
   const { results } = await env.DB.prepare('SELECT user_id FROM group_members WHERE group_id = ?').bind(groupId).all<{ user_id: string }>();
   return (results ?? []).map((r) => r.user_id);
 }
