@@ -20,6 +20,7 @@ import { GroupWithMembers, groupService } from '../services/groupService';
 import { UserProfile, GroupMessage } from '../types';
 import { mediaService } from '../services/mediaService';
 import { GroupMessageActions, GroupReactionsDisplay } from './GroupMessageActions';
+import { useKeyboardInset } from '../hooks/useKeyboardInset';
 
 interface GroupChatViewProps {
   currentUser: UserProfile;
@@ -33,6 +34,11 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
   const [messageText, setMessageText] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const chatRootRef = useRef<HTMLDivElement>(null);
+  // See ChatView.tsx for why this exists alongside the app shell's own
+  // visualViewport-driven resize — this is the fallback for when that
+  // alone doesn't account for the keyboard on a given device/browser.
+  const keyboardInset = useKeyboardInset(chatRootRef);
 
   // Message Actions State
   const [selectedMessage, setSelectedMessage] = useState<GroupMessageWithStatus | null>(null);
@@ -363,7 +369,11 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
   };
 
   return (
-    <div className="h-full flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50">
+    <div
+      ref={chatRootRef}
+      className="h-full flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50"
+      style={keyboardInset > 0 ? { paddingBottom: keyboardInset } : undefined}
+    >
       {/* Header */}
       <div className="relative z-20 backdrop-blur-2xl bg-gradient-to-r from-violet-500/95 via-purple-500/95 to-fuchsia-500/95 text-white px-3 py-3 shadow-xl shadow-purple-500/20">
         <div className="flex items-center gap-3">

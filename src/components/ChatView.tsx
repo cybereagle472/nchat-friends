@@ -9,6 +9,7 @@ import { getChatId, getChatMessages, saveMessages, LocalMessage } from '../utils
 import { presenceStatusText } from '../utils/presenceFormat';
 import { Message, UserProfile, Contact } from '../types';
 import { MessageActions, ForwardDialog, ReactionsDisplay } from './MessageActions';
+import { useKeyboardInset } from '../hooks/useKeyboardInset';
 
 // Debounce utility for typing indicator
 const debounce = <T extends (...args: Parameters<T>) => void>(fn: T, delay: number) => {
@@ -1029,6 +1030,13 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messageInputRef = useRef<HTMLInputElement>(null);
+  const chatRootRef = useRef<HTMLDivElement>(null);
+  // See useKeyboardInset's doc comment — this is the fallback that kicks
+  // in specifically when the keyboard is covering the input *despite* the
+  // app shell's own resize (useVisualViewportHeight, in App.tsx), by
+  // measuring this exact screen's own bottom edge against the real
+  // visible viewport instead of assuming the shell already got it right.
+  const keyboardInset = useKeyboardInset(chatRootRef);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
@@ -2114,7 +2122,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
   );
 
   return (
-    <div className="h-full flex flex-col relative bg-slate-100">
+    <div
+      ref={chatRootRef}
+      className="h-full flex flex-col relative bg-slate-100"
+      style={keyboardInset > 0 ? { paddingBottom: keyboardInset } : undefined}
+    >
       {/* Chat Background Pattern */}
       <div className="absolute inset-0 opacity-[0.03] pointer-events-none">
         <div
@@ -3472,14 +3484,21 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
            left to reveal the clipped end, pauses, slides back, pauses,
            repeats — same back-and-forth WhatsApp uses instead of a
            continuous one-direction loop. */
+        /* 11s cycle: ~1s holding the start, ~1s sliding out, a full 3.5s
+           holding fully revealed (this used to be only ~1.2s, so it felt
+           like it snapped back almost as soon as it finished sliding —
+           not enough time to actually read the end of the text), ~1s
+           sliding back, then another hold before it repeats. */
         .header-marquee-text {
-          animation: header-marquee-slide 8s ease-in-out infinite;
+          animation: header-marquee-slide 11s ease-in-out infinite;
         }
 
         @keyframes header-marquee-slide {
-          0%, 15% { transform: translateX(0); }
-          45%, 60% { transform: translateX(var(--marquee-shift)); }
-          92%, 100% { transform: translateX(0); }
+          0%, 9% { transform: translateX(0); }
+          18% { transform: translateX(var(--marquee-shift)); }
+          50% { transform: translateX(var(--marquee-shift)); }
+          59% { transform: translateX(0); }
+          100% { transform: translateX(0); }
         }
 
         /* Date Separator Pill - shown between messages sent on different
