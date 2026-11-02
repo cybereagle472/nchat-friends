@@ -368,8 +368,19 @@ groups.post('/:id/messages', async (c) => {
     created_at,
   });
 
-  await Promise.all([
-    c.env.DB.prepare(
+  // The `duration` column (needed for group voice messages) was added by a
+  // later migration (0003_group_voice_duration.sql) that has to be applied
+  // by hand against each D1 database — it is NOT picked up automatically
+  // by a plain worker code deploy. If it hasn't been run yet on whichever
+  // database this request hits, an INSERT that references `duration`
+  // fails outright with a "no such column" error — and since this insert
+  // used to be unconditional, that took down *every* group message send,
+  // not just voice ones, the instant this code shipped ahead of the
+  // migration. Try the full insert first (so duration is saved once the
+  // migration has run), and silently fall back to the pre-migration
+  // column list if it hasn't, so sending never breaks either way.
+  try {
+    await c.env.DB.prepare(
       `INSERT INTO group_messages (id, group_id, sender_id, content, type, media_url, thumbnail_url, duration, client_message_id, reply_to, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
@@ -386,9 +397,29 @@ groups.post('/:id/messages', async (c) => {
         body.reply_to ?? null,
         created_at
       )
-      .run(),
-    broadcastToGroup(c.env, groupId, { type: 'group-message:new', message: msg }),
-  ]);
+      .run();
+  } catch (err) {
+    console.error('[groups] insert with duration column failed, retrying without it (migration 0003 likely not applied yet):', err);
+    await c.env.DB.prepare(
+      `INSERT INTO group_messages (id, group_id, sender_id, content, type, media_url, thumbnail_url, client_message_id, reply_to, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        id,
+        groupId,
+        userId,
+        body.content ?? '',
+        body.type ?? 'text',
+        body.media_url ?? null,
+        body.thumbnail_url ?? null,
+        body.client_message_id ?? null,
+        body.reply_to ?? null,
+        created_at
+      )
+      .run();
+  }
+
+  await broadcastToGroup(c.env, groupId, { type: 'group-message:new', message: msg });
 
   return c.json({ message: msg }, 201);
 });
