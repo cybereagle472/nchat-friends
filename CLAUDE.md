@@ -157,3 +157,35 @@ CF_TURN_KEY_API_TOKEN      # optional, for reliable cross-network calls
 
 See `worker/SETUP_GUIDE.md` (CLI/`wrangler`) or
 `worker/DASHBOARD_SETUP_GUIDE.md` (Cloudflare dashboard only, no terminal).
+
+## Cloudflare Git-integration deploy settings (Workers Builds)
+
+Both the frontend and the backend are connected to Cloudflare as separate
+"Workers Builds" (Git-integrated) projects, each with its own Production
+branch / Build command / Deploy command configured in the Cloudflare
+dashboard (Settings → Build) — **not** in any file in this repo. Getting
+these wrong fails silently in a way that's easy to misdiagnose as "my
+code isn't pushed" when the code on GitHub is actually fine. The correct
+settings, worked out the hard way once already:
+
+| Project | Root directory | Build command | Deploy command |
+|---|---|---|---|
+| Frontend (serves `dist/`, static site) | `/` | `npm run build` | `npx wrangler deploy` |
+| Backend/API (`worker/`, Hono on Workers) | `worker` | *(leave empty — nothing to build, `wrangler deploy` bundles the TS itself)* | `npx wrangler deploy` |
+
+Both projects' **Production branch** should be `main`.
+
+Two gotchas worth remembering if a deployment looks stuck or wrong:
+- `npx wrangler preview` is **not** a deploy command — it's an unrelated
+  beta command for ephemeral local-style previews and will fail with a
+  "missing `previews` block" error. If a project's Deploy command field
+  ever shows this, it's misconfigured; change it to `npx wrangler deploy`.
+- Cloudflare's **"Retry deployment"** button reruns the *exact* historical
+  deployment it's attached to — same branch, same commit it originally
+  built from — regardless of whatever the Production branch setting
+  currently says. Changing Production branch in Settings only affects the
+  *next new* deployment triggered by an actual push; it does not retarget
+  or re-run anything already in the Deployments list. If you've just
+  changed the Production branch and need a fresh build from it, push a
+  new commit (or use a "Create deployment" action, if the dashboard
+  exposes one) rather than retrying an old entry.
