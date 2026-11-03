@@ -263,6 +263,13 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
           filteredGroups.map((group, index) => {
             const activity = getActivity(group);
             const preview = getGroupMessagePreview(group);
+            // Pre-compute a real boolean rather than guarding the badge with
+            // `group.unreadCount && ...` directly: once a group has been
+            // fully read, unreadCount is the *number* 0, and `0 && x` short
+            // -circuits to 0 (not false) -- which React happily renders as
+            // literal text, unlike false/null/undefined. That's exactly
+            // what was putting a stray "0" on every caught-up group.
+            const hasUnread = (group.unreadCount || 0) > 0;
             return (
             <button
               key={group.id}
@@ -327,9 +334,9 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
                       <span className="text-slate-400">No messages yet</span>
                     )}
                   </p>
-                  {group.unreadCount && group.unreadCount > 0 && (
+                  {hasUnread && (
                     <span className="px-2 py-0.5 rounded-full bg-gradient-to-r from-violet-500 to-purple-500 text-white text-[10px] font-bold shadow-sm flex-shrink-0">
-                      {group.unreadCount > 99 ? '99+' : group.unreadCount}
+                      {(group.unreadCount as number) > 99 ? '99+' : group.unreadCount}
                     </span>
                   )}
                 </div>
