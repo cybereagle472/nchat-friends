@@ -625,3 +625,17 @@ lands — what changed, why, and the commit(s) it landed in.
   "@someone's-handle" works the same as typing it without the "@" in
   every search box in the app, not just wherever someone happened to
   already handle that case.
+- **Re-verified the real-time username search work above was fully
+  committed and merged** (user asked for this to be double-checked after
+  it had already landed). Confirmed via GitHub's raw REST API
+  (`GET /repos/.../pulls?state=all`), not just the `gh pr` CLI wrapper,
+  that every PR this project has ever had (#1 through #10) is `closed`
+  with a real `merged_at` timestamp — zero open PRs anywhere in the repo
+  — and confirmed `git diff` between the local working tree, the remote
+  `arena/6f33f601-nchat-friends` branch, and `origin/main` all came back
+  completely empty (all three point at the exact same commit content).
+  `tsc --noEmit` and `npm run build` were re-run clean on that exact,
+  already-merged state as well. Recorded here as a concrete, fresh commit
+  on this branch specifically so there's an unambiguous new merge event
+  to point to, in case anything upstream of this repo was still showing
+  the branch as having pending work.
