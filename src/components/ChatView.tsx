@@ -110,6 +110,11 @@ interface MessageBubbleProps {
   formatTime: (timestamp: string) => string;
   onLongPress: (message: Message, position: { x: number; y: number }) => void;
   onReactionClick: (messageId: string, emoji: string) => void;
+  /** Short quoted preview of the message this one is replying to, if any
+   *  (looked up by the parent from `message.reply_to`). Undefined when the
+   *  message isn't a reply, or the original couldn't be found (e.g. not
+   *  loaded in the current page of history). */
+  repliedToPreview?: { senderName: string; text: string } | null;
 }
 
 const MessageBubble = memo(function MessageBubble({
@@ -119,7 +124,8 @@ const MessageBubble = memo(function MessageBubble({
   renderMessageContent,
   formatTime,
   onLongPress,
-  onReactionClick
+  onReactionClick,
+  repliedToPreview
 }: MessageBubbleProps) {
   const isVoice = message.type === 'voice';
   // Photos/videos/GIFs get their own bubble treatment below: unlike text
@@ -197,6 +203,24 @@ const MessageBubble = memo(function MessageBubble({
 
   const hasReactions = message.reactions && Object.keys(message.reactions).length > 0;
 
+  // Quoted "replying to" snippet shown above the bubble content, WhatsApp
+  // style. Only rendered when this message actually has a reply target
+  // AND the parent managed to find it in the loaded history.
+  const replyQuote = repliedToPreview ? (
+    <div
+      className={`mb-1.5 px-2 py-1 rounded-lg border-l-2 ${
+        isOwn
+          ? 'bg-white/15 border-white/60 text-white/90'
+          : 'bg-slate-100 border-violet-400 text-slate-600'
+      }`}
+    >
+      <p className={`text-[11px] font-semibold ${isOwn ? 'text-white' : 'text-violet-600'}`}>
+        {repliedToPreview.senderName}
+      </p>
+      <p className="text-xs truncate">{repliedToPreview.text}</p>
+    </div>
+  ) : null;
+
   return (
     <div className={`flex ${isOwn ? 'justify-end' : 'justify-start'} ${hasReactions ? 'mb-4' : ''}`}>
       {isVoice ? (
@@ -207,6 +231,7 @@ const MessageBubble = memo(function MessageBubble({
           onTouchEnd={handleTouchEnd}
           onContextMenu={handleContextMenu}
         >
+          {replyQuote}
           {renderMessageContent(message, isOwn)}
           <div className={`flex items-center gap-1 mt-1 px-2 text-[10px] ${isOwn ? 'text-slate-400 justify-end' : 'text-slate-400'}`}>
             <span>{formatTime(message.created_at)}</span>
@@ -228,6 +253,7 @@ const MessageBubble = memo(function MessageBubble({
           onTouchEnd={handleTouchEnd}
           onContextMenu={handleContextMenu}
         >
+          {replyQuote}
           <div
             className={`relative max-w-full rounded-2xl overflow-hidden select-none ${
               isOwn ? 'rounded-br-md' : 'rounded-bl-md'
@@ -275,6 +301,7 @@ const MessageBubble = memo(function MessageBubble({
                 : 'bg-white text-slate-800 rounded-bl-md shadow-sm'
             }`}
           >
+            {replyQuote}
             {renderMessageContent(message, isOwn)}
             <div className={`flex items-center gap-1 mt-1 text-[10px] ${isOwn ? 'text-white/70 justify-end' : 'text-slate-400'}`}>
               <span>{formatTime(message.created_at)}</span>
@@ -301,7 +328,15 @@ const MessageBubble = memo(function MessageBubble({
     prevProps.message.is_edited === nextProps.message.is_edited &&
     prevProps.message.is_deleted === nextProps.message.is_deleted &&
     JSON.stringify(prevProps.message.reactions) === JSON.stringify(nextProps.message.reactions) &&
-    prevProps.isOwn === nextProps.isOwn
+    prevProps.isOwn === nextProps.isOwn &&
+    // repliedToPreview is usually resolvable immediately, but if the
+    // replied-to message hasn't loaded yet (e.g. older history still
+    // paginating in) it starts as null/undefined and only becomes
+    // available once that message arrives in state — without comparing
+    // it here, the memoized bubble would silently keep rendering with no
+    // quote forever since none of the other compared fields ever change.
+    prevProps.repliedToPreview?.text === nextProps.repliedToPreview?.text &&
+    prevProps.repliedToPreview?.senderName === nextProps.repliedToPreview?.senderName
   );
 });
 
@@ -982,6 +1017,15 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
   const [messages, setMessages] = useState<Message[]>(
     () => chatService.getCachedMessages(currentUser.id, contact.user_id) || []
   );
+
+  // Fast id -> message lookup so reply quotes can resolve the original
+  // message's content without an O(n) scan per rendered bubble.
+  const messagesById = useMemo(() => {
+    const map = new Map<string, Message>();
+    for (const m of messages) map.set(m.id, m);
+    return map;
+  }, [messages]);
+
   const [inputMessage, setInputMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
@@ -1331,6 +1375,15 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
 
     const messageContent = inputMessage.trim();
     const tempId = `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    // Capture (and clear) whatever message the user tapped "Reply" on
+    // *before* sending — this was previously read by the UI (the banner
+    // above the input) but never actually attached to the outgoing
+    // message, so every "reply" silently sent as a normal, unlinked
+    // message. Clearing it immediately here (rather than only after the
+    // server round-trip) also matches WhatsApp: the reply banner should
+    // disappear the instant you hit send, not a moment later.
+    const replyToId = replyToMessage?.id;
+    setReplyToMessage(null);
 
     // Create optimistic message to show immediately
     const optimisticMessage: Message = {
@@ -1340,6 +1393,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
       receiver_id: contact.user_id,
       content: messageContent,
       type: 'text',
+      reply_to: replyToId,
       created_at: new Date().toISOString(),
       is_read: false,
       is_deleted: false
@@ -1357,6 +1411,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
         receiverId: contact.user_id,
         content: messageContent,
         type: 'text',
+        replyToId,
         clientMessageId: tempId
       });
 
@@ -1381,6 +1436,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
   const handleFileUpload = async (file: File, type: 'image' | 'video' | 'file') => {
     setUploading(true);
     setShowMediaOptions(false);
+    // Same fix as handleSendMessage: a reply started before attaching
+    // media must still carry through, and the banner should clear as
+    // soon as the send is kicked off rather than being left dangling.
+    const replyToId = replyToMessage?.id;
+    setReplyToMessage(null);
 
     try {
       const result = await mediaService.uploadMedia(file, currentUser.id);
@@ -1390,7 +1450,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           senderId: currentUser.id,
           receiverId: contact.user_id,
           content: result.url,
-          type: type
+          type: type,
+          replyToId
         });
       }
     } catch (error) {
@@ -1822,6 +1883,11 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
 
   const sendVoiceMessage = async (audioBlob: Blob, durationSeconds: number, waveformSamples: number[]) => {
     setUploading(true);
+    // Same reply-attachment fix as handleSendMessage/handleFileUpload —
+    // a reply started before recording a voice note must still carry
+    // through instead of being silently dropped.
+    const replyToId = replyToMessage?.id;
+    setReplyToMessage(null);
     try {
       // Use the blob's *actual* recorded type (webm/mp4/ogg, whichever the
       // browser negotiated — e.g. Safari/iOS records audio/mp4, not webm)
@@ -1845,7 +1911,8 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           content: result.url,
           type: 'voice',
           duration: durationSeconds,
-          waveform: downsampleWaveform(waveformSamples)
+          waveform: downsampleWaveform(waveformSamples),
+          replyToId
         });
       } else {
         // Previously failed silently here with no feedback at all whenever
@@ -2390,6 +2457,18 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                 );
               }
 
+              const repliedTo = message.reply_to ? messagesById.get(message.reply_to) : undefined;
+              const repliedToPreview = repliedTo
+                ? {
+                    senderName: repliedTo.sender_id === currentUser.id ? 'You' : contact.profile.full_name,
+                    text: repliedTo.is_deleted
+                      ? 'This message was deleted'
+                      : (!repliedTo.type || repliedTo.type === 'text')
+                        ? repliedTo.content
+                        : `[${repliedTo.type}]`
+                  }
+                : null;
+
               items.push(
                 <MessageBubble
                   key={message.client_message_id || message.id}
@@ -2400,6 +2479,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                   formatTime={formatTime}
                   onLongPress={handleMessageLongPress}
                   onReactionClick={handleReactionClick}
+                  repliedToPreview={repliedToPreview}
                 />
               );
             });

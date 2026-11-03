@@ -173,6 +173,14 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
     userId: currentUser.id
   });
 
+  // Fast id -> message lookup so reply quotes can resolve the original
+  // message's content without an O(n) scan per rendered bubble.
+  const messagesById = useMemo(() => {
+    const map = new Map<string, GroupMessageWithStatus>();
+    for (const m of messages) map.set(m.id, m);
+    return map;
+  }, [messages]);
+
   // Typing / recording indicators — mirrors ChatView's isTyping/
   // isContactRecording exactly, except a group can have more than one
   // member typing or recording at once, so these are Sets of member ids
@@ -225,10 +233,19 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
     const text = messageText.trim();
     if (!text || isSending) return;
 
+    // Tapping "Reply" on a message only ever showed a banner above the
+    // input — it was never actually attached to the outgoing message, so
+    // every "reply" silently sent as a normal, unlinked message. Capture
+    // the target here and clear the banner immediately (matching
+    // WhatsApp: it disappears the instant you hit send, not after the
+    // server round-trip).
+    const replyToId = replyToMessage?.id;
+    setReplyToMessage(null);
+
     setMessageText('');
     typingService.sendGroupStoppedTyping(currentUser.id, group.id);
-    await sendMessage(text);
-  }, [messageText, isSending, sendMessage, currentUser.id, group.id]);
+    await sendMessage(text, 'text', { replyToId });
+  }, [messageText, isSending, sendMessage, currentUser.id, group.id, replyToMessage]);
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -260,11 +277,16 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
   const handleFileUpload = async (file: File, type: 'image' | 'video' | 'file') => {
     setUploading(true);
     setShowMediaOptions(false);
+    // Same fix as handleSendMessage: a reply started before attaching
+    // media must still carry through, and the banner should clear as
+    // soon as the send is kicked off rather than being left dangling.
+    const replyToId = replyToMessage?.id;
+    setReplyToMessage(null);
 
     try {
       const result = await mediaService.uploadMedia(file, currentUser.id);
       if (result.success && result.url) {
-        await sendMessage(result.url, type);
+        await sendMessage(result.url, type, { replyToId });
       }
     } catch (error) {
       console.error('Error uploading file:', error);
@@ -360,6 +382,11 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
 
   const sendVoiceMessage = async (audioBlob: Blob, durationSeconds: number, waveformSamples: number[]) => {
     setUploading(true);
+    // Same reply-attachment fix as handleSendMessage/handleFileUpload —
+    // a reply started before recording a voice note must still carry
+    // through instead of being silently dropped.
+    const replyToId = replyToMessage?.id;
+    setReplyToMessage(null);
     try {
       const actualType = audioBlob.type || 'audio/webm';
       const extension = actualType.includes('mp4')
@@ -375,7 +402,8 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
       if (result.success && result.url) {
         await sendMessage(result.url, 'voice', {
           duration: durationSeconds,
-          waveform: downsampleWaveform(waveformSamples)
+          waveform: downsampleWaveform(waveformSamples),
+          replyToId
         });
       } else {
         console.error('Voice message upload failed:', result.error);
@@ -813,6 +841,31 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
       formatDate(messages[index - 1].created_at) !== formatDate(message.created_at);
     const showSender = !isOwn && (index === 0 || messages[index - 1].sender_id !== message.sender_id);
 
+    // Quoted "replying to" snippet, WhatsApp style — only rendered when
+    // this message actually has a reply target AND it's resolvable in
+    // the currently loaded history.
+    const repliedTo = message.reply_to ? messagesById.get(message.reply_to) : undefined;
+    const replyQuote = repliedTo ? (
+      <div
+        className={`mb-1 px-2 py-1 rounded-lg border-l-2 ${
+          isOwn
+            ? 'bg-white/15 border-white/60 text-white/90'
+            : 'bg-slate-100 border-violet-400 text-slate-600'
+        }`}
+      >
+        <p className={`text-[11px] font-semibold ${isOwn ? 'text-white' : 'text-violet-600'}`}>
+          {repliedTo.sender_id === currentUser.id ? 'You' : getSenderName(repliedTo.sender_id)}
+        </p>
+        <p className="text-xs truncate">
+          {repliedTo.is_deleted
+            ? 'This message was deleted'
+            : (!repliedTo.type || repliedTo.type === 'text')
+              ? repliedTo.content
+              : `[${repliedTo.type}]`}
+        </p>
+      </div>
+    ) : null;
+
     // Check if message is deleted
     if (message.is_deleted) {
       return (
@@ -882,6 +935,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
 
             {isMedia ? (
               <>
+                {replyQuote}
                 {/* Edge-to-edge media bubble (no px-3.5 py-2 text padding) —
                     matches the 1:1 chat's photo/video bubbles: the media
                     fills the whole rounded shape instead of sitting inside a
@@ -951,6 +1005,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                 onTouchEnd={handleTouchEnd}
                 onContextMenu={(e) => handleContextMenu(e, message)}
               >
+                {replyQuote}
                 <VoiceMessageBubble
                   message={message}
                   isOwn={isOwn}
@@ -993,6 +1048,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                 onTouchEnd={handleTouchEnd}
                 onContextMenu={(e) => handleContextMenu(e, message)}
               >
+                {replyQuote}
                 {isFile ? (
                   <DocumentBubble message={message} isOwn={isOwn} />
                 ) : (
