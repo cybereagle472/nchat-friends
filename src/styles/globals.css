@@ -273,6 +273,72 @@
   border: 1px solid rgba(255, 255, 255, 0.25);
 }
 
+/* ===== Shared "frosted glass" card utility =====
+   Reusable version of the exact glassmorphism recipe used for small
+   floating surfaces that sit on top of this app's colorful/animated
+   backgrounds (confirmation dialogs, the header overflow menu, empty-state
+   cards, the reply-preview banner). Every purely *visual* property of the
+   reference recipe — the translucent tint, the blur, the border, the
+   layered shadow/inner glow, and the shimmering top/left edge highlights
+   — is kept byte-for-byte faithful. What's deliberately left out is the
+   reference's fixed `width: 240px; height: 360px` and `border-radius:
+   20px`: those aren't part of the glass *look*, they're just the size of
+   one mockup box, and hardcoding them here would break every differently
+   sized place this class gets used. Real usages keep their own Tailwind
+   sizing/rounding classes (w-*, max-w-*, rounded-*, ...) and this class
+   only ever contributes the glass surface itself.
+   `position: relative` + `overflow: hidden` are required, not decorative
+   — they're what makes the ::before/::after highlight lines below clip
+   correctly to each usage's own rounded corners. */
+.glass-card {
+  position: relative;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.1),
+    /* Reference value was rgba(255, 255, 255, 2.4) — alpha can't go above
+       1 and browsers silently clamp it there anyway, so this is written
+       as the equivalent valid value rather than an out-of-range one. */
+    inset 0 0 48px 24px rgba(255, 255, 255, 1);
+}
+
+.glass-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.8), transparent);
+  pointer-events: none;
+}
+
+.glass-card::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 100%;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.8), transparent, rgba(255, 255, 255, 0.3));
+  pointer-events: none;
+}
+
+/* The reply-preview banner (see ChatView/GroupChatView) wants to keep its
+   own thicker violet accent stripe on its left edge on top of the shared
+   glass look above. Declared after .glass-card so this one side's
+   longhand border-left wins over the all-around shorthand `border` the
+   base class sets, without having to fork a whole separate glass variant
+   just for one accent color. */
+.glass-card-reply-accent {
+  border-left: 4px solid rgba(139, 92, 246, 0.9);
+}
+
 /* Smooth scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
@@ -1079,16 +1145,52 @@ img {
         }
 
         /* Date Separator Pill - shown between messages sent on different
-           days, WhatsApp-style. */
+           days, WhatsApp-style. Upgraded to the app's shared glassmorphism
+           recipe (see .glass-card in the base styles above) instead of a
+           flat near-opaque chip — it floats directly over the animated
+           low-poly chat background, which is exactly the kind of surface
+           that recipe is meant for. Kept as its own rule (rather than
+           reusing the .glass-card class) only because this element needs
+           its own border-radius/padding/font sizing, which the shared
+           class intentionally leaves out. */
         .date-separator-pill {
           display: inline-block;
+          position: relative;
+          overflow: hidden;
           padding: 5px 14px;
           font-size: 12px;
           font-weight: 600;
           color: #64748b;
-          background: rgba(255, 255, 255, 0.9);
+          background: rgba(255, 255, 255, 0.06);
+          backdrop-filter: blur(5px);
+          -webkit-backdrop-filter: blur(5px);
+          border: 1px solid rgba(255, 255, 255, 0.3);
           border-radius: 10px;
-          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+          box-shadow:
+            0 1px 3px rgba(0, 0, 0, 0.08),
+            inset 0 1px 0 rgba(255, 255, 255, 0.5),
+            inset 0 -1px 0 rgba(255, 255, 255, 0.1),
+            inset 0 0 48px 24px rgba(255, 255, 255, 1);
+        }
+
+        .date-separator-pill::before {
+          content: '';
+          position: absolute;
+          top: 0;
+          left: 0;
+          right: 0;
+          height: 1px;
+          background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.8), transparent);
+        }
+
+        .date-separator-pill::after {
+          content: '';
+          position: absolute;
+          top: 0;
+          left: 0;
+          width: 1px;
+          height: 100%;
+          background: linear-gradient(180deg, rgba(255, 255, 255, 0.8), transparent, rgba(255, 255, 255, 0.3));
         }
 
         /* Message Bubble Wrapper for Reactions Positioning */

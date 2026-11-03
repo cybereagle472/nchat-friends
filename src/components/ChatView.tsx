@@ -2359,7 +2359,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                   className="fixed inset-0 z-40"
                   onClick={() => setShowMenu(false)}
                 />
-                <div className="absolute right-0 top-full mt-1 w-48 bg-white rounded-xl shadow-xl border border-slate-200 overflow-hidden z-50 animate-scale-in">
+                <div className="glass-card absolute right-0 top-full mt-1 w-48 rounded-xl z-50 animate-scale-in">
                   <button
                     onClick={() => {
                       setShowMenu(false);
@@ -2380,7 +2380,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
       {/* Block Confirmation Modal */}
       {showBlockConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
-          <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
+          <div className="glass-card rounded-2xl p-6 max-w-sm w-full">
             <div className="flex flex-col items-center text-center">
               <div className="w-16 h-16 rounded-full bg-red-100 flex items-center justify-center mb-4">
                 <UserX className="w-8 h-8 text-red-500" />
@@ -2431,7 +2431,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           </div>
         ) : messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full">
-            <div className="bg-white rounded-2xl p-6 shadow-sm text-center max-w-[280px]">
+            <div className="glass-card rounded-2xl p-6 text-center max-w-[280px]">
               <div className="w-16 h-16 rounded-full bg-gradient-to-br from-violet-400 to-fuchsia-400 flex items-center justify-center text-2xl mb-3 mx-auto">
                 👋
               </div>
@@ -2743,7 +2743,7 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
       >
           {/* Reply Preview */}
           {replyToMessage && (
-            <div className="mb-2 bg-white/90 backdrop-blur-sm rounded-xl px-3 py-2 flex items-start gap-2 border-l-4 border-violet-500">
+            <div className="glass-card glass-card-reply-accent mb-2 rounded-xl px-3 py-2 flex items-start gap-2">
               <div className="flex-1 min-w-0">
                 <p className="text-xs font-semibold text-violet-600">
                   Replying to {replyToMessage.sender_id === currentUser.id ? 'yourself' : contact.profile.full_name}

@@ -429,7 +429,7 @@ export function ProfileView({ currentUser, userId, initialProfile, onClose, onMe
       {/* Remove-friend / Block confirmation */}
       {confirmKind && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
-          <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
+          <div className="glass-card rounded-2xl p-6 max-w-sm w-full">
             <div className="flex flex-col items-center text-center">
               <div className="w-16 h-16 rounded-full bg-red-100 flex items-center justify-center mb-4">
                 {confirmKind === 'remove' ? (
