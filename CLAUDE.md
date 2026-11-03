@@ -189,3 +189,78 @@ Two gotchas worth remembering if a deployment looks stuck or wrong:
   changed the Production branch and need a fresh build from it, push a
   new commit (or use a "Create deployment" action, if the dashboard
   exposes one) rather than retrying an old entry.
+
+## Verifying a deployment is actually running the commit you think it is
+
+The frontend bakes its current git commit hash into the build at compile
+time (see `vite.config.ts`'s `define` block + `__BUILD_COMMIT__` in
+`src/vite-env.d.ts`) and shows it in **Settings → About** ("Version 2.0.0
+· build xxxxxxx") and in the Settings screen's footer. Compare that hash
+against `main`'s latest commit on GitHub — if they don't match, the
+browser is looking at a stale build/cache or the deploy didn't actually
+pick up the latest commit, which is a *deployment* problem, not a code
+problem. This exists because of exactly that kind of confusion during
+this app's glassmorphism work (see Change Log below) — "I don't see the
+change" was, more than once, actually "the browser/deploy is still
+serving an older commit," which was impossible to tell apart from an
+actual code bug without a way to check what commit is literally running.
+If you can't find this build string in a deployed build, that's step one
+of diagnosing *anything* that "isn't showing up."
+
+## Change Log
+
+Kept so context isn't lost across sessions/conversations. Append new
+entries here (most recent last) whenever a non-trivial round of work
+lands — what changed, why, and the commit(s) it landed in.
+
+- **Glassmorphism recipe adopted app-wide, in stages** (commits `ef4cc05`,
+  `37436d1`, `de71bec`, plus this entry's commit): added a shared
+  `.glass-card` utility to `globals.css` implementing a specific
+  translucent-card recipe (6% white fill, blur(5px), 1px translucent
+  border, layered box-shadow with insets, ::before/::after shimmer edge
+  highlights), generalized to drop the original one-off fixed
+  `width/height/border-radius` so it works as a reusable class. Applied,
+  by design judgment (not literally everywhere), to: confirmation/alert
+  dialogs that float over a dark blurred scrim (Block/Unfriend/Remove/
+  Delete-message confirmations across ChatView, Discover, ProfileView,
+  MessageActions, GroupMessageActions), the chat header overflow menu,
+  the reply-preview banner, ChatView's empty-state card, the
+  date-separator pill, the always-visible bottom nav bar in `App.tsx`,
+  and the "nothing here yet" empty-state cards in Chats/Discover/Friends/
+  Groups/History. Deliberately *not* applied to message bubbles, the
+  message long-press menu, the forward-to dialog, the reactions picker,
+  the edit-message modal, or brand-colored gradient headers/dense list
+  rows — text-legibility or branding reasons in each case.
+- **Found and fixed a real production-only bug that silently killed the
+  blur() in every non-Safari browser** (commit `de71bec`): every
+  `backdrop-filter` rule in `globals.css` was written as
+  `backdrop-filter: ...; -webkit-backdrop-filter: ...;` (standard
+  property first). This repo's production CSS minifier (Lightning CSS,
+  used internally by `@tailwindcss/vite`) treats that specific order as
+  two redundant declarations and silently **drops the standard
+  `backdrop-filter` property**, keeping only the `-webkit-` prefixed one
+  — which Chrome/Firefox/Edge don't understand at all. Confirmed directly
+  by running a 2-line reproduction through `lightningcss` itself (see PR
+  #5's description for the exact before/after). This wasn't new — it
+  already affected the pre-existing `.glass`, `.glass-dark`, and
+  `.chat-input-glass`/`.chat-input-inner` rules too — and never showed up
+  in local dev because `vite dev` doesn't minify CSS, only a production
+  build does. **Fix: always write `-webkit-backdrop-filter` before the
+  standard `backdrop-filter`** — see the comment directly above `.glass`
+  in `globals.css`. If any future `backdrop-filter` is added anywhere in
+  that file, use that order or it will silently break in production.
+- **Two separate Cloudflare Workers Builds projects had wrong dashboard
+  Build/Deploy command settings**, found while debugging why none of the
+  above was visible live, even once GitHub's `main` branch definitely had
+  the code (verified byte-for-byte via the GitHub API): the frontend
+  project's Deploy command was `npx wrangler preview` (an unrelated
+  ephemeral-preview beta command, not a real deploy — always fails) and
+  the backend project's Build command was `npm run build` despite
+  `worker/package.json` having no such script. See the "Cloudflare
+  Git-integration deploy settings" section above for the corrected
+  values; both are now fixed in the Cloudflare dashboard (outside this
+  repo, so not visible in git history).
+- **Added a build-commit stamp** (this entry's commit) visible in
+  Settings → About, specifically to make "is this deployment actually
+  running the latest code" a 5-second check instead of a guessing game —
+  see the section directly above this Change Log.
