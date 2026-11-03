@@ -454,17 +454,17 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
           align-items: center;
           justify-content: center;
           padding: 32px;
-          background: rgba(255, 255, 255, 0.06);
-          backdrop-filter: blur(5px);
-          -webkit-backdrop-filter: blur(5px);
+          background: rgba(255, 255, 255, 0.22);
+          -webkit-backdrop-filter: blur(18px) saturate(150%);
+          backdrop-filter: blur(18px) saturate(150%);
           margin: 12px;
           border-radius: 20px;
-          border: 1px solid rgba(255, 255, 255, 0.3);
+          border: 1px solid rgba(255, 255, 255, 0.55);
           box-shadow:
-            0 8px 32px rgba(0, 0, 0, 0.1),
-            inset 0 1px 0 rgba(255, 255, 255, 0.5),
-            inset 0 -1px 0 rgba(255, 255, 255, 0.1),
-            inset 0 0 48px 24px rgba(255, 255, 255, 1);
+            0 8px 32px rgba(0, 0, 0, 0.18),
+            inset 0 1px 0 rgba(255, 255, 255, 0.6),
+            inset 0 -1px 0 rgba(255, 255, 255, 0.15),
+            inset 0 0 48px 24px rgba(255, 255, 255, 0.4);
         }
 
         .chat-list-empty::before {
