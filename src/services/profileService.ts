@@ -48,6 +48,25 @@ export const profileService = {
     }
   },
 
+  // Real-time username/name search across *every* user on the server —
+  // not just whatever's already been loaded into `getAllProfiles()`'s
+  // capped, most-recently-joined snapshot. Callers are expected to debounce
+  // keystrokes themselves (see Discover.tsx's `useDebouncedValue`); this
+  // method itself just does one round-trip per call.
+  async searchUsers(query: string): Promise<UserProfile[]> {
+    const q = query.trim();
+    if (!q) return [];
+    try {
+      const { profiles } = await apiFetch<{ profiles: UserProfile[] }>(
+        `/users/search?q=${encodeURIComponent(q)}`
+      );
+      return profiles.filter((p) => p.full_name);
+    } catch (err) {
+      console.error('Error searching users:', err);
+      return [];
+    }
+  },
+
   // Create/complete a profile (Profile Setup screen) — PATCHes the user created at signup.
   async createProfile(profile: {
     id: string;

@@ -19,6 +19,7 @@ import {
   Trash2
 } from 'lucide-react';
 import { groupService, GroupWithMembers } from '../services/groupService';
+import { matchesQuery } from '../utils/search';
 import { UserProfile } from '../types';
 import { Friend } from '../hooks/useAppData';
 import { toast } from 'sonner';
@@ -252,10 +253,7 @@ export function GroupInfo({ currentUser, group, friends, onChanged, onLeftOrDele
 
   const memberIds = new Set(group.members.map((m) => m.user_id));
   const addableFriends = friends.filter(
-    (f) =>
-      !memberIds.has(f.id) &&
-      (f.profile.full_name?.toLowerCase().includes(addSearch.toLowerCase()) ||
-        f.profile.username?.toLowerCase().includes(addSearch.toLowerCase()))
+    (f) => !memberIds.has(f.id) && matchesQuery(addSearch, f.profile.full_name, f.profile.username)
   );
 
   const toggleSelectToAdd = (id: string) => {

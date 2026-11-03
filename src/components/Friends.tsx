@@ -1,6 +1,7 @@
 import { Search, MessageCircle, Phone, Video } from 'lucide-react';
 import { useState } from 'react';
 import { UserProfile, Contact } from '../types';
+import { matchesQuery } from '../utils/search';
 
 interface Friend {
   id: string;
@@ -26,8 +27,7 @@ export function Friends({ friends, onMessage, onCall }: FriendsProps) {
   };
 
   const filteredFriends = friends.filter((friend) =>
-    friend.profile.full_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    friend.profile.username?.toLowerCase().includes(searchQuery.toLowerCase())
+    matchesQuery(searchQuery, friend.profile.full_name, friend.profile.username)
   );
 
   return (
