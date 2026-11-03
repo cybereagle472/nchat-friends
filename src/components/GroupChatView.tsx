@@ -1391,7 +1391,7 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
       >
         {/* Reply Preview */}
         {replyToMessage && (
-          <div className="mb-2 bg-white/90 backdrop-blur-sm rounded-xl px-3 py-2 flex items-start gap-2 border-l-4 border-violet-500">
+          <div className="glass-card glass-card-reply-accent mb-2 rounded-xl px-3 py-2 flex items-start gap-2">
             <div className="flex-1 min-w-0">
               <p className="text-xs font-semibold text-violet-600">
                 Replying to {replyToMessage.sender_id === currentUser.id ? 'yourself' : getSenderName(replyToMessage.sender_id)}

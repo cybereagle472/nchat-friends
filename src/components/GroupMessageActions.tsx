@@ -170,7 +170,7 @@ export function GroupMessageActions({
   if (showDeleteConfirm) {
     return portalRoot ? createPortal(
       <div className="fixed inset-0 flex items-center justify-center bg-black/50 p-4" style={{ zIndex: 99999 }}>
-        <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl animate-scale-in">
+        <div className="glass-card rounded-2xl w-full max-w-sm animate-scale-in">
           <div className="p-4 text-center">
             <div className="w-12 h-12 rounded-full bg-red-100 flex items-center justify-center mx-auto mb-3">
               <Trash2 className="w-6 h-6 text-red-500" />
