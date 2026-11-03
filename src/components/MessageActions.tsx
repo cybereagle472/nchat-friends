@@ -86,22 +86,41 @@ export function MessageActions({
   useLayoutEffect(() => {
     const el = menuRef.current;
     if (!el || showEditModal || showDeleteConfirm || showAllReactions) return;
-    const margin = 8;
-    const rect = el.getBoundingClientRect();
-    let left = position.x;
-    let top = position.y;
 
-    if (left + rect.width + margin > window.innerWidth) {
-      left = window.innerWidth - rect.width - margin;
-    }
-    if (left < margin) left = margin;
+    // `document.documentElement.clientWidth/clientHeight` (the layout
+    // viewport, excluding any scrollbar) is used here instead of
+    // `window.innerWidth/innerHeight` — on some mobile browsers/WebViews
+    // `window.innerWidth` can momentarily report a stale or
+    // zoom-/scrollbar-inflated value, which let this menu get positioned
+    // (and then never re-clamped) partially or fully off the right edge
+    // of the actual visible screen.
+    const clamp = () => {
+      const margin = 8;
+      const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+      const viewportHeight = document.documentElement.clientHeight || window.innerHeight;
+      const rect = el.getBoundingClientRect();
+      let left = position.x;
+      let top = position.y;
 
-    if (top + rect.height + margin > window.innerHeight) {
-      top = window.innerHeight - rect.height - margin;
-    }
-    if (top < margin) top = margin;
+      if (left + rect.width + margin > viewportWidth) {
+        left = viewportWidth - rect.width - margin;
+      }
+      if (left < margin) left = margin;
 
-    setMenuPos({ left, top });
+      if (top + rect.height + margin > viewportHeight) {
+        top = viewportHeight - rect.height - margin;
+      }
+      if (top < margin) top = margin;
+
+      setMenuPos({ left, top });
+    };
+
+    clamp();
+    // Re-clamp on resize/orientation change (e.g. rotating the phone, or
+    // the on-screen keyboard changing the visible viewport) while the
+    // menu happens to still be open.
+    window.addEventListener('resize', clamp);
+    return () => window.removeEventListener('resize', clamp);
   }, [position.x, position.y, showEditModal, showDeleteConfirm, showAllReactions]);
 
   // Check if message can be edited (only text, within 15 minutes, own message)
@@ -349,7 +368,14 @@ export function MessageActions({
       <div className="fixed inset-0 bg-black/30 backdrop-blur-sm" />
       <div
         ref={menuRef}
-        className="absolute bg-white rounded-2xl shadow-2xl overflow-hidden animate-scale-in min-w-[200px]"
+        // `max-w-[min(15.5rem,calc(100vw-16px))]` is a hard cap, not just a
+        // hint: it guarantees this menu can never be wider than the actual
+        // screen (minus an 8px margin on each side), independent of
+        // whatever the clamping effect above computes — so even if a
+        // device/browser ever gets the `left`/width math wrong, the menu
+        // itself is physically incapable of extending past the visible
+        // viewport the way it used to.
+        className="absolute bg-white rounded-2xl shadow-2xl overflow-hidden animate-scale-in w-max max-w-[min(15.5rem,calc(100vw-16px))]"
         style={{
           left: menuPos?.left ?? position.x,
           top: menuPos?.top ?? position.y,
@@ -358,8 +384,14 @@ export function MessageActions({
         }}
         onClick={e => e.stopPropagation()}
       >
-        {/* Quick Reactions */}
-        <div className="flex items-center gap-1 p-2 border-b border-slate-100">
+        {/* Quick Reactions.
+            `overflow-x-auto` + `flex-nowrap` here is a safety net for
+            narrow screens: if the 6 reaction emoji + the "more" button are
+            ever wider than the menu's capped max-width above, this row
+            scrolls horizontally inside itself instead of forcing the whole
+            menu wider than the screen (which is what used to push this
+            entire popup half off-screen). */}
+        <div className="flex items-center flex-nowrap gap-0.5 p-1.5 border-b border-slate-100 overflow-x-auto">
           {QUICK_REACTIONS.map((emoji) => {
             const userReacted = message.reactions?.[emoji]?.includes(currentUserId);
             return (
@@ -367,7 +399,7 @@ export function MessageActions({
                 key={emoji}
                 onClick={() => handleReaction(emoji)}
                 disabled={isProcessing}
-                className={`text-xl p-2 rounded-full transition-all hover:scale-125 hover:bg-slate-100 ${
+                className={`shrink-0 text-lg p-1.5 rounded-full transition-all hover:scale-125 hover:bg-slate-100 ${
                   userReacted ? 'bg-violet-100' : ''
                 }`}
               >
@@ -377,9 +409,9 @@ export function MessageActions({
           })}
           <button
             onClick={() => setShowAllReactions(true)}
-            className="p-2 rounded-full hover:bg-slate-100 text-slate-500"
+            className="shrink-0 p-1.5 rounded-full hover:bg-slate-100 text-slate-500"
           >
-            <Smile className="w-5 h-5" />
+            <Smile className="w-4 h-4" />
           </button>
         </div>
 
@@ -387,26 +419,26 @@ export function MessageActions({
         <div className="py-1">
           <button
             onClick={handleReply}
-            className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 text-slate-700"
+            className="w-full flex items-center gap-2.5 px-3.5 py-2 hover:bg-slate-50 text-slate-700"
           >
-            <Reply className="w-5 h-5 text-slate-500" />
+            <Reply className="w-4 h-4 text-slate-500" />
             <span className="text-sm font-medium">Reply</span>
           </button>
 
           <button
             onClick={handleForward}
-            className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 text-slate-700"
+            className="w-full flex items-center gap-2.5 px-3.5 py-2 hover:bg-slate-50 text-slate-700"
           >
-            <Forward className="w-5 h-5 text-slate-500" />
+            <Forward className="w-4 h-4 text-slate-500" />
             <span className="text-sm font-medium">Forward</span>
           </button>
 
           {message.type === 'text' && (
             <button
               onClick={handleCopy}
-              className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 text-slate-700"
+              className="w-full flex items-center gap-2.5 px-3.5 py-2 hover:bg-slate-50 text-slate-700"
             >
-              <Copy className="w-5 h-5 text-slate-500" />
+              <Copy className="w-4 h-4 text-slate-500" />
               <span className="text-sm font-medium">Copy</span>
             </button>
           )}
@@ -414,18 +446,18 @@ export function MessageActions({
           {canEdit && (
             <button
               onClick={() => setShowEditModal(true)}
-              className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 text-slate-700"
+              className="w-full flex items-center gap-2.5 px-3.5 py-2 hover:bg-slate-50 text-slate-700"
             >
-              <Pencil className="w-5 h-5 text-slate-500" />
+              <Pencil className="w-4 h-4 text-slate-500" />
               <span className="text-sm font-medium">Edit</span>
             </button>
           )}
 
           <button
             onClick={() => setShowDeleteConfirm(true)}
-            className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-red-50 text-red-600"
+            className="w-full flex items-center gap-2.5 px-3.5 py-2 hover:bg-red-50 text-red-600"
           >
-            <Trash2 className="w-5 h-5" />
+            <Trash2 className="w-4 h-4" />
             <span className="text-sm font-medium">Delete</span>
           </button>
         </div>

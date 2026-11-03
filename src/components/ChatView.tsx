@@ -2264,8 +2264,22 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
           white/slate background + barely-visible dot pattern. */}
       <LowPolyBackground />
 
-      {/* Chat Header */}
-      <div className="relative z-10 bg-gradient-to-r from-violet-500 via-purple-500 to-fuchsia-500 text-white px-3 py-2.5 shadow-lg">
+      {/* Chat Header.
+          z-20 here, not z-10: the messages list right below this header is
+          ALSO `position: relative` with its own z-index (z-10). Since both
+          are siblings in the same stacking context and the messages list
+          comes later in the DOM, a tied z-index would make the messages
+          list paint *on top of* the entire header — including this
+          header's own header-overflow dropdown menu (e.g. "Block User"),
+          even though that dropdown has z-50 *inside* the header's own
+          stacking context. A child's z-index only wins against siblings of
+          its own parent stacking context; it can't make that whole parent
+          context escape above an equal/higher sibling stacking context
+          like the message list. Giving the header a strictly higher
+          z-index than the message list (matching GroupChatView's header,
+          which already uses z-20) fixes the header menu rendering behind
+          message bubbles. */}
+      <div className="relative z-20 bg-gradient-to-r from-violet-500 via-purple-500 to-fuchsia-500 text-white px-3 py-2.5 shadow-lg">
         <div className="flex items-center gap-3">
           <button
             onClick={onBack}
