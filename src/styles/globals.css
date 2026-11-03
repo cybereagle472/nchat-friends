@@ -318,7 +318,19 @@
    the faintest glass effect in the app. The @supports block further down
    also gives browsers/WebViews with no backdrop-filter support at all
    (rather than just a weak/buggy one) a plainer but still clearly visible
-   translucent card instead of silently looking like nothing happened. */
+   translucent card instead of silently looking like nothing happened.
+
+   IMPORTANT animation gotcha, found the hard way: never put a
+   transform/opacity CSS animation (e.g. `animate-scale-in`) directly on
+   an element that has this class. Animating transform/opacity on the
+   same element as `backdrop-filter` is a known trigger for real
+   Chromium/Android-WebView compositing bugs where the live blurred
+   backdrop gets "frozen" and renders as a flat, nearly opaque solid
+   color with zero blur/tint instead of an actual blur. If a `.glass-card`
+   surface needs an entrance animation, put the animation on a wrapper
+   element around it instead — see ChatView.tsx's header dropdown,
+   Discover.tsx's Unfriend confirmation, or MessageActions.tsx's /
+   GroupMessageActions.tsx's Delete confirmation for the pattern. */
 .glass-card {
   position: relative;
   overflow: hidden;

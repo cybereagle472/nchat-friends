@@ -528,6 +528,35 @@ lands — what changed, why, and the commit(s) it landed in.
   grepping the built CSS bundle to confirm both the base rule and the
   `@supports`-gated stronger rule survived minification with the correct
   property order.
+- **Found and fixed the actual code bug behind "the glass effect looks like
+  a flat opaque color, no blur/tint at all"** (this entry's commit): four
+  `.glass-card` elements — `ChatView.tsx`'s header overflow dropdown (the
+  exact element the user had screenshotted as proof), `Discover.tsx`'s
+  Unfriend confirmation, and both `MessageActions.tsx`'s and
+  `GroupMessageActions.tsx`'s Delete Message confirmation — had the
+  `animate-scale-in` entrance animation (animates `transform: scale()` +
+  `opacity` via `@keyframes`) applied **directly on the same element**
+  that also carries `backdrop-filter` via `.glass-card`. Animating
+  transform/opacity on an element that simultaneously uses
+  `backdrop-filter` is a well-documented trigger for real Chromium/
+  Android-WebView compositing bugs, where the browser promotes the
+  element onto its own compositing layer for the animation and the
+  backdrop-filter's live backdrop sample gets "frozen" at an early/
+  incorrect point — rendering as a flat, nearly opaque solid color with a
+  crisp edge and zero blur bleed-through, instead of a live blurred/
+  tinted backdrop. This matches, element-for-element, what was reported:
+  broken on the animated dropdown/dialogs, not reported as broken on the
+  always-visible bottom nav's `.glass-card` (which has no transform/
+  opacity animation on the nav element itself). **Fix**: split each
+  affected element into an outer wrapper (carries `animate-scale-in` +
+  positioning/sizing, no `backdrop-filter`) and an inner, permanently
+  static element (carries `.glass-card` + rounding only, never animated)
+  — same visual entrance motion, but the backdrop-filter element itself
+  is never subject to a transform/opacity animation. **If any future
+  glass-card-style element needs an entrance animation, always put the
+  animation on a wrapper, never directly on the element that has
+  `backdrop-filter`** — this is now the established pattern; see the
+  inline comments at each of the four fixed call sites.
 - **Added a comprehensive, whole-project history section to this file**
   (the "Full Project History (comprehensive)" section above, this
   entry's commit) — covering the app's origin, the full Supabase→
