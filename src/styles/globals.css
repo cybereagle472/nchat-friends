@@ -258,18 +258,32 @@
   animation: slideDown 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
-/* Glass morphism effect */
+/* Glass morphism effect.
+   IMPORTANT ordering gotcha for every `backdrop-filter` pair in this file:
+   always write `-webkit-backdrop-filter` BEFORE the standard
+   `backdrop-filter`, never the reverse. The production build's CSS
+   minifier (Lightning CSS, used internally by @tailwindcss/vite)
+   recognizes "-webkit-X then X" as an intentional prefix+fallback pair and
+   keeps both — but "X then -webkit-X" it treats as redundant and silently
+   drops the modern standard property, keeping only the -webkit- one. Since
+   Chrome/Firefox/Edge don't understand `-webkit-backdrop-filter` at all,
+   getting this order backwards makes every blur() here silently render as
+   nothing (no blur, just the translucent tint/border/shadow) in every
+   non-Safari browser in production, while looking completely fine in
+   local dev (`vite dev` doesn't minify) — which is exactly what happened
+   here and made a correctly-written, correctly-deployed effect look like
+   it was never applied at all. */
 .glass {
   background: rgba(255, 255, 255, 0.4);
-  backdrop-filter: blur(24px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.3);
 }
 
 .glass-dark {
   background: rgba(139, 92, 246, 0.3);
-  backdrop-filter: blur(24px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.25);
 }
 
@@ -294,8 +308,8 @@
   position: relative;
   overflow: hidden;
   background: rgba(255, 255, 255, 0.06);
-  backdrop-filter: blur(5px);
   -webkit-backdrop-filter: blur(5px);
+  backdrop-filter: blur(5px);
   border: 1px solid rgba(255, 255, 255, 0.3);
   box-shadow:
     0 8px 32px rgba(0, 0, 0, 0.1),
@@ -437,8 +451,8 @@ img {
            barely-there shadow for a hint of lift, nothing more. */
         .chat-input-glass {
           background: linear-gradient(135deg, rgba(168, 85, 247, 0.9) 0%, rgba(139, 92, 246, 0.9) 50%, rgba(124, 58, 237, 0.9) 100%);
-          backdrop-filter: blur(20px);
           -webkit-backdrop-filter: blur(20px);
+          backdrop-filter: blur(20px);
           border-radius: 28px;
           padding: 4px;
           box-shadow:
@@ -451,8 +465,8 @@ img {
           align-items: center;
           gap: 8px;
           background: rgba(255, 255, 255, 0.15);
-          backdrop-filter: blur(10px);
           -webkit-backdrop-filter: blur(10px);
+          backdrop-filter: blur(10px);
           border-radius: 24px;
           padding: 6px 6px 6px 8px;
           border: 1px solid rgba(255, 255, 255, 0.2);
@@ -1162,8 +1176,8 @@ img {
           font-weight: 600;
           color: #64748b;
           background: rgba(255, 255, 255, 0.06);
-          backdrop-filter: blur(5px);
           -webkit-backdrop-filter: blur(5px);
+          backdrop-filter: blur(5px);
           border: 1px solid rgba(255, 255, 255, 0.3);
           border-radius: 10px;
           box-shadow:
