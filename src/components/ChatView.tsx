@@ -2359,17 +2359,32 @@ export function ChatView({ currentUser, contact, onBack, onCall, onBlockUser, on
                   className="fixed inset-0 z-40"
                   onClick={() => setShowMenu(false)}
                 />
-                <div className="glass-card absolute right-0 top-full mt-1 w-48 rounded-xl z-50 animate-scale-in">
-                  <button
-                    onClick={() => {
-                      setShowMenu(false);
-                      setShowBlockConfirm(true);
-                    }}
-                    className="w-full flex items-center gap-3 px-4 py-3 text-left text-red-600 hover:bg-red-50 transition-colors"
-                  >
-                    <UserX className="w-4 h-4" />
-                    <span className="text-sm font-medium">Block User</span>
-                  </button>
+                {/* The entrance animation (animate-scale-in, which animates
+                    transform + opacity) deliberately lives on this *outer*
+                    wrapper, not on the .glass-card element itself. Animating
+                    transform/opacity directly on the same element that has
+                    backdrop-filter is a known trigger for a real Chromium/
+                    Android-WebView compositing bug where the blur layer gets
+                    "frozen" mid-animation and paints as a flat, unblurred,
+                    near-opaque solid color instead of a live translucent
+                    blur — i.e. exactly "looks like glass isn't applied at
+                    all" even though the CSS is 100% correct. Keeping the
+                    glass surface itself static (no transform/opacity
+                    animation ever applied to it) avoids that class of bug
+                    entirely. */}
+                <div className="absolute right-0 top-full mt-1 w-48 z-50 animate-scale-in">
+                  <div className="glass-card rounded-xl">
+                    <button
+                      onClick={() => {
+                        setShowMenu(false);
+                        setShowBlockConfirm(true);
+                      }}
+                      className="w-full flex items-center gap-3 px-4 py-3 text-left text-red-600 hover:bg-red-50 transition-colors"
+                    >
+                      <UserX className="w-4 h-4" />
+                      <span className="text-sm font-medium">Block User</span>
+                    </button>
+                  </div>
                 </div>
               </>
             )}
