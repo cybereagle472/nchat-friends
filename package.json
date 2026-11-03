@@ -3,8 +3,8 @@
   "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Real-time messaging app (React + Cloudflare Workers/D1/R2) - competing with WhatsApp, Messenger, WeChat, and IMO",
-  "author": "NChat Team",
+  "description": "NChat — a modern, real-time messaging app with 1:1 & group chat, voice/video calls, and status updates, built on React and Cloudflare Workers/D1/R2.",
+  "author": "Muhammad Nasir",
   "license": "MIT",
   "scripts": {
     "dev": "vite --port 3000 --open",
