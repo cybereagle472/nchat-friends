@@ -925,9 +925,10 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                     {isOwn && (
                       <>
                         {message.syncStatus === 'pending' && <Clock className="w-3 h-3 opacity-70" />}
-                        {message.syncStatus === 'sent' && <Check className="w-3 h-3" />}
-                        {(!message.syncStatus || message.syncStatus === 'sent') && message.is_read && (
-                          <CheckCheck className="w-3 h-3" />
+                        {(!message.syncStatus || message.syncStatus === 'sent') && (
+                          message.is_read
+                            ? <CheckCheck className="w-3 h-3" />
+                            : <Check className="w-3 h-3" />
                         )}
                         {message.syncStatus === 'failed' && <X className="w-3 h-3 text-red-400" />}
                       </>
@@ -965,9 +966,10 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                   {isOwn && (
                     <>
                       {message.syncStatus === 'pending' && <Clock className="w-3 h-3 opacity-70" />}
-                      {message.syncStatus === 'sent' && <Check className="w-3 h-3" />}
-                      {(!message.syncStatus || message.syncStatus === 'sent') && message.is_read && (
-                        <CheckCheck className="w-3 h-3" />
+                      {(!message.syncStatus || message.syncStatus === 'sent') && (
+                        message.is_read
+                          ? <CheckCheck className="w-3 h-3" />
+                          : <Check className="w-3 h-3" />
                       )}
                       {message.syncStatus === 'failed' && <X className="w-3 h-3 text-red-400" />}
                     </>
@@ -1003,9 +1005,10 @@ export function GroupChatView({ currentUser, group, onBack, onGroupCall, onManag
                   {isOwn && (
                     <>
                       {message.syncStatus === 'pending' && <Clock className="w-3 h-3 opacity-70" />}
-                      {message.syncStatus === 'sent' && <Check className="w-3 h-3" />}
-                      {(!message.syncStatus || message.syncStatus === 'sent') && message.is_read && (
-                        <CheckCheck className="w-3 h-3" />
+                      {(!message.syncStatus || message.syncStatus === 'sent') && (
+                        message.is_read
+                          ? <CheckCheck className="w-3 h-3" />
+                          : <Check className="w-3 h-3" />
                       )}
                       {message.syncStatus === 'failed' && <X className="w-3 h-3 text-red-400" />}
                     </>
