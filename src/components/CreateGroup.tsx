@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { ArrowLeft, Camera, Check, Search, Users, X } from 'lucide-react';
 import { groupService } from '../services/groupService';
 import { friendService } from '../services/friendService';
+import { matchesQuery } from '../utils/search';
 import { UserProfile } from '../types';
 
 interface CreateGroupProps {
@@ -54,8 +55,7 @@ export function CreateGroup({ currentUser, onBack, onGroupCreated }: CreateGroup
 
   const selectedFriends = friends.filter(f => f.selected);
   const filteredFriends = friends.filter(f =>
-    f.profile.full_name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    f.profile.username?.toLowerCase().includes(searchQuery.toLowerCase())
+    matchesQuery(searchQuery, f.profile.full_name, f.profile.username)
   );
 
   const toggleFriendSelection = (id: string) => {

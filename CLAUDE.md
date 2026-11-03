@@ -595,3 +595,33 @@ lands — what changed, why, and the commit(s) it landed in.
   of ever overflowing. Also added a global `html, body { overflow-x:
   hidden }` safety net so any future mispositioned fixed/absolute popup
   can't widen the whole page's layout viewport the way this one did.
+- **Added real-time, full-database username search** (new `GET
+  /users/search?q=...` Worker route): previously, the *only* way to "find
+  someone" by username anywhere in the app (Discover's Find tab) worked
+  by filtering a client-side snapshot from `GET /users`, which is
+  capped to the 100 most-recently-joined accounts — meaning search could
+  never find anyone outside that page no matter how exactly their
+  username was typed, and that snapshot only refreshed on full app
+  reloads. The new endpoint does a real SQL search across every row in
+  the `users` table (case-insensitive, matches username or full name,
+  excludes blocked users both directions, ranks exact username match >
+  username-starts-with > name-contains > other-contains, accepts a
+  leading "@", properly escapes `%`/`_` so literal searches for those
+  characters aren't treated as wildcards), registered before the `/:id`
+  route so it isn't shadowed by that catch-all. Wired into Discover.tsx's
+  Find tab via a new `profileService.searchUsers()` + a new reusable
+  `useDebouncedValue` hook (`src/hooks/useDebouncedValue.ts`, 300ms,
+  matching the app's existing `UI.DEBOUNCE_DELAY` constant) — it fires
+  the real server search as the user types (not on every keystroke), and
+  keeps instantly filtering whatever's already loaded locally as a
+  zero-latency placeholder while that request is in flight, so the list
+  never looks like it went blank. A small spinner shows next to the
+  search box while a request is pending. Also added a shared
+  `src/utils/search.ts` (`matchesQuery`/`normalizeSearchQuery`) and
+  switched every other search bar in the app (Chats, Friends, Groups,
+  CreateGroup, GroupInfo's "add member" search, and Discover's own
+  Friends-tab search) to use it, so matching is consistent everywhere:
+  trims whitespace and strips a leading "@" before matching, so typing
+  "@someone's-handle" works the same as typing it without the "@" in
+  every search box in the app, not just wherever someone happened to
+  already handle that case.

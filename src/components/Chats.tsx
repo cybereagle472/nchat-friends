@@ -2,6 +2,7 @@ import { Search, Settings, Plus, Image, Mic, Video, FileText, MapPin, Check, Che
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { typingService } from '../services/typingService';
 import { chatService } from '../services/chatService';
+import { matchesQuery } from '../utils/search';
 import { Contact, UserProfile } from '../types';
 
 // Track prefetch status to avoid redundant calls
@@ -206,8 +207,7 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
   };
 
   const filteredChats = chats.filter(chat =>
-    chat.profile.full_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    chat.profile.username?.toLowerCase().includes(searchQuery.toLowerCase())
+    matchesQuery(searchQuery, chat.profile.full_name, chat.profile.username)
   );
 
   return (

@@ -7,7 +7,7 @@
  * - Find: Search and discover new people
  */
 
-import { useState } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import {
   Search,
   UserPlus,
@@ -19,10 +19,15 @@ import {
   MessageCircle,
   Phone,
   Video,
-  Users
+  Users,
+  Loader2
 } from 'lucide-react';
 import { friendService } from '../services/friendService';
+import { profileService } from '../services/profileService';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
+import { matchesQuery, normalizeSearchQuery } from '../utils/search';
 import { presenceStatusText } from '../utils/presenceFormat';
+import { UI } from '../utils/constants';
 import { UserProfile, FriendRequest, Contact } from '../types';
 
 interface Friend {
@@ -92,8 +97,7 @@ export function Discover({
   };
 
   const filteredFriends = friends.filter((friend) =>
-    friend.profile.full_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    friend.profile.username?.toLowerCase().includes(searchQuery.toLowerCase())
+    matchesQuery(searchQuery, friend.profile.full_name, friend.profile.username)
   );
 
   // Request handlers
@@ -177,11 +181,63 @@ export function Discover({
     setConfirmUnfriend(null);
   };
 
-  const filteredSuggestions = suggestions.filter(
-    (user) =>
-      user.profile.full_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      user.profile.username?.toLowerCase().includes(searchQuery.toLowerCase())
+  const friendIdSet = useMemo(() => new Set(friends.map((f) => f.id)), [friends]);
+  const requestSenderIds = useMemo(
+    () => new Set(localRequests.map((r) => r.sender_id)),
+    [localRequests]
   );
+
+  // Real-time, full-user-base search for the "Find" tab, debounced so it's
+  // not firing a network request on every keystroke. `suggestions` (used
+  // as the instant local fallback just below, and as the full browse list
+  // when the search box is empty) is only ever the ~100 most-recently-
+  // joined users — without hitting the server here, searching could never
+  // find anyone outside that page no matter how exact the typed username
+  // was. This calls the server's full-table `/users/search` endpoint
+  // instead, so username search is actually complete/accurate across every
+  // user in the app, not just whoever happened to already be loaded.
+  const debouncedSearchQuery = useDebouncedValue(searchQuery, UI.DEBOUNCE_DELAY);
+  const [serverSearchResults, setServerSearchResults] = useState<UserProfile[] | null>(null);
+  const [isSearchingUsers, setIsSearchingUsers] = useState(false);
+
+  useEffect(() => {
+    if (activeTab !== 'find') return;
+    const q = debouncedSearchQuery.trim();
+    if (!q) {
+      setServerSearchResults(null);
+      setIsSearchingUsers(false);
+      return;
+    }
+    let cancelled = false;
+    setIsSearchingUsers(true);
+    profileService.searchUsers(q).then((profiles) => {
+      if (cancelled) return;
+      setServerSearchResults(profiles);
+      setIsSearchingUsers(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, debouncedSearchQuery]);
+
+  const filteredSuggestions: Suggestion[] = useMemo(() => {
+    if (!normalizeSearchQuery(searchQuery)) return suggestions;
+
+    if (serverSearchResults) {
+      return serverSearchResults
+        .filter((p) => p.id !== currentUser.id && !requestSenderIds.has(p.id))
+        .map((p) => ({ id: p.id, profile: p, isFriend: friendIdSet.has(p.id) }));
+    }
+
+    // While the debounced server search for the current keystrokes is
+    // still in flight (or hasn't fired yet), fall back to instantly
+    // filtering whatever's already loaded locally so the list never looks
+    // like it momentarily went blank — it's replaced by the full, accurate
+    // server results a moment later.
+    return suggestions.filter((user) =>
+      matchesQuery(searchQuery, user.profile.full_name, user.profile.username)
+    );
+  }, [searchQuery, suggestions, serverSearchResults, currentUser.id, requestSenderIds, friendIdSet]);
 
   const formatTime = (timestamp: string) => {
     const date = new Date(timestamp);
@@ -508,11 +564,19 @@ export function Discover({
                 />
                 <input
                   type="text"
-                  placeholder="Search people..."
+                  placeholder="Search by username or name..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full pl-10 pr-4 py-3 text-sm rounded-xl backdrop-blur-xl bg-white/85 border border-white/70 focus:outline-none focus:ring-2 focus:ring-violet-400 focus:border-violet-400 text-slate-800 placeholder-slate-400 transition-all duration-300 shadow-sm"
+                  className="w-full pl-10 pr-9 py-3 text-sm rounded-xl backdrop-blur-xl bg-white/85 border border-white/70 focus:outline-none focus:ring-2 focus:ring-violet-400 focus:border-violet-400 text-slate-800 placeholder-slate-400 transition-all duration-300 shadow-sm"
                 />
+                {/* Spinner while the debounced server-side search for the
+                    current query is in flight — the list below is already
+                    showing the instant local-filter fallback, this just
+                    signals that the full, accurate app-wide result set is
+                    still being fetched. */}
+                {isSearchingUsers && (
+                  <Loader2 className="absolute right-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-violet-400 animate-spin" />
+                )}
               </div>
             </div>
 

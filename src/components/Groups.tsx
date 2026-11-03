@@ -3,6 +3,7 @@ import { Users, Plus, Search, ChevronRight, Mic, Check, CheckCheck, Image, Video
 import { GroupWithMembers } from '../services/groupService';
 import { UserProfile } from '../types';
 import { typingService } from '../services/typingService';
+import { matchesQuery } from '../utils/search';
 
 interface GroupsProps {
   currentUser: UserProfile;
@@ -201,9 +202,7 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
     [currentUser.id]
   );
 
-  const filteredGroups = groups.filter(group =>
-    group.name.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredGroups = groups.filter(group => matchesQuery(searchQuery, group.name));
 
   return (
     <div className="h-full flex flex-col">

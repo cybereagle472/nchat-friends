@@ -79,6 +79,66 @@ users.get('/username-available', async (c) => {
   return c.json({ available: !row });
 });
 
+// Full, server-side username/name search across *every* user in the
+// database — not just the most-recently-joined page the plain `GET /`
+// suggestions list below is capped to. This is what every search bar in
+// the app that needs to find "a specific person" (Discover's Find tab,
+// and anywhere else that adds a live user-lookup) should call as the
+// user types, instead of only ever being able to filter whatever users
+// happened to already be loaded on the client.
+//
+// Registered before the `/:id` route below on purpose: Hono matches
+// routes in registration order, and `/:id` is a catch-all single-segment
+// pattern that would otherwise swallow `/users/search` as if `search`
+// were a user id.
+users.get('/search', async (c) => {
+  const userId = c.get('userId');
+  const qRaw = (c.req.query('q') || '').trim();
+  // Also accept a leading "@" (e.g. someone typing "@muhammad" to search
+  // by handle) — strip it rather than treating it as part of the query.
+  const q = qRaw.startsWith('@') ? qRaw.slice(1).trim() : qRaw;
+  if (!q) return c.json({ profiles: [] });
+
+  // Escape SQL LIKE's own wildcard characters (% and _) so a query that
+  // happens to literally contain them (e.g. searching for "a_b") is
+  // matched as literal text instead of behaving like a wildcard pattern.
+  const escapeLike = (s: string) => s.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+  const lower = q.toLowerCase();
+  const escaped = escapeLike(lower);
+  const containsPattern = `%${escaped}%`;
+  const prefixPattern = `${escaped}%`;
+  const limit = Math.min(Math.max(Number(c.req.query('limit')) || 30, 1), 50);
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT u.* FROM users u
+     WHERE u.id != ?
+       AND u.id NOT IN (SELECT blocked_user_id FROM blocked_users WHERE user_id = ?)
+       AND u.id NOT IN (SELECT user_id FROM blocked_users WHERE blocked_user_id = ?)
+       AND (
+         LOWER(u.username) LIKE ? ESCAPE '\\'
+         OR LOWER(u.full_name) LIKE ? ESCAPE '\\'
+       )
+     ORDER BY
+       CASE
+         WHEN LOWER(u.username) = ? THEN 0
+         WHEN LOWER(u.username) LIKE ? ESCAPE '\\' THEN 1
+         WHEN LOWER(u.full_name) LIKE ? ESCAPE '\\' THEN 2
+         ELSE 3
+       END,
+       u.username ASC,
+       u.full_name ASC
+     LIMIT ?`
+  )
+    .bind(userId, userId, userId, containsPattern, containsPattern, lower, prefixPattern, prefixPattern, limit)
+    .all();
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rows = (results ?? []) as any[];
+  const presenceMap = await getPresenceMap(c.env, rows.map((r) => r.id));
+  const profiles = await applyPrivacyToList(c.env, userId, rows.map((r) => profilePublic(r, presenceMap.get(r.id))));
+  return c.json({ profiles });
+});
+
 users.get('/:id', async (c) => {
   const viewerId = c.get('userId');
   const id = c.req.param('id');
