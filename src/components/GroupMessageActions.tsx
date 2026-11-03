@@ -170,7 +170,14 @@ export function GroupMessageActions({
   if (showDeleteConfirm) {
     return portalRoot ? createPortal(
       <div className="fixed inset-0 flex items-center justify-center bg-black/50 p-4" style={{ zIndex: 99999 }}>
-        <div className="glass-card rounded-2xl w-full max-w-sm animate-scale-in">
+        {/* animate-scale-in (transform + opacity) lives on this wrapper, not
+            on the .glass-card element — animating transform/opacity on the
+            same element as backdrop-filter is a known trigger for a real
+            Chromium/Android-WebView compositing bug where the blur layer
+            freezes and renders as a flat solid color instead of a live
+            blur. */}
+        <div className="w-full max-w-sm animate-scale-in">
+        <div className="glass-card rounded-2xl">
           <div className="p-4 text-center">
             <div className="w-12 h-12 rounded-full bg-red-100 flex items-center justify-center mx-auto mb-3">
               <Trash2 className="w-6 h-6 text-red-500" />
@@ -206,6 +213,7 @@ export function GroupMessageActions({
               Cancel
             </button>
           </div>
+        </div>
         </div>
       </div>,
       portalRoot

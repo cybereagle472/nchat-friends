@@ -603,7 +603,14 @@ export function Discover({
       {/* Unfriend Confirmation Modal */}
       {confirmUnfriend && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-fade-in">
-          <div className="glass-card rounded-2xl p-6 max-w-sm w-full animate-scale-in">
+          {/* animate-scale-in (transform + opacity) lives on this wrapper,
+              not on the .glass-card element — animating transform/opacity
+              on the same element as backdrop-filter is a known trigger for
+              a real Chromium/Android-WebView compositing bug where the
+              blur layer freezes and renders as a flat solid color instead
+              of a live blur. */}
+          <div className="max-w-sm w-full animate-scale-in">
+          <div className="glass-card rounded-2xl p-6">
             <div className="flex flex-col items-center text-center">
               <div className="w-16 h-16 rounded-full bg-red-100 flex items-center justify-center mb-4">
                 <UserMinus className="w-8 h-8 text-red-500" />
@@ -627,6 +634,7 @@ export function Discover({
                 </button>
               </div>
             </div>
+          </div>
           </div>
         </div>
       )}
