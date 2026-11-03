@@ -303,22 +303,40 @@
    only ever contributes the glass surface itself.
    `position: relative` + `overflow: hidden` are required, not decorative
    — they're what makes the ::before/::after highlight lines below clip
-   correctly to each usage's own rounded corners. */
+   correctly to each usage's own rounded corners.
+
+   Tuning note: the original reference recipe used a near-invisible 6%
+   white fill + a 5px blur. That's correct on a large desktop mockup, but
+   across real-world testing on actual phones/WebViews it turned out to
+   be too subtle to reliably perceive — especially over a screenshot's
+   JPEG compression, and especially on small elements like a dropdown
+   menu. The values below keep the exact same *technique* (translucent
+   fill + blur + border + inner glow + shimmer edges) but turned up
+   enough to be unmistakable on any device, matching the visible strength
+   of this app's other, older glass elements above (.glass is 40%
+   fill + blur(24px); .chat-input-glass is blur(20px)) rather than being
+   the faintest glass effect in the app. The @supports block further down
+   also gives browsers/WebViews with no backdrop-filter support at all
+   (rather than just a weak/buggy one) a plainer but still clearly visible
+   translucent card instead of silently looking like nothing happened. */
 .glass-card {
   position: relative;
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.06);
-  -webkit-backdrop-filter: blur(5px);
-  backdrop-filter: blur(5px);
-  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.55);
   box-shadow:
-    0 8px 32px rgba(0, 0, 0, 0.1),
-    inset 0 1px 0 rgba(255, 255, 255, 0.5),
-    inset 0 -1px 0 rgba(255, 255, 255, 0.1),
-    /* Reference value was rgba(255, 255, 255, 2.4) — alpha can't go above
-       1 and browsers silently clamp it there anyway, so this is written
-       as the equivalent valid value rather than an out-of-range one. */
-    inset 0 0 48px 24px rgba(255, 255, 255, 1);
+    0 8px 32px rgba(0, 0, 0, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.6),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.15),
+    inset 0 0 48px 24px rgba(255, 255, 255, 0.4);
+}
+
+@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .glass-card {
+    background: rgba(255, 255, 255, 0.16);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
+    backdrop-filter: blur(18px) saturate(150%);
+  }
 }
 
 .glass-card::before {
@@ -1175,16 +1193,22 @@ img {
           font-size: 12px;
           font-weight: 600;
           color: #64748b;
-          background: rgba(255, 255, 255, 0.06);
-          -webkit-backdrop-filter: blur(5px);
-          backdrop-filter: blur(5px);
-          border: 1px solid rgba(255, 255, 255, 0.3);
+          background: rgba(255, 255, 255, 0.22);
+          border: 1px solid rgba(255, 255, 255, 0.55);
           border-radius: 10px;
           box-shadow:
             0 1px 3px rgba(0, 0, 0, 0.08),
-            inset 0 1px 0 rgba(255, 255, 255, 0.5),
-            inset 0 -1px 0 rgba(255, 255, 255, 0.1),
-            inset 0 0 48px 24px rgba(255, 255, 255, 1);
+            inset 0 1px 0 rgba(255, 255, 255, 0.6),
+            inset 0 -1px 0 rgba(255, 255, 255, 0.15),
+            inset 0 0 48px 24px rgba(255, 255, 255, 0.4);
+        }
+
+        @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+          .date-separator-pill {
+            background: rgba(255, 255, 255, 0.16);
+            -webkit-backdrop-filter: blur(18px) saturate(150%);
+            backdrop-filter: blur(18px) saturate(150%);
+          }
         }
 
         .date-separator-pill::before {
