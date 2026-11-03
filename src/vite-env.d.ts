@@ -17,3 +17,9 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+
+// Injected by vite.config.ts's `define` at build time — see the comment
+// there for why this exists (verifying a deployment is actually serving
+// the commit it claims to).
+declare const __BUILD_COMMIT__: string;
+declare const __BUILD_TIME__: string;

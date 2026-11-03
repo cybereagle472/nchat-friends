@@ -455,7 +455,9 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
               </div>
               <div className="settings-menu-text">
                 <span className="settings-menu-title">About</span>
-                <span className="settings-menu-subtitle">Version 2.0.0</span>
+                <span className="settings-menu-subtitle">
+                  Version 2.0.0 · build {__BUILD_COMMIT__}
+                </span>
               </div>
               <ChevronRight className="w-5 h-5 text-gray-400" />
             </button>
@@ -482,7 +484,9 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           </button>
 
           {/* Footer */}
-          <p className="settings-footer">NChat v2.0.0</p>
+          <p className="settings-footer">
+            NChat v2.0.0 · build {__BUILD_COMMIT__}
+          </p>
         </div>
 
         <style>{settingsStyles}</style>
