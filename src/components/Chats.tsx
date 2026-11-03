@@ -441,19 +441,50 @@ export function Chats({ currentUser, chats, onOpenChat, onCreateNewChat, onOpenS
           overflow-y: auto;
         }
 
+        /* Upgraded to the app's shared glassmorphism recipe (see .glass-card
+           in globals.css) instead of the old flat bg-white/50 approximation
+           — this is the very first thing a new user with no chats yet sees,
+           so it's one of the most visible places that look should land. */
         .chat-list-empty {
+          position: relative;
+          overflow: hidden;
           height: 100%;
           display: flex;
           flex-direction: column;
           align-items: center;
           justify-content: center;
           padding: 32px;
-          background: rgba(255, 255, 255, 0.5);
-          backdrop-filter: blur(10px);
-          -webkit-backdrop-filter: blur(10px);
+          background: rgba(255, 255, 255, 0.06);
+          backdrop-filter: blur(5px);
+          -webkit-backdrop-filter: blur(5px);
           margin: 12px;
           border-radius: 20px;
-          border: 1px solid rgba(255, 255, 255, 0.7);
+          border: 1px solid rgba(255, 255, 255, 0.3);
+          box-shadow:
+            0 8px 32px rgba(0, 0, 0, 0.1),
+            inset 0 1px 0 rgba(255, 255, 255, 0.5),
+            inset 0 -1px 0 rgba(255, 255, 255, 0.1),
+            inset 0 0 48px 24px rgba(255, 255, 255, 1);
+        }
+
+        .chat-list-empty::before {
+          content: '';
+          position: absolute;
+          top: 0;
+          left: 0;
+          right: 0;
+          height: 1px;
+          background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.8), transparent);
+        }
+
+        .chat-list-empty::after {
+          content: '';
+          position: absolute;
+          top: 0;
+          left: 0;
+          width: 1px;
+          height: 100%;
+          background: linear-gradient(180deg, rgba(255, 255, 255, 0.8), transparent, rgba(255, 255, 255, 0.3));
         }
 
         .chat-list-empty-icon {

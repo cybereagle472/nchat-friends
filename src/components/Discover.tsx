@@ -330,7 +330,7 @@ export function Discover({
             </div>
 
             {filteredFriends.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-64 backdrop-blur-lg bg-white/50 rounded-2xl border border-white/70 p-8">
+              <div className="glass-card flex flex-col items-center justify-center h-64 rounded-2xl p-8">
                 <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-3xl mb-4 shadow-lg shadow-purple-500/30">
                   👥
                 </div>
@@ -485,7 +485,7 @@ export function Discover({
                 ))}
               </div>
             ) : (
-              <div className="flex flex-col items-center justify-center h-64 backdrop-blur-lg bg-white/50 rounded-2xl border border-white/70 p-8">
+              <div className="glass-card flex flex-col items-center justify-center h-64 rounded-2xl p-8">
                 <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-3xl mb-4 shadow-lg shadow-purple-500/30">
                   📬
                 </div>
@@ -584,7 +584,7 @@ export function Discover({
                 </div>
               </>
             ) : (
-              <div className="flex flex-col items-center justify-center h-64 backdrop-blur-lg bg-white/50 rounded-2xl border border-white/70 p-8">
+              <div className="glass-card flex flex-col items-center justify-center h-64 rounded-2xl p-8">
                 <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-3xl mb-4 shadow-lg shadow-purple-500/30">
                   🔍
                 </div>

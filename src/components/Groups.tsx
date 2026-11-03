@@ -239,7 +239,7 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
       {/* Groups List */}
       <div className="flex-1 overflow-y-auto px-2.5 py-3">
         {filteredGroups.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full backdrop-blur-lg bg-white/50 rounded-2xl border border-white/70 p-8">
+          <div className="glass-card flex flex-col items-center justify-center h-full rounded-2xl p-8">
             <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-3xl mb-4 shadow-lg shadow-purple-500/30">
               <Users className="w-10 h-10 text-white" />
             </div>

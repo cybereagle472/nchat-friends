@@ -872,7 +872,7 @@ function MainApp({
 
       {/* Bottom Navigation */}
       {!selectedChat && !selectedGroup && !showCreateGroup && !showSettings && (
-        <nav className="relative z-20 mx-3 mb-3 backdrop-blur-2xl bg-white/50 border border-white/60 rounded-3xl px-1.5 py-2 shadow-2xl shadow-purple-500/10">
+        <nav className="glass-card relative z-20 mx-3 mb-3 rounded-3xl px-1.5 py-2">
           <div className="flex justify-around items-center max-w-2xl mx-auto gap-0.5">
             <button
               onClick={() => setActiveTab('chats')}
