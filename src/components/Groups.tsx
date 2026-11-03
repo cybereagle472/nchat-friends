@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Users, Plus, Search, ChevronRight, Mic, Check, CheckCheck } from 'lucide-react';
+import { Users, Plus, Search, ChevronRight, Mic, Check, CheckCheck, Image, Video, FileText, MapPin } from 'lucide-react';
 import { GroupWithMembers } from '../services/groupService';
 import { UserProfile } from '../types';
 import { typingService } from '../services/typingService';
@@ -160,6 +160,47 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
     }
   };
 
+  // Mirrors Chats.tsx's getMessagePreview exactly (same media-type labels
+  // and icons, same "You"/read-tick treatment for your own last message),
+  // plus two things a group preview needs that a 1:1 one doesn't:
+  //  - a sender name, since a group has more than one possible sender;
+  //  - a lastMessage.sender_profile fallback through the group's own
+  //    member list. The server's lastMessage payload doesn't embed a
+  //    sender_profile at all (see worker/src/routes/groups.ts's
+  //    groupMessageJson), so without this every row fell back straight to
+  //    "Someone" — the member list already has everyone's profile right
+  //    there in the same response, the same way useGroupChat.ts already
+  //    resolves sender profiles for live-arriving messages.
+  const getGroupMessagePreview = useCallback(
+    (group: GroupWithMembers) => {
+      const lastMessage = group.lastMessage;
+      if (!lastMessage) return { senderLabel: null as string | null, icon: null as React.ReactNode, text: 'No messages yet', deliveryStatus: null as 'sent' | 'read' | null };
+
+      const isMe = lastMessage.sender_id === currentUser.id;
+      const deliveryStatus: 'sent' | 'read' | null = isMe ? (lastMessage.is_read ? 'read' : 'sent') : null;
+      const senderProfile = lastMessage.sender_profile ?? group.members.find((m) => m.user_id === lastMessage.sender_id)?.profile;
+      const senderLabel = isMe ? 'You' : senderProfile?.full_name?.split(' ')[0] || 'Someone';
+
+      switch (lastMessage.type) {
+        case 'image':
+          return { senderLabel, icon: <Image className="w-3.5 h-3.5" />, text: 'Photo', deliveryStatus };
+        case 'voice':
+          return { senderLabel, icon: <Mic className="w-3.5 h-3.5" />, text: 'Voice message', deliveryStatus };
+        case 'video':
+          return { senderLabel, icon: <Video className="w-3.5 h-3.5" />, text: 'Video', deliveryStatus };
+        case 'file':
+          return { senderLabel, icon: <FileText className="w-3.5 h-3.5" />, text: 'Document', deliveryStatus };
+        case 'gif':
+          return { senderLabel, icon: null, text: 'GIF', deliveryStatus };
+        case 'location':
+          return { senderLabel, icon: <MapPin className="w-3.5 h-3.5" />, text: 'Location', deliveryStatus };
+        default:
+          return { senderLabel, icon: null, text: lastMessage.content || 'Sent a message', deliveryStatus };
+      }
+    },
+    [currentUser.id]
+  );
+
   const filteredGroups = groups.filter(group =>
     group.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
@@ -221,6 +262,7 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
         ) : (
           filteredGroups.map((group, index) => {
             const activity = getActivity(group);
+            const preview = getGroupMessagePreview(group);
             return (
             <button
               key={group.id}
@@ -268,20 +310,18 @@ export function Groups({ currentUser, groups, onOpenGroup, onCreateGroup }: Grou
                       </span>
                     ) : group.lastMessage ? (
                       <>
-                        {group.lastMessage.sender_id === currentUser.id && (
-                          group.lastMessage.is_read ? (
+                        {preview.deliveryStatus && (
+                          preview.deliveryStatus === 'read' ? (
                             <CheckCheck className="inline w-3.5 h-3.5 text-sky-500 mr-1 align-text-bottom" strokeWidth={2.5} />
                           ) : (
                             <Check className="inline w-3.5 h-3.5 text-slate-400 mr-1 align-text-bottom" strokeWidth={2.5} />
                           )
                         )}
-                        <span className="font-medium text-slate-600">
-                          {group.lastMessage.sender_id === currentUser.id
-                            ? 'You'
-                            : group.lastMessage.sender_profile?.full_name?.split(' ')[0] || 'Someone'}
-                          :
-                        </span>{' '}
-                        {group.lastMessage.content || 'Sent a message'}
+                        <span className="font-medium text-slate-600">{preview.senderLabel}:</span>{' '}
+                        {preview.icon && (
+                          <span className="inline-flex items-center align-text-bottom mr-1">{preview.icon}</span>
+                        )}
+                        {preview.text}
                       </>
                     ) : (
                       <span className="text-slate-400">No messages yet</span>
