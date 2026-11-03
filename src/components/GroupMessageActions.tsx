@@ -77,22 +77,38 @@ export function GroupMessageActions({
   useLayoutEffect(() => {
     const el = menuRef.current;
     if (!el || showDeleteConfirm || showAllReactions) return;
-    const margin = 8;
-    const rect = el.getBoundingClientRect();
-    let left = position.x;
-    let top = position.y;
 
-    if (left + rect.width + margin > window.innerWidth) {
-      left = window.innerWidth - rect.width - margin;
-    }
-    if (left < margin) left = margin;
+    // `document.documentElement.clientWidth/clientHeight` (the layout
+    // viewport, excluding any scrollbar) is used here instead of
+    // `window.innerWidth/innerHeight` — on some mobile browsers/WebViews
+    // `window.innerWidth` can momentarily report a stale or
+    // zoom-/scrollbar-inflated value, which let this menu get positioned
+    // (and then never re-clamped) partially or fully off the right edge
+    // of the actual visible screen.
+    const clamp = () => {
+      const margin = 8;
+      const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+      const viewportHeight = document.documentElement.clientHeight || window.innerHeight;
+      const rect = el.getBoundingClientRect();
+      let left = position.x;
+      let top = position.y;
 
-    if (top + rect.height + margin > window.innerHeight) {
-      top = window.innerHeight - rect.height - margin;
-    }
-    if (top < margin) top = margin;
+      if (left + rect.width + margin > viewportWidth) {
+        left = viewportWidth - rect.width - margin;
+      }
+      if (left < margin) left = margin;
 
-    setMenuPos({ left, top });
+      if (top + rect.height + margin > viewportHeight) {
+        top = viewportHeight - rect.height - margin;
+      }
+      if (top < margin) top = margin;
+
+      setMenuPos({ left, top });
+    };
+
+    clamp();
+    window.addEventListener('resize', clamp);
+    return () => window.removeEventListener('resize', clamp);
   }, [position.x, position.y, showDeleteConfirm, showAllReactions]);
 
   // Check if message can be deleted for everyone (own message, within 1 hour)
@@ -264,7 +280,11 @@ export function GroupMessageActions({
     <div className="fixed inset-0" style={{ zIndex: 99999 }} onClick={onClose}>
       <div
         ref={menuRef}
-        className="absolute bg-white rounded-2xl shadow-2xl overflow-hidden animate-scale-in min-w-[200px]"
+        // `max-w-[min(15.5rem,calc(100vw-16px))]` is a hard cap, not just a
+        // hint: it guarantees this menu can never be wider than the actual
+        // screen (minus an 8px margin on each side), independent of
+        // whatever the clamping effect above computes.
+        className="absolute bg-white rounded-2xl shadow-2xl overflow-hidden animate-scale-in w-max max-w-[min(15.5rem,calc(100vw-16px))]"
         style={{
           left: menuPos?.left ?? position.x,
           top: menuPos?.top ?? position.y,
@@ -273,8 +293,13 @@ export function GroupMessageActions({
         }}
         onClick={e => e.stopPropagation()}
       >
-        {/* Quick Reactions */}
-        <div className="flex items-center gap-1 p-2 border-b border-slate-100">
+        {/* Quick Reactions.
+            `overflow-x-auto` + `flex-nowrap` is a safety net for narrow
+            screens: if the reactions + "more" button are ever wider than
+            the menu's capped max-width above, this row scrolls
+            horizontally inside itself instead of forcing the whole menu
+            wider than the screen. */}
+        <div className="flex items-center flex-nowrap gap-0.5 p-1.5 border-b border-slate-100 overflow-x-auto">
           {QUICK_REACTIONS.map((emoji) => {
             const userReacted = message.reactions?.[emoji]?.includes(currentUserId);
             return (
@@ -282,7 +307,7 @@ export function GroupMessageActions({
                 key={emoji}
                 onClick={() => handleReaction(emoji)}
                 disabled={isProcessing}
-                className={`text-xl p-2 rounded-full transition-all hover:scale-125 hover:bg-slate-100 ${
+                className={`shrink-0 text-lg p-1.5 rounded-full transition-all hover:scale-125 hover:bg-slate-100 ${
                   userReacted ? 'bg-violet-100' : ''
                 }`}
               >
@@ -292,9 +317,9 @@ export function GroupMessageActions({
           })}
           <button
             onClick={() => setShowAllReactions(true)}
-            className="p-2 rounded-full hover:bg-slate-100 text-slate-500"
+            className="shrink-0 p-1.5 rounded-full hover:bg-slate-100 text-slate-500"
           >
-            <Smile className="w-5 h-5" />
+            <Smile className="w-4 h-4" />
           </button>
         </div>
 
@@ -302,35 +327,35 @@ export function GroupMessageActions({
         <div className="py-1">
           <button
             onClick={handleReply}
-            className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 text-slate-700"
+            className="w-full flex items-center gap-2.5 px-3.5 py-2 hover:bg-slate-50 text-slate-700"
           >
-            <Reply className="w-5 h-5 text-slate-500" />
+            <Reply className="w-4 h-4 text-slate-500" />
             <span className="text-sm font-medium">Reply</span>
           </button>
 
           <button
             onClick={handleForward}
-            className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 text-slate-700"
+            className="w-full flex items-center gap-2.5 px-3.5 py-2 hover:bg-slate-50 text-slate-700"
           >
-            <Forward className="w-5 h-5 text-slate-500" />
+            <Forward className="w-4 h-4 text-slate-500" />
             <span className="text-sm font-medium">Forward</span>
           </button>
 
           {(!message.type || message.type === 'text') && (
             <button
               onClick={handleCopy}
-              className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-slate-50 text-slate-700"
+              className="w-full flex items-center gap-2.5 px-3.5 py-2 hover:bg-slate-50 text-slate-700"
             >
-              <Copy className="w-5 h-5 text-slate-500" />
+              <Copy className="w-4 h-4 text-slate-500" />
               <span className="text-sm font-medium">Copy</span>
             </button>
           )}
 
           <button
             onClick={() => setShowDeleteConfirm(true)}
-            className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-red-50 text-red-600"
+            className="w-full flex items-center gap-2.5 px-3.5 py-2 hover:bg-red-50 text-red-600"
           >
-            <Trash2 className="w-5 h-5" />
+            <Trash2 className="w-4 h-4" />
             <span className="text-sm font-medium">Delete</span>
           </button>
         </div>

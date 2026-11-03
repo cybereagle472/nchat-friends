@@ -568,3 +568,30 @@ lands — what changed, why, and the commit(s) it landed in.
   commit history (141 commits on `main`) plus this and prior sessions'
   merged PRs, at the user's request for "the full history and everything
   about the whole app."
+- **Fixed two more real bugs surfaced once the glass effect itself
+  started actually rendering** (user feedback after the previous entry's
+  fix went live): (1) `ChatView.tsx`'s chat header was `relative z-10`,
+  tied with the message list right below it which is *also* `relative
+  z-10` — since both are siblings and the message list comes later in
+  the DOM, the tied z-index meant the message list painted on top of the
+  *entire header*, including the header's own "Block User" overflow
+  dropdown (which has `z-50`, but only relative to its own parent's
+  stacking context — a child z-index can't lift its whole ancestor
+  stacking context above an equal/higher sibling context). Fix: raised
+  the header to `z-20`, matching the convention `GroupChatView.tsx`'s
+  header already used (and never had this bug). (2) The message
+  long-press action menu's (`MessageActions.tsx` / `GroupMessageActions.
+  tsx`, which duplicate this logic) on-screen clamping used
+  `window.innerWidth`/`innerHeight`, measured once with no `resize`
+  listener, which on some mobile browsers reported a stale/inflated
+  value and let the menu render partially or fully off the right edge of
+  the screen, looking oversized and cut off. Fix: switched the clamp
+  math to `document.documentElement.clientWidth/clientHeight` (re-run on
+  `resize` too), added a hard `max-width` cap on the menu itself so it's
+  physically incapable of exceeding the viewport width regardless of any
+  future measurement bug, shrank the quick-reaction row's button
+  size/padding so it fits more comfortably on narrow phone screens, and
+  made that row horizontally scrollable as a last-resort fallback instead
+  of ever overflowing. Also added a global `html, body { overflow-x:
+  hidden }` safety net so any future mispositioned fixed/absolute popup
+  can't widen the whole page's layout viewport the way this one did.

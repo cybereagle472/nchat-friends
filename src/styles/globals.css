@@ -15,6 +15,19 @@
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
   }
 
+  /* Defense-in-depth against any `position: fixed`/`absolute` popup
+     (context menus, dropdowns, modals) ever getting positioned or sized
+     wide enough to extend past the right edge of the screen: without
+     this, some mobile browsers/WebViews let that overflow widen the
+     whole page's layout viewport instead of just clipping/scrolling the
+     offending element, which can make the *entire app* appear to shift
+     or require horizontal scrolling to see content that's actually
+     supposed to be on-screen. This never affects normal vertical
+     scrolling of chat lists/messages (only the horizontal axis). */
+  html, body {
+    overflow-x: hidden;
+  }
+
   /*
    * App-wide "native app" feel: nothing in the UI — message text, names,
    * timestamps, buttons, nav tabs, labels, images — should ever get
