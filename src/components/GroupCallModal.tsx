@@ -27,7 +27,16 @@ interface GroupCallModalProps {
 // (couldn't start/join the call, e.g. a network/server error) is reported
 // through `error` and closes the modal, same as 1:1 handles that same
 // class of failure in initiateCall/answerCall's catch blocks.
-type ModalState = 'initiating' | 'ringing' | 'in-call' | 'ended';
+// 'calling' is the caller's own "ringing the group" screen — distinct
+// from 'ringing', which is what *recipients* see for an incoming call.
+// The caller sits here (own camera/mic already captured, but no tile
+// grid and no running duration clock yet) until the first other person
+// actually joins; only then do we know the call has genuinely been
+// answered by anyone and switch to 'in-call'. Skipping straight to
+// 'in-call' the instant the call is created (the previous behavior) made
+// every outgoing call look answered immediately, clock already running,
+// even when nobody else had joined yet.
+type ModalState = 'initiating' | 'calling' | 'ringing' | 'in-call' | 'ended';
 type PeerStatus = 'connecting' | 'connected' | 'disconnected';
 
 // Same timing this app's 1:1 calling already settled on through real-device
@@ -71,10 +80,23 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
   const remoteMediaElsRef = useRef<Map<string, HTMLMediaElement>>(new Map());
   const eventSubRef = useRef<{ unsubscribe: () => void } | null>(null);
   const ringTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Caller-side counterpart to ringTimeoutRef: how long we'll sit in
+  // 'calling' with nobody having joined before giving up, same as a
+  // normal phone call eventually stops ringing if nobody picks up.
+  const callerWaitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const endedRef = useRef(false);
   const isSpeakerOnRef = useRef(false);
   const profileCacheRef = useRef<Map<string, UserProfile>>(new Map());
+  // Mirrors `modalState` for code that needs the *current* value inside a
+  // callback that was created (and closed over an older modalState) before
+  // this render — e.g. subscribeFullEvents's onParticipantJoined, which is
+  // only ever (re)created once per call, back when modalState was still
+  // 'initiating'.
+  const modalStateRef = useRef<ModalState>(incomingCall ? 'ringing' : 'initiating');
+  useEffect(() => {
+    modalStateRef.current = modalState;
+  }, [modalState]);
 
   // Seed the profile cache from the group's own member list when we have
   // it (starting the call ourselves) — avoids a network round trip per
@@ -183,6 +205,10 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
     if (ringTimeoutRef.current) {
       clearTimeout(ringTimeoutRef.current);
       ringTimeoutRef.current = null;
+    }
+    if (callerWaitTimeoutRef.current) {
+      clearTimeout(callerWaitTimeoutRef.current);
+      callerWaitTimeoutRef.current = null;
     }
     if (durationIntervalRef.current) {
       clearInterval(durationIntervalRef.current);
@@ -325,6 +351,17 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
     [offerTo]
   );
 
+  // Declared up here (rather than down by its main caller,
+  // connectToExistingParticipants) so subscribeFullEvents's
+  // onParticipantJoined — defined below, but which needs to start this
+  // the moment an outgoing call's first participant actually joins — can
+  // reference it without a declaration-order problem.
+  const startDurationTimer = useCallback(() => {
+    if (!durationIntervalRef.current) {
+      durationIntervalRef.current = setInterval(() => setCallDuration((p) => p + 1), 1000);
+    }
+  }, []);
+
   const handleIncomingSignal = useCallback(
     async (from: string, signal: Signal) => {
       if (signal.request_offer) {
@@ -370,6 +407,18 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
       eventSubRef.current = groupCallService.subscribeToGroupCallEvents(callId, {
         onParticipantJoined: (userId) => {
           if (userId === currentUser.id) return;
+          // The very first other participant to actually join is what
+          // makes an outgoing call genuinely "answered" — stop waiting
+          // and start the real duration clock right now, not the instant
+          // we created the call (see the ModalState doc comment above).
+          if (modalStateRef.current === 'calling') {
+            if (callerWaitTimeoutRef.current) {
+              clearTimeout(callerWaitTimeoutRef.current);
+              callerWaitTimeoutRef.current = null;
+            }
+            setModalState('in-call');
+            startDurationTimer();
+          }
           // Opportunistic fast path — ensureOfferTo also covers the
           // guaranteed request_offer nudge below, so whichever of the two
           // actually arrives (this one has a real race; see sendSignal's
@@ -391,7 +440,7 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
         },
       });
     },
-    [cleanupAll, currentUser.id, dropPeer, ensureOfferTo, handleIncomingSignal, onClose]
+    [cleanupAll, currentUser.id, dropPeer, ensureOfferTo, handleIncomingSignal, onClose, startDurationTimer]
   );
 
   const initializeMedia = useCallback(async () => {
@@ -428,12 +477,6 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
     }
   }, [modalState]);
 
-  const startDurationTimer = useCallback(() => {
-    if (!durationIntervalRef.current) {
-      durationIntervalRef.current = setInterval(() => setCallDuration((p) => p + 1), 1000);
-    }
-  }, []);
-
   // Runs the instant we know our own call id, for both starting a call and
   // joining one — and in that exact order: subscribe to events FIRST,
   // before anything else (including the roster bookkeeping below, which
@@ -455,6 +498,36 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
     [addToRoster, subscribeFullEvents]
   );
 
+  // Shared by both startOutgoingCall and acceptIncomingCall, right after
+  // connectToExistingParticipants: if anyone was already genuinely joined,
+  // we're walking into a real in-progress call — go straight to 'in-call'.
+  // If not (a brand new call we just started, or — rarer — everyone we
+  // were about to join already left in the moment between us getting
+  // rung and tapping Accept), there's truly nobody here yet, so wait for
+  // the first real joiner instead of pretending the call is already
+  // answered. subscribeFullEvents's onParticipantJoined is what ends this
+  // wait the moment someone genuinely shows up.
+  const enterCallOrWaitForFirstJoiner = useCallback(
+    (existingParticipantCount: number) => {
+      if (existingParticipantCount > 0) {
+        setModalState('in-call');
+        startDurationTimer();
+        return;
+      }
+      setModalState('calling');
+      callerWaitTimeoutRef.current = setTimeout(() => {
+        if (endedRef.current || modalStateRef.current !== 'calling') return;
+        endedRef.current = true;
+        setError('No one answered');
+        if (callIdRef.current) groupCallService.leaveCall(callIdRef.current);
+        cleanupAll();
+        setModalState('ended');
+        setTimeout(onClose, 2000);
+      }, RING_TIMEOUT_MS);
+    },
+    [cleanupAll, onClose, startDurationTimer]
+  );
+
   const startOutgoingCall = useCallback(async () => {
     if (!group) return;
     try {
@@ -472,8 +545,7 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
       }
       callIdRef.current = result.data.call.id;
       await connectToExistingParticipants(result.data.call.id, result.data.participants);
-      setModalState('in-call');
-      startDurationTimer();
+      enterCallOrWaitForFirstJoiner(result.data.participants.length);
     } catch (err) {
       console.error('Error starting group call:', err);
       setError('Failed to start group call');
@@ -481,7 +553,7 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
       cleanupAll();
       setTimeout(onClose, 2000);
     }
-  }, [callType, cleanupAll, connectToExistingParticipants, group, initializeMedia, onClose, startDurationTimer]);
+  }, [callType, cleanupAll, connectToExistingParticipants, enterCallOrWaitForFirstJoiner, group, initializeMedia, onClose]);
 
   const acceptIncomingCall = useCallback(async () => {
     if (!incomingCall) return;
@@ -500,15 +572,14 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
       }
       callIdRef.current = incomingCall.id;
       await connectToExistingParticipants(incomingCall.id, result.data.participants);
-      setModalState('in-call');
-      startDurationTimer();
+      enterCallOrWaitForFirstJoiner(result.data.participants.length);
     } catch (err) {
       console.error('Error joining group call:', err);
       setError('Failed to join group call');
       cleanupAll();
       setTimeout(onClose, 2000);
     }
-  }, [cleanupAll, connectToExistingParticipants, incomingCall, initializeMedia, onClose, startDurationTimer]);
+  }, [cleanupAll, connectToExistingParticipants, enterCallOrWaitForFirstJoiner, incomingCall, initializeMedia, onClose]);
 
   const declineIncomingCall = useCallback(async () => {
     if (incomingCall) {
@@ -609,10 +680,12 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
   const headerSubtitle =
     modalState === 'ringing'
       ? `${incomingCall?.callerProfile?.full_name || 'Someone'} is calling the group`
-      : modalState === 'ended'
-      ? 'Call ended'
+      : modalState === 'calling'
+      ? 'Ringing\u2026'
       : error
       ? error
+      : modalState === 'ended'
+      ? 'Call ended'
       : `${formatDuration(callDuration)} \u00b7 ${participantCount} in call`;
 
   const rosterEntries = Array.from(roster.entries());
@@ -661,6 +734,23 @@ export function GroupCallModal({ currentUser, callType, group, incomingCall, onC
               </button>
               <span className="text-white/70 text-sm">Join</span>
             </div>
+          </div>
+        </div>
+      ) : modalState === 'calling' ? (
+        <div className="flex-1 flex flex-col items-center justify-center px-8 gap-8">
+          <div className="relative">
+            <div className="absolute inset-0 rounded-full bg-violet-500/30 animate-ping" style={{ animationDuration: '2s' }} />
+            <AvatarPlaceholder name={headerTitle} avatarUrl={group?.avatar_url} />
+          </div>
+          <p className="text-white/70 text-sm -mt-4">Calling everyone in {headerTitle}{'\u2026'}</p>
+          <div className="flex flex-col items-center gap-2">
+            <button
+              onClick={leaveCall}
+              className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 hover:scale-105 active:scale-90 transition-all duration-150"
+            >
+              <PhoneOff className="w-7 h-7" />
+            </button>
+            <span className="text-white/70 text-sm">Cancel</span>
           </div>
         </div>
       ) : modalState === 'ended' || modalState === 'initiating' ? (
