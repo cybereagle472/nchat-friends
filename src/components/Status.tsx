@@ -11,6 +11,8 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { toast } from 'sonner';
 import {
   Plus,
   Camera,
@@ -47,6 +49,7 @@ export function Status({ currentUser, friends }: StatusProps) {
   } | null>(null);
   const [viewingMyStatus, setViewingMyStatus] = useState(false);
   const [statusViewers, setStatusViewers] = useState<StatusView[]>([]);
+  const viewersPanelStatusIdRef = useRef<string | null>(null);
   const [showViewers, setShowViewers] = useState(false);
 
   // Create status state
@@ -60,10 +63,12 @@ export function Status({ currentUser, friends }: StatusProps) {
   const [caption, setCaption] = useState('');
   const [uploading, setUploading] = useState(false);
   const [replyText, setReplyText] = useState('');
+  const [isReplyFocused, setIsReplyFocused] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
 
   // Refs
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const replyInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [progress, setProgress] = useState(0);
@@ -106,6 +111,24 @@ export function Status({ currentUser, friends }: StatusProps) {
     return () => subscription.unsubscribe();
   }, [currentUser.id, friends, loadStatuses]);
 
+  // Subscribe to views on my own statuses — updates the view count live
+  // while I'm looking at my status, and the viewer list if it's open.
+  useEffect(() => {
+    const subscription = statusService.subscribeToMyStatusViews(currentUser.id, (view) => {
+      setMyStatuses(prev =>
+        prev.map(s => (s.id === view.status_id ? { ...s, view_count: s.view_count + 1 } : s))
+      );
+      setStatusViewers(prev => {
+        if (prev.length === 0) return prev;
+        if (viewersPanelStatusIdRef.current !== view.status_id) return prev;
+        if (prev.some(v => v.viewer_id === view.viewer_id)) return prev;
+        return [view, ...prev];
+      });
+    });
+
+    return () => subscription.unsubscribe();
+  }, [currentUser.id]);
+
   // Progress bar timer for status viewing
   useEffect(() => {
     if (!viewingStatus && !viewingMyStatus) {
@@ -116,7 +139,10 @@ export function Status({ currentUser, friends }: StatusProps) {
       return;
     }
 
-    if (isPaused) return;
+    // Also pause while the viewer list is open or the reply box is focused —
+    // either of those means the user's attention is on that UI, not on
+    // watching the story play through.
+    if (isPaused || showViewers || isReplyFocused) return;
 
     const currentStatus = viewingMyStatus
       ? myStatuses[viewingStatus?.currentIndex || 0]
@@ -145,17 +171,19 @@ export function Status({ currentUser, friends }: StatusProps) {
         clearInterval(progressIntervalRef.current);
       }
     };
-  }, [viewingStatus, viewingMyStatus, isPaused]);
+  }, [viewingStatus, viewingMyStatus, isPaused, showViewers, isReplyFocused]);
 
-  // Mark status as viewed
+  // Mark status as viewed (not applicable to your own status — viewing your
+  // own updates should never count as a "view" or add you to your own
+  // viewer list, so skip the call entirely).
   useEffect(() => {
-    if (!viewingStatus) return;
+    if (!viewingStatus || viewingMyStatus) return;
 
     const currentStatus = viewingStatus.userStatuses.statuses[viewingStatus.currentIndex];
     if (currentStatus) {
       statusService.viewStatus(currentStatus.id, currentUser.id);
     }
-  }, [viewingStatus?.currentIndex, currentUser.id]);
+  }, [viewingStatus?.currentIndex, viewingMyStatus, currentUser.id]);
 
   // Handle file selection
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -278,7 +306,7 @@ export function Status({ currentUser, friends }: StatusProps) {
             user_profile: currentUser,
             statuses: myStatuses,
             hasUnviewed: false,
-            lastStatusAt: myStatuses[0]?.created_at || ''
+            lastStatusAt: myStatuses[myStatuses.length - 1]?.created_at || ''
           },
           currentIndex: nextIndex
         });
@@ -351,6 +379,7 @@ export function Status({ currentUser, friends }: StatusProps) {
     setIsPaused(false);
     setShowViewers(false);
     setReplyText('');
+    setIsReplyFocused(false);
     loadStatuses(); // Refresh to update view counts
   };
 
@@ -364,7 +393,7 @@ export function Status({ currentUser, friends }: StatusProps) {
         user_profile: currentUser,
         statuses: myStatuses,
         hasUnviewed: false,
-        lastStatusAt: myStatuses[0]?.created_at || ''
+        lastStatusAt: myStatuses[myStatuses.length - 1]?.created_at || ''
       },
       currentIndex: 0
     });
@@ -372,6 +401,7 @@ export function Status({ currentUser, friends }: StatusProps) {
 
   // Load viewers for current status
   const loadViewers = async (statusId: string) => {
+    viewersPanelStatusIdRef.current = statusId;
     const viewers = await statusService.getStatusViewers(statusId);
     setStatusViewers(viewers);
     setShowViewers(true);
@@ -405,7 +435,11 @@ export function Status({ currentUser, friends }: StatusProps) {
       replyText
     );
     setReplyText('');
-    alert('Reply sent!');
+    // Close the reply box (blur it so the keyboard dismisses and it
+    // collapses back to its idle state) and let the story resume playing.
+    replyInputRef.current?.blur();
+    setIsReplyFocused(false);
+    toast.success('Reply sent!');
   };
 
   // Format time ago
@@ -577,9 +611,14 @@ export function Status({ currentUser, friends }: StatusProps) {
 
   // Render status viewer
   if (viewingStatus && currentViewingStatus) {
-    return (
+    // Rendered via a portal straight into <body> so it truly covers the
+    // whole viewport — ancestor containers in the normal tree use
+    // overflow-hidden for their own layout/animations, which would
+    // otherwise clip this fixed overlay and let the bottom tab bar show
+    // through above it.
+    return createPortal(
       <div
-        className="h-full flex flex-col bg-black"
+        className="fixed inset-0 z-[100] flex flex-col bg-black"
         onClick={(e) => {
           // Click left/right to navigate
           const rect = (e.target as HTMLElement).getBoundingClientRect();
@@ -735,7 +774,7 @@ export function Status({ currentUser, friends }: StatusProps) {
         )}
 
         {/* Bottom - View count or Reply */}
-        <div className="absolute bottom-0 left-0 right-0 z-20 p-4 bg-gradient-to-t from-black/50">
+        <div className="absolute bottom-0 left-0 right-0 z-20 px-4 pt-4 bg-gradient-to-t from-black/50" style={{ paddingBottom: 'max(1rem, env(safe-area-inset-bottom))' }}>
           {viewingMyStatus ? (
             <button
               onClick={(e) => {
@@ -750,9 +789,12 @@ export function Status({ currentUser, friends }: StatusProps) {
           ) : (
             <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
               <input
+                ref={replyInputRef}
                 type="text"
                 value={replyText}
                 onChange={(e) => setReplyText(e.target.value)}
+                onFocus={() => setIsReplyFocused(true)}
+                onBlur={() => setIsReplyFocused(false)}
                 placeholder="Reply..."
                 className="flex-1 bg-white/10 text-white placeholder-white/60 px-4 py-3 rounded-full text-sm outline-none"
               />
@@ -820,7 +862,8 @@ export function Status({ currentUser, friends }: StatusProps) {
             </div>
           </div>
         )}
-      </div>
+      </div>,
+      document.body
     );
   }
 

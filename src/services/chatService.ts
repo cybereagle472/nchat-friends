@@ -1,79 +1,60 @@
 /**
- * Chat Service - Convex-backed implementation.
- * Same public surface as the original offline-first Supabase service,
- * backed by the Convex conversations/messages tables.
+ * Chat Service - Production-Ready Offline-First Implementation (Cloudflare Worker backend)
+ *
+ * Features:
+ * - Idempotent message sending with client_message_id
+ * - Offline queue with automatic retry
+ * - Local-first UI updates
+ * - Sync reconciliation
+ * - Message pre-fetching for instant chat loading (WhatsApp-style)
+ * - Realtime updates over a single per-user WebSocket (src/lib/realtimeClient.ts)
  */
 
-import { api, convex } from '../lib/convexClient';
-import type { Message, Contact } from '../types';
+import { apiFetch, ApiError } from '../lib/apiClient';
+import { realtimeClient } from '../lib/realtimeClient';
+import { retry } from '../utils/retry';
+import { Message, Contact, UserProfile } from '../types';
+import {
+  generateClientMessageId,
+  getChatId,
+  saveMessage,
+  saveMessages,
+  getChatMessages as getLocalMessages,
+  queuePendingMessage,
+  getPendingMessages,
+  removePendingMessage,
+  updatePendingMessageStatus,
+  updateMessageSyncStatus,
+  getMessageByClientId,
+  cacheProfiles,
+  isOnline,
+  repairDuplicateClientMessageIds,
+  LocalMessage,
+  PendingMessage,
+  MessageSyncStatus
+} from '../utils/offlineStorage';
+import { log } from '../utils/logger';
+import { RateLimiter } from '../utils/validation';
+import { RATE_LIMITS } from '../utils/constants';
 
-type AnyMsg = Record<string, any>;
-
-// In-memory cache for instant chat switching
+// In-memory message cache for INSTANT chat switching
 const messageCache = new Map<string, { messages: Message[]; fetchedAt: number }>();
-const CACHE_TTL_MS = 60_000;
+const CACHE_TTL_MS = 60000; // 1 minute cache TTL
+const PREFETCH_LIMIT = 30; // Messages to prefetch per chat
 
-function cacheKey(userId: string, contactId: string) {
-  return [userId, contactId].sort().join(':');
-}
+const MAX_RETRY_COUNT = 5;
+const RETRY_DELAY_MS = 2000;
 
-interface ConvexMessage {
-  _id: string;
-  senderId: string;
-  body: string;
-  createdAt: number;
-  clientMessageId?: string | null;
-  editedAt?: number | null;
-  isDeleted?: boolean;
-  reactions?: Record<string, string[]> | null;
-  attachmentFileId?: string | null;
-  attachmentName?: string | null;
-  attachmentType?: string | null;
-}
+// Rate limiter for message sending
+const messageRateLimiter = new RateLimiter(
+  RATE_LIMITS.MESSAGES_PER_MINUTE,
+  60000 // 1 minute window
+);
 
-function mapMessage(
-  m: ConvexMessage,
-  receiverId: string,
-  otherLastReadAt = 0
-): Message {
-  const type = m.attachmentFileId
-    ? ((m.attachmentType ?? 'file') as Message['type'])
-    : ('text' as Message['type']);
-  return {
-    id: m._id,
-    client_message_id: m.clientMessageId ?? undefined,
-    sender_id: m.senderId,
-    receiver_id: receiverId,
-    content: m.body ?? '',
-    type,
-    created_at: new Date(m.createdAt).toISOString(),
-    is_read: otherLastReadAt >= m.createdAt || m.senderId !== receiverId ? true : false,
-    is_deleted: !!m.isDeleted,
-    is_edited: !!m.editedAt,
-    edited_at: m.editedAt ? new Date(m.editedAt).toISOString() : undefined,
-    reactions: (m.reactions as unknown as Record<string, string[]>) ?? {},
-  };
-}
-
-async function findOrCreateConversation(
-  userId: string,
-  otherId: string
-): Promise<string | null> {
-  try {
-    return await convex.mutation(api.conversations.getOrCreate, {
-      otherUserId: otherId as never,
-    });
-  } catch {
-    // Fall back to read-only lookup
-    try {
-      return await convex.query(api.conversations.getByMembers, {
-        userA: userId as never,
-        userB: otherId as never,
-      });
-    } catch {
-      return null;
-    }
-  }
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message;
+  if (err instanceof Error) return err.message;
+  return fallback;
 }
 
 export interface SendMessageParams {
@@ -82,8 +63,23 @@ export interface SendMessageParams {
   content: string;
   type?: Message['type'];
   duration?: number;
+  /**
+   * Optional precomputed waveform/preview data. Reuses the `thumbnail_url`
+   * column server-side (meaningless for voice messages otherwise) so voice
+   * bubbles can render the *actual* recorded amplitude instead of a fake
+   * placeholder, with no schema changes required.
+   */
+  waveform?: string;
   replyToId?: string;
+  /**
+   * Optional caller-supplied idempotency id. Pass the same id you used for
+   * an optimistic local/UI message so the realtime echo of this exact send
+   * (the Worker broadcasts message:new to the sender too) reconciles with
+   * it instead of being inserted as a visual duplicate.
+   */
+  clientMessageId?: string;
 }
+
 
 export interface SendMessageResult {
   success: boolean;
@@ -94,362 +90,923 @@ export interface SendMessageResult {
 }
 
 export const chatService = {
+  /**
+   * Send a message with offline-first support
+   * Returns immediately with optimistic local message
+   */
   async sendMessage(params: SendMessageParams): Promise<SendMessageResult> {
-    const { senderId, receiverId, content, type = 'text' } = params;
-    const clientMessageId = `cm_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const {
+      senderId,
+      receiverId,
+      content,
+      type = 'text',
+      duration,
+      waveform,
+      replyToId
+    } = params;
 
-    try {
-      const conversationId = await findOrCreateConversation(senderId, receiverId);
-      if (!conversationId) {
-        return { success: false, clientMessageId, error: 'Could not open conversation' };
-      }
-
-      let messageId: string;
-      if (type === 'text') {
-        messageId = await convex.mutation(api.messages.send, {
-          conversationId: conversationId as never,
-          body: content,
-          clientMessageId,
-        });
-      } else {
-        messageId = await convex.mutation(api.messages.sendWithAttachment, {
-          conversationId: conversationId as never,
-          body: '',
-          clientMessageId,
-          attachmentFileId: content, // content holds the URL/storage ref for media
-          attachmentName: type,
-          attachmentType: type,
-        });
-      }
-
-      const now = Date.now();
-      const message: Message = {
-        id: messageId,
-        client_message_id: clientMessageId,
-        sender_id: senderId,
-        receiver_id: receiverId,
-        content,
-        type,
-        created_at: new Date(now).toISOString(),
-        is_read: false,
-      };
-      this.updateCache(senderId, receiverId, message);
-      return { success: true, message, clientMessageId };
-    } catch (err) {
+    // Rate limiting check
+    if (!messageRateLimiter.isAllowed(senderId)) {
       return {
         success: false,
-        clientMessageId,
-        error: err instanceof Error ? err.message : String(err),
+        clientMessageId: params.clientMessageId || generateClientMessageId(),
+        error: `Rate limit exceeded. Maximum ${RATE_LIMITS.MESSAGES_PER_MINUTE} messages per minute.`
       };
     }
-  },
 
-  async getMessages(
-    userId: string,
-    otherId: string,
-    _opts?: { limit?: number; forceServerSync?: boolean; beforeTimestamp?: string | number }
-  ): Promise<Message[]> {
+    // Reuse the caller's id (e.g. a UI's optimistic-message id) when given,
+    // so the realtime echo of this exact message reconciles with the local
+    // optimistic entry instead of showing up as a second, duplicate message.
+    const clientMessageId = params.clientMessageId || generateClientMessageId();
+    const chatId = getChatId(senderId, receiverId);
+    const now = new Date().toISOString();
+
+    const localMessage: LocalMessage = {
+      id: clientMessageId,
+      sender_id: senderId,
+      receiver_id: receiverId,
+      content,
+      type,
+      duration: duration?.toString(),
+      thumbnail_url: waveform,
+      reply_to: replyToId,
+      created_at: now,
+      is_read: false,
+      is_deleted: false,
+      deleted_for: [],
+      reactions: {},
+      chatId,
+      syncStatus: 'pending',
+      clientMessageId,
+      localCreatedAt: now,
+      retryCount: 0
+    };
+
+    await saveMessage(localMessage);
+
+    if (!isOnline()) {
+      const pendingMessage: PendingMessage = {
+        clientMessageId,
+        senderId,
+        receiverId,
+        content,
+        type,
+        duration,
+        waveform,
+        replyToId,
+        createdAt: now,
+        retryCount: 0,
+        status: 'queued'
+      };
+      await queuePendingMessage(pendingMessage);
+
+      return {
+        success: true,
+        message: localMessage as Message,
+        clientMessageId,
+        isOffline: true
+      };
+    }
+
     try {
-      const conversationId = await findOrCreateConversation(userId, otherId);
-      if (!conversationId) return [];
-
-      const result = await convex.query(api.conversations.messages, {
-        conversationId: conversationId as never,
+      const result = await this.sendToServer({
+        clientMessageId,
+        senderId,
+        receiverId,
+        content,
+        type,
+        duration,
+        waveform,
+        replyToId
       });
-      const conv = await convex.query(api.conversations.get, {
-        conversationId: conversationId as never,
-      });
-      const otherLastReadAt = conv?.lastReadBy?.[otherId]
-        ? new Date(conv.lastReadBy[otherId]).getTime()
-        : 0;
 
-      const msgs = (result.messages as never as ConvexMessage[]).map((m) =>
-        mapMessage(m, userId, otherLastReadAt)
-      );
-      messageCache.set(cacheKey(userId, otherId), {
-        messages: msgs,
-        fetchedAt: Date.now(),
-      });
-      return msgs;
-    } catch {
-      return [];
-    }
-  },
+      if (result.success && result.message) {
+        await updateMessageSyncStatus(
+          clientMessageId,
+          'sent',
+          result.message.id,
+          result.message.created_at
+        );
 
-  async getChatList(userId: string, friendIds: string[]): Promise<Contact[]> {
-    void friendIds;
-    try {
-      const { conversations } = await convex.query(api.conversations.list, {});
-      return (conversations as never as Array<AnyMsg>)
-        .filter((c) => !c.isGroup && c.other)
-        .map((c) => ({
-          user_id: c.other._id as string,
-          status: 'accepted',
-          profile: {
-            id: c.other._id,
-            full_name: c.other.name ?? c.other.email?.split('@')[0] ?? 'User',
-            username: undefined,
-            email: c.other.email ?? '',
-            avatar_url: c.other.image,
-            is_online: false,
-          },
-          unreadCount: c.unreadCount ?? 0,
-          lastMessage: c.lastMessagePreview
-            ? ({
-                id: `${c._id}-last`,
-                sender_id: (c.lastMessageSenderId as string) ?? '',
-                receiver_id: userId,
-                content: c.lastMessagePreview as string,
-                type: 'text',
-                created_at: new Date(c.lastMessageAt as number).toISOString(),
-                is_read: false,
-              } as Message)
-            : null,
-        }));
-    } catch {
-      return [];
-    }
-  },
+        return {
+          success: true,
+          message: result.message,
+          clientMessageId
+        };
+      } else {
+        await updateMessageSyncStatus(clientMessageId, 'failed');
 
-  async getChatListFallback(userId: string, friendIds: string[]): Promise<Contact[]> {
-    return this.getChatList(userId, friendIds);
-  },
+        const pendingMessage: PendingMessage = {
+          clientMessageId,
+          senderId,
+          receiverId,
+          content,
+          type,
+          duration,
+          waveform,
+          replyToId,
+          createdAt: now,
+          retryCount: 1,
+          status: 'failed'
+        };
+        await queuePendingMessage(pendingMessage);
 
-  async getMessagesInstant(
-    userId: string,
-    otherId: string,
-    opts?: { limit?: number; beforeTimestamp?: string | number }
-  ): Promise<Message[]> {
-    return this.getMessages(userId, otherId, opts);
-  },
-
-  async markAsRead(_userId: string, otherId: string): Promise<void> {
-    try {
-      const conversationId = await convex.query(api.conversations.getByMembers, {
-        userA: otherId as never,
-        userB: otherId === '' ? (otherId as never) : (undefined as never),
-      }).catch(() => null);
-      void conversationId;
-    } catch {
-      /* noop */
-    }
-  },
-
-  /** Mark the conversation with `otherId` fully read (uses current session). */
-  async markConversationRead(conversationId: string): Promise<void> {
-    try {
-      await convex.mutation(api.conversations.markRead, {
-        conversationId: conversationId as never,
-      });
-    } catch {
-      /* ignore */
-    }
-  },
-
-  getCachedMessages(userId: string, contactId: string): Message[] | null {
-    const cached = messageCache.get(cacheKey(userId, contactId));
-    if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
-      return cached.messages;
-    }
-    return cached?.messages ?? null;
-  },
-
-  updateCache(userId: string, contactId: string, message: Message): void {
-    const key = cacheKey(userId, contactId);
-    const cached = messageCache.get(key);
-    if (cached) {
-      if (!cached.messages.some((m) => m.id === message.id)) {
-        cached.messages.push(message);
+        return {
+          success: false,
+          message: localMessage as Message,
+          clientMessageId,
+          error: result.error
+        };
       }
-    } else {
-      messageCache.set(key, { messages: [message], fetchedAt: Date.now() });
+    } catch (error: any) {
+      await updateMessageSyncStatus(clientMessageId, 'failed');
+
+      const pendingMessage: PendingMessage = {
+        clientMessageId,
+        senderId,
+        receiverId,
+        content,
+        type,
+        duration,
+        waveform,
+        replyToId,
+        createdAt: now,
+        retryCount: 1,
+        status: 'failed'
+      };
+      await queuePendingMessage(pendingMessage);
+
+      return {
+        success: false,
+        message: localMessage as Message,
+        clientMessageId,
+        error: error.message || 'An error occurred'
+      };
     }
-  },
-
-  mergeMessages(a: Message[], b: Message[]): Message[] {
-    const map = new Map<string, Message>();
-    [...a, ...b].forEach((m) => map.set(m.id, m));
-    return Array.from(map.values()).sort(
-      (x, y) => new Date(x.created_at).getTime() - new Date(y.created_at).getTime()
-    );
-  },
-
-  clearCache(key?: string): void {
-    if (key) messageCache.delete(key);
-    else messageCache.clear();
-  },
-
-  async prefetchChatsMessages(
-    userId: string,
-    chatIds: string[]
-  ): Promise<void> {
-    await Promise.allSettled(chatIds.map((id) => this.getMessages(userId, id)));
-  },
-
-  async processPendingQueue(
-    onStatusUpdate?: (clientMessageId: string, status: 'sent' | 'failed') => void,
-    ..._rest: unknown[]
-  ): Promise<{ processed: number; failed: number }> {
-    /* No offline queue in the Convex path — sends are direct.
-       Report any locally-pending messages as failed so the UI clears them. */
-    let failed = 0;
-    for (const entry of messageCache.values()) {
-      for (const m of entry.messages) {
-        if ((m as AnyMsg).syncStatus === 'pending') {
-          failed++;
-          onStatusUpdate?.(m.client_message_id ?? m.id, 'failed');
-        }
-      }
-    }
-    return { processed: 0, failed };
-  },
-
-  async addReaction(messageId: string, _userId: string, emoji: string): Promise<void> {
-    await convex.mutation(api.messages.toggleReaction, {
-      messageId: messageId as never,
-      emoji,
-    });
-  },
-
-  async removeReaction(messageId: string, _userId: string, emoji: string): Promise<void> {
-    await convex.mutation(api.messages.toggleReaction, {
-      messageId: messageId as never,
-      emoji,
-    });
-  },
-
-  async editMessage(
-    messageId: string,
-    _userId: string,
-    newContent: string
-  ): Promise<{ success: boolean; error?: string }> {
-    try {
-      await convex.mutation(api.messages.editMessage, {
-        messageId: messageId as never,
-        body: newContent,
-      });
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) };
-    }
-  },
-
-  async deleteForEveryone(
-    messageId: string,
-    _userId: string
-  ): Promise<{ success: boolean; error?: string }> {
-    try {
-      await convex.mutation(api.messages.deleteMessage, {
-        messageId: messageId as never,
-      });
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) };
-    }
-  },
-
-  async deleteForMe(
-    messageId: string,
-    _userId: string
-  ): Promise<{ success: boolean; error?: string }> {
-    // Local-only deletion: remove from caches.
-    for (const [key, entry] of messageCache.entries()) {
-      messageCache.set(
-        key,
-        { ...entry, messages: entry.messages.filter((m) => m.id !== messageId) }
-      );
-    }
-    return { success: true };
-  },
-
-  async forwardToUsers(
-    userId: string,
-    targetUserIds: string[],
-    message: Message
-  ): Promise<{ success: boolean; count?: number; sentCount?: number; error?: string }> {
-    try {
-      let count = 0;
-      for (const target of targetUserIds) {
-        const res = await this.sendMessage({
-          senderId: userId,
-          receiverId: target,
-          content: message.content,
-          type: message.type,
-        });
-        if (res.success) count++;
-      }
-      return { success: true, count, sentCount: count };
-    } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) };
-    }
-  },
-
-  async forwardToGroups(
-    _userId: string,
-    groupIds: string[],
-    message: Message
-  ): Promise<{ success: boolean; count?: number; sentCount?: number; error?: string }> {
-    // Group forwarding handled by groupService in the zip UI flow
-    void groupIds;
-    void message;
-    return { success: true, count: 0, sentCount: 0 };
   },
 
   /**
-   * Polling-based realtime substitute for Supabase channels.
-   * Calls back when messages change for this user.
+   * Send message to server with idempotency (the Worker also de-dupes by
+   * client_message_id, so a retried call is always safe)
+   */
+  async sendToServer(params: {
+    clientMessageId: string;
+    senderId: string;
+    receiverId: string;
+    content: string;
+    type: string;
+    duration?: number;
+    waveform?: string;
+    replyToId?: string;
+  }): Promise<{ success: boolean; message?: Message; error?: string }> {
+    try {
+      return await retry(async () => {
+        const { message } = await apiFetch<{ message: Message }>('/messages', {
+          method: 'POST',
+          body: JSON.stringify({
+            receiver_id: params.receiverId,
+            content: params.content,
+            type: params.type,
+            duration: params.duration,
+            thumbnail_url: params.waveform,
+            reply_to: params.replyToId,
+            client_message_id: params.clientMessageId
+          })
+        });
+        return { success: true, message };
+      }, {
+        maxRetries: 3,
+        delay: 1000,
+        backoff: true
+      });
+    } catch (error: any) {
+      return { success: false, error: errorMessage(error, 'Failed to send message') };
+    }
+  },
+
+  /**
+   * Process pending message queue (call on reconnect)
+   */
+  async processPendingQueue(
+    onProgress?: (clientMessageId: string, status: 'sending' | 'sent' | 'failed') => void
+  ): Promise<{ processed: number; failed: number }> {
+    const pendingMessages = await getPendingMessages();
+    let processed = 0;
+    let failed = 0;
+
+    for (const pending of pendingMessages) {
+      if (pending.retryCount >= MAX_RETRY_COUNT) {
+        failed++;
+        continue;
+      }
+
+      onProgress?.(pending.clientMessageId, 'sending');
+      await updatePendingMessageStatus(pending.clientMessageId, 'sending');
+
+      if (!pending.receiverId) {
+        failed++;
+        continue; // Skip group messages in this queue
+      }
+
+      try {
+        const result = await this.sendToServer({
+          clientMessageId: pending.clientMessageId,
+          senderId: pending.senderId,
+          receiverId: pending.receiverId,
+          content: pending.content,
+          type: pending.type,
+          duration: pending.duration || undefined,
+          waveform: pending.waveform,
+          replyToId: pending.replyToId
+        });
+
+        if (result.success) {
+          await removePendingMessage(pending.clientMessageId);
+          await updateMessageSyncStatus(
+            pending.clientMessageId,
+            'sent',
+            result.message?.id,
+            result.message?.created_at
+          );
+          onProgress?.(pending.clientMessageId, 'sent');
+          processed++;
+        } else {
+          await updatePendingMessageStatus(
+            pending.clientMessageId,
+            'failed',
+            pending.retryCount + 1
+          );
+          await updateMessageSyncStatus(pending.clientMessageId, 'failed');
+          onProgress?.(pending.clientMessageId, 'failed');
+          failed++;
+        }
+      } catch (error) {
+        log.error('Failed to process pending message', error, 'chatService');
+
+        await updatePendingMessageStatus(
+          pending.clientMessageId,
+          'failed',
+          pending.retryCount + 1
+        );
+        await updateMessageSyncStatus(pending.clientMessageId, 'failed');
+        onProgress?.(pending.clientMessageId, 'failed');
+        failed++;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+
+    return { processed, failed };
+  },
+
+  /**
+   * Get messages for a chat - local first, then sync with server
+   */
+  async getMessages(
+    userId: string,
+    contactId: string,
+    options: {
+      limit?: number;
+      beforeTimestamp?: string;
+      forceServerSync?: boolean;
+    } = {}
+  ): Promise<Message[]> {
+    const { limit = 50, beforeTimestamp, forceServerSync = false } = options;
+    const chatId = getChatId(userId, contactId);
+
+    const localMessages = await getLocalMessages(chatId, limit, beforeTimestamp);
+
+    if (!forceServerSync && localMessages.length > 0 && !isOnline()) {
+      return localMessages.filter(m => !m.deleted_for?.includes(userId)) as Message[];
+    }
+
+    if (isOnline()) {
+      try {
+        const params = new URLSearchParams({ limit: String(limit) });
+        if (beforeTimestamp) params.set('before', beforeTimestamp);
+
+        const { messages: serverMessages } = await apiFetch<{ messages: Message[] }>(
+          `/messages/with/${contactId}?${params.toString()}`
+        );
+
+        if (serverMessages) {
+          const localMessagesToSave: LocalMessage[] = serverMessages.map(msg => ({
+            ...msg,
+            chatId,
+            syncStatus: 'sent' as MessageSyncStatus,
+            clientMessageId: msg.client_message_id || msg.id,
+            localCreatedAt: msg.created_at,
+            serverCreatedAt: msg.created_at,
+            retryCount: 0
+          }));
+
+          await saveMessages(localMessagesToSave);
+
+          const mergedMessages = this.mergeMessages(localMessages, localMessagesToSave);
+
+          // mergeMessages sorts ascending (oldest first), so once a chat has
+          // accumulated more than `limit` messages, slicing from the front
+          // silently drops the newest ones — including the message that just
+          // arrived while the chat was closed. Keep the most recent `limit`
+          // instead.
+          return mergedMessages
+            .filter(m => !m.deleted_for?.includes(userId))
+            .slice(-limit) as Message[];
+        }
+      } catch (error) {
+        console.error('Error syncing messages:', error);
+      }
+    }
+
+    return localMessages.filter(m => !m.deleted_for?.includes(userId)) as Message[];
+  },
+
+  /**
+   * Merge local and server messages, preferring server versions
+   */
+  mergeMessages(local: LocalMessage[], server: LocalMessage[]): LocalMessage[] {
+    const messageMap = new Map<string, LocalMessage>();
+
+    for (const msg of local) {
+      messageMap.set(msg.clientMessageId || msg.id, msg);
+    }
+
+    for (const msg of server) {
+      const key = msg.clientMessageId || msg.id;
+      const existing = messageMap.get(key);
+
+      if (!existing || msg.serverCreatedAt) {
+        messageMap.set(key, msg);
+      }
+    }
+
+    return Array.from(messageMap.values()).sort(
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+    );
+  },
+
+  /**
+   * Mark messages as read (the Worker notifies the sender's live session)
+   */
+  async markAsRead(_userId: string, senderId: string): Promise<void> {
+    if (!isOnline()) return;
+    try {
+      await apiFetch('/messages/mark-read', {
+        method: 'POST',
+        body: JSON.stringify({ sender_id: senderId })
+      });
+    } catch (error) {
+      log.error('Error marking messages as read', error, 'chatService');
+    }
+  },
+
+  /**
+   * Delete message for self only
+   */
+  async deleteForMe(messageId: string, _userId: string): Promise<{ success: boolean }> {
+    try {
+      await apiFetch(`/messages/${messageId}/delete-for-me`, { method: 'POST' });
+      return { success: true };
+    } catch (error) {
+      log.error('Error deleting message for self', error, 'chatService');
+      return { success: false };
+    }
+  },
+
+  /**
+   * Delete message for everyone (sender only)
+   */
+  async deleteForEveryone(
+    messageId: string,
+    _senderId: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      await apiFetch(`/messages/${messageId}`, { method: 'DELETE' });
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: errorMessage(error, 'You can only delete your own messages') };
+    }
+  },
+
+  /**
+   * Add reaction to message (the Worker's endpoint toggles, which is what we want here)
+   */
+  async addReaction(messageId: string, _userId: string, emoji: string): Promise<void> {
+    try {
+      await apiFetch(`/messages/${messageId}/reaction`, {
+        method: 'POST',
+        body: JSON.stringify({ emoji })
+      });
+    } catch (error) {
+      log.error('Error adding reaction', error, 'chatService');
+    }
+  },
+
+  /**
+   * Remove reaction from message
+   */
+  async removeReaction(messageId: string, _userId: string, emoji: string): Promise<void> {
+    try {
+      // Same toggle endpoint as addReaction — calling it again removes an
+      // existing reaction from this user for this emoji.
+      await apiFetch(`/messages/${messageId}/reaction`, {
+        method: 'POST',
+        body: JSON.stringify({ emoji })
+      });
+    } catch (error) {
+      log.error('Error removing reaction', error, 'chatService');
+    }
+  },
+
+  /**
+   * Get chat list with last messages + unread counts
+   */
+  async getChatList(userId: string, friendIds: string[]): Promise<Contact[]> {
+    if (friendIds.length === 0) return [];
+
+    try {
+      const { chats } = await apiFetch<{ chats: any[] }>('/messages/chats');
+      if (!chats) return [];
+
+      const result: Contact[] = chats.map((row) => ({
+        user_id: row.user_id,
+        status: 'accepted' as const,
+        profile: {
+          id: row.profile.id,
+          email: row.profile.email || '',
+          full_name: row.profile.full_name || '',
+          username: row.profile.username,
+          avatar_url: row.profile.avatar_url,
+          is_online: row.profile.is_online,
+          last_seen: row.profile.last_seen
+        } as UserProfile,
+        lastMessage: row.lastMessage as Message | undefined,
+        unreadCount: Number(row.unreadCount) || 0
+      }));
+
+      cacheProfiles(result.map(c => c.profile)).catch(() => {});
+
+      return result;
+    } catch (error) {
+      console.error('Error fetching chat list:', error);
+      return this.getChatListFallback(userId, friendIds);
+    }
+  },
+
+  /**
+   * Fallback method if the combined /messages/chats endpoint is unreachable
+   */
+  async getChatListFallback(userId: string, friendIds: string[]): Promise<Contact[]> {
+    try {
+      const results = await Promise.all(
+        friendIds.map(async (friendId) => {
+          const [profileResult, messagesResult] = await Promise.all([
+            apiFetch<{ profile: UserProfile }>(`/users/${friendId}`).catch(() => null),
+            apiFetch<{ messages: Message[] }>(`/messages/with/${friendId}?limit=1`).catch(() => ({ messages: [] as Message[] }))
+          ]);
+
+          if (!profileResult) return null;
+
+          await cacheProfiles([profileResult.profile]).catch(() => {});
+
+          const lastMessage = messagesResult.messages[messagesResult.messages.length - 1];
+
+          return {
+            user_id: friendId,
+            status: 'accepted' as const,
+            profile: profileResult.profile,
+            lastMessage,
+            unreadCount: lastMessage && lastMessage.receiver_id === userId && !lastMessage.is_read ? 1 : 0
+          };
+        })
+      );
+
+      return (results.filter(Boolean) as Contact[]).sort((a, b) => {
+        const aTime = a.lastMessage?.created_at || '0';
+        const bTime = b.lastMessage?.created_at || '0';
+        return bTime.localeCompare(aTime);
+      });
+    } catch {
+      return [];
+    }
+  },
+
+  /**
+   * Subscribe to message events for this user, across every conversation.
+   * Backed by a single shared WebSocket (src/lib/realtimeClient.ts) instead
+   * of per-table Supabase subscriptions.
    */
   subscribeToMessages(
-    _userId: string,
+    userId: string,
     onNewMessage: (message: Message) => void,
     onUpdate: (message: Message) => void
-  ): { unsubscribe: () => void } {
-    const seen = new Set<string>();
-    const known = new Map<string, string>(); // id -> content hash for edits
+  ) {
+    const subs = [
+      realtimeClient.on('message:new', (payload) => {
+        const msg = payload.message as Message;
+        if (msg.sender_id === userId || msg.receiver_id === userId) {
+          // Fire the live UI update immediately and unconditionally. The
+          // local-cache (IndexedDB) reconciliation below is best-effort and
+          // must never gate it — IndexedDB can throw, or even hang
+          // indefinitely (e.g. a blocked version-upgrade across tabs), and
+          // none of that should ever be able to delay or swallow a message
+          // actually showing up live in the chat.
+          onNewMessage(msg);
 
-    const poll = async () => {
-      try {
-        const { conversations } = await convex.query(api.conversations.list, {});
-        for (const c of conversations as never as Array<AnyMsg>) {
-          if (c.isGroup) continue;
-          const conversationId = c._id as string;
-          const result = await convex.query(api.conversations.messages, {
-            conversationId: conversationId as never,
-          });
-          const msgs = result.messages as never as ConvexMessage[];
-          const otherId = (c.other?._id as string) ?? '';
-          for (const m of msgs) {
-            const mapped = mapMessage(m, otherId);
-            if (!seen.has(m._id)) {
-              seen.add(m._id);
-              known.set(m._id, JSON.stringify(m));
-              onNewMessage(mapped);
-            } else {
-              const prev = known.get(m._id);
-              const curr = JSON.stringify(m);
-              if (prev !== curr) {
-                known.set(m._id, curr);
-                onUpdate(mapped);
+          if (msg.client_message_id) {
+            (async () => {
+              try {
+                const existingLocal = await getMessageByClientId(msg.client_message_id!);
+                if (existingLocal && existingLocal.syncStatus === 'pending') {
+                  await updateMessageSyncStatus(existingLocal.id, 'sent', msg.id, msg.created_at);
+                }
+              } catch (err) {
+                log.warn('Failed to reconcile realtime message with local cache', err, 'chatService');
               }
-            }
+            })();
           }
         }
-      } catch {
-        /* ignore polling errors */
-      }
-    };
+      }),
+      realtimeClient.on('message:edit', (payload) => {
+        const msg = payload.message as Message;
+        if (msg.sender_id === userId || msg.receiver_id === userId) {
+          onUpdate(msg);
+        }
+      }),
+      realtimeClient.on('message:delete', (payload) => {
+        if (payload.sender_id === userId || payload.receiver_id === userId) {
+          onUpdate({
+            id: payload.messageId,
+            sender_id: payload.sender_id,
+            receiver_id: payload.receiver_id,
+            is_deleted: true,
+            content: ''
+          } as Message);
+        }
+      }),
+      realtimeClient.on('message:reaction', (payload) => {
+        if (payload.sender_id === userId || payload.receiver_id === userId) {
+          onUpdate({
+            id: payload.messageId,
+            sender_id: payload.sender_id,
+            receiver_id: payload.receiver_id,
+            reactions: payload.reactions
+          } as Message);
+        }
+      })
+    ];
 
-    poll();
-    const interval = setInterval(poll, 2500);
-    return { unsubscribe: () => clearInterval(interval) };
+    return { unsubscribe: () => subs.forEach((s) => s.unsubscribe()) };
   },
 
+  /**
+   * Subscribe to read receipts (for sender to know when their messages are read)
+   */
   subscribeToReadReceipts(
     _userId: string,
-    callback: (messageIds: string[]) => void
-  ): { unsubscribe: () => void } {
-    // Simplified: report nothing; read state comes through message polls.
-    void callback;
-    return { unsubscribe: () => {} };
+    onMessagesRead: (messageIds: string[], readerId: string) => void
+  ) {
+    return realtimeClient.on('message:read', (payload) => {
+      if (payload.message_ids) onMessagesRead(payload.message_ids, payload.reader_id);
+    });
   },
+
+  /**
+   * Edit a sent message (only text messages, only by sender — enforced server-side too)
+   */
+  async editMessage(
+    messageId: string,
+    _senderId: string,
+    newContent: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      await apiFetch(`/messages/${messageId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ content: newContent })
+      });
+      return { success: true };
+    } catch (error) {
+      log.error('Edit message failed', error, 'chatService');
+      return { success: false, error: errorMessage(error, 'Failed to edit message') };
+    }
+  },
+
+  /**
+   * Forward a message to multiple users
+   */
+  async forwardToUsers(
+    senderId: string,
+    receiverIds: string[],
+    originalMessage: Message
+  ): Promise<{ success: boolean; sentCount: number; error?: string }> {
+    let sentCount = 0;
+
+    try {
+      for (const receiverId of receiverIds) {
+        const clientMessageId = generateClientMessageId();
+
+        try {
+          await apiFetch('/messages', {
+            method: 'POST',
+            body: JSON.stringify({
+              receiver_id: receiverId,
+              content: originalMessage.content,
+              type: originalMessage.type,
+              media_url: originalMessage.media_url,
+              thumbnail_url: originalMessage.thumbnail_url,
+              fileName: originalMessage.fileName,
+              fileSize: originalMessage.fileSize,
+              duration: originalMessage.duration,
+              client_message_id: clientMessageId
+            })
+          });
+          sentCount++;
+        } catch (error) {
+          log.error('Failed to forward message', error, 'chatService');
+        }
+      }
+
+      void senderId;
+      return { success: sentCount > 0, sentCount };
+    } catch (error: any) {
+      return { success: false, sentCount, error: errorMessage(error, 'Failed to forward message') };
+    }
+  },
+
+  /**
+   * Forward a message to multiple groups
+   */
+  async forwardToGroups(
+    senderId: string,
+    groupIds: string[],
+    originalMessage: Message
+  ): Promise<{ success: boolean; sentCount: number; error?: string }> {
+    let sentCount = 0;
+
+    try {
+      for (const groupId of groupIds) {
+        const clientMessageId = generateClientMessageId();
+
+        try {
+          await apiFetch(`/groups/${groupId}/messages`, {
+            method: 'POST',
+            body: JSON.stringify({
+              content: originalMessage.content,
+              type: originalMessage.type,
+              media_url: originalMessage.media_url,
+              thumbnail_url: originalMessage.thumbnail_url,
+              client_message_id: clientMessageId
+            })
+          });
+          sentCount++;
+        } catch (error) {
+          log.error('Failed to forward message to group', error, 'chatService');
+        }
+      }
+
+      void senderId;
+      return { success: sentCount > 0, sentCount };
+    } catch (error: any) {
+      return { success: false, sentCount, error: errorMessage(error, 'Failed to forward message') };
+    }
+  },
+
+  /**
+   * Pre-fetch messages for multiple chats in background
+   * Call this when chat list loads to ensure instant chat opening
+   */
+  async prefetchChatsMessages(
+    userId: string,
+    contactIds: string[],
+    limit: number = PREFETCH_LIMIT
+  ): Promise<void> {
+    // Prefetch in batches to avoid overwhelming the server
+    const batchSize = 5;
+
+    for (let i = 0; i < contactIds.length; i += batchSize) {
+      const batch = contactIds.slice(i, i + batchSize);
+
+      await Promise.all(
+        batch.map(async (contactId) => {
+          const chatId = getChatId(userId, contactId);
+
+          // Skip if already cached and fresh
+          const cached = messageCache.get(chatId);
+          if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+            return;
+          }
+
+          try {
+            // First try local cache
+            const localMessages = await getLocalMessages(chatId, limit);
+
+            if (localMessages.length > 0) {
+              messageCache.set(chatId, {
+                messages: localMessages as Message[],
+                fetchedAt: Date.now()
+              });
+            }
+
+            // Background fetch from server if online
+            if (isOnline()) {
+              const { messages: serverMessages } = await apiFetch<{ messages: Message[] }>(
+                `/messages/with/${contactId}?limit=${limit}`
+              );
+
+              if (serverMessages && serverMessages.length > 0) {
+                messageCache.set(chatId, {
+                  messages: serverMessages,
+                  fetchedAt: Date.now()
+                });
+
+                // Save to IndexedDB for offline access
+                const localMessagesToSave: LocalMessage[] = serverMessages.map(msg => ({
+                  ...msg,
+                  chatId,
+                  syncStatus: 'sent' as MessageSyncStatus,
+                  clientMessageId: msg.client_message_id || msg.id,
+                  localCreatedAt: msg.created_at,
+                  serverCreatedAt: msg.created_at,
+                  retryCount: 0
+                }));
+                saveMessages(localMessagesToSave).catch(() => {});
+              }
+            }
+          } catch (error) {
+            // Silent fail - prefetching is optional optimization
+          }
+        })
+      );
+
+      // Small delay between batches to be nice to the server
+      if (i + batchSize < contactIds.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+  },
+
+  /**
+   * Get cached messages instantly (for immediate UI display)
+   * Returns null if no cache available
+   */
+  getCachedMessages(userId: string, contactId: string): Message[] | null {
+    const chatId = getChatId(userId, contactId);
+    const cached = messageCache.get(chatId);
+
+    if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS * 5) {
+      // Allow slightly stale cache for instant display
+      return cached.messages;
+    }
+
+    return null;
+  },
+
+  /**
+   * Update cache with new message (call when message is sent/received)
+   */
+  updateCache(userId: string, contactId: string, message: Message): void {
+    const chatId = getChatId(userId, contactId);
+    const cached = messageCache.get(chatId);
+
+    if (cached) {
+      // Check if message already exists
+      const existingIndex = cached.messages.findIndex(
+        m => m.id === message.id ||
+             (m.client_message_id && m.client_message_id === message.client_message_id)
+      );
+
+      if (existingIndex >= 0) {
+        cached.messages[existingIndex] = message;
+      } else {
+        cached.messages.push(message);
+        // Keep sorted by created_at
+        cached.messages.sort((a, b) =>
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        );
+        // Trim to PREFETCH_LIMIT
+        if (cached.messages.length > PREFETCH_LIMIT * 2) {
+          cached.messages = cached.messages.slice(-PREFETCH_LIMIT * 2);
+        }
+      }
+    } else {
+      // No warm cache yet for this chat (e.g. right after a fresh page
+      // load, before this conversation has been opened/prefetched this
+      // session). Do NOT fabricate a cache entry containing only this one
+      // message — getCachedMessages()/ChatView treat whatever is cached as
+      // "the known message list" and would render it as the chat's full
+      // history, making every older message (including everything the
+      // other person had sent) appear to vanish for the moment it takes
+      // the real load to catch up. Leaving the cache cold here means
+      // ChatView's normal IndexedDB/server load path runs instead, which
+      // always fetches the complete, correct history.
+    }
+  },
+
+  /**
+   * Persist a realtime-delivered message to local storage even while its
+   * chat isn't open. Without this, a message that arrives while the user is
+   * elsewhere in the app (chat list, a different conversation) only lived
+   * in the in-memory cache — if the chat was never opened again before the
+   * app was reloaded, IndexedDB wouldn't have it until the next full server
+   * sync. Safe/idempotent: saveMessage() upserts by id.
+   */
+  async persistIncomingMessage(userId: string, contactId: string, message: Message): Promise<void> {
+    try {
+      const chatId = getChatId(userId, contactId);
+      const localMessage: LocalMessage = {
+        ...message,
+        chatId,
+        syncStatus: 'sent',
+        clientMessageId: message.client_message_id || message.id,
+        localCreatedAt: message.created_at,
+        serverCreatedAt: message.created_at,
+        retryCount: 0
+      };
+      await saveMessage(localMessage);
+    } catch (error) {
+      log.warn('Failed to persist incoming message locally (non-fatal)', error, 'chatService');
+    }
+  },
+
+  /**
+   * Clear all message cache (call on logout)
+   */
+  clearCache(): void {
+    messageCache.clear();
+  },
+
+  /**
+   * One-time repair for local storage left over from a past bug where a
+   * sent message's temp id wasn't cleanly swapped for its server id (see
+   * offlineStorage.updateMessageSyncStatus). Safe to call repeatedly; call
+   * it once on app start so devices that already hit the bug self-heal
+   * without the user needing to clear any data.
+   */
+  async repairLocalMessageStore(): Promise<void> {
+    try {
+      await repairDuplicateClientMessageIds();
+    } catch (error) {
+      log.warn('Local message store repair failed (non-fatal)', error, 'chatService');
+    }
+  },
+
+  /**
+   * Get messages with instant cache-first loading
+   * This is the main method to use for WhatsApp-style instant loading
+   */
+  async getMessagesInstant(
+    userId: string,
+    contactId: string,
+    options: {
+      limit?: number;
+      beforeTimestamp?: string;
+    } = {}
+  ): Promise<{ messages: Message[]; fromCache: boolean }> {
+    const { limit = 50, beforeTimestamp } = options;
+    const chatId = getChatId(userId, contactId);
+
+    // STEP 1: Return cache instantly if available
+    const cached = messageCache.get(chatId);
+    if (cached && !beforeTimestamp) {
+      // Trigger background refresh but return immediately
+      this.getMessages(userId, contactId, { limit, forceServerSync: true })
+        .then(serverMessages => {
+          messageCache.set(chatId, {
+            messages: serverMessages,
+            fetchedAt: Date.now()
+          });
+        })
+        .catch(() => {});
+
+      return { messages: cached.messages, fromCache: true };
+    }
+
+    // STEP 2: Try IndexedDB (still fast, <10ms typically)
+    const localMessages = await getLocalMessages(chatId, limit, beforeTimestamp);
+    if (localMessages.length > 0) {
+      const messages = localMessages as Message[];
+
+      // Update cache
+      if (!beforeTimestamp) {
+        messageCache.set(chatId, { messages, fetchedAt: Date.now() });
+      }
+
+      // Background server sync
+      if (isOnline()) {
+        this.getMessages(userId, contactId, { limit, forceServerSync: true })
+          .then(serverMessages => {
+            messageCache.set(chatId, { messages: serverMessages, fetchedAt: Date.now() });
+          })
+          .catch(() => {});
+      }
+
+      return { messages, fromCache: true };
+    }
+
+    // STEP 3: Fetch from server (only if no local data)
+    const messages = await this.getMessages(userId, contactId, { limit, beforeTimestamp });
+    messageCache.set(chatId, { messages, fetchedAt: Date.now() });
+
+    return { messages, fromCache: false };
+  }
 };

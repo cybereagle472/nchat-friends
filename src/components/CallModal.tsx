@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Phone, PhoneOff, Mic, MicOff, Video, VideoOff, Volume2, RotateCcw, X } from 'lucide-react';
+import { Phone, PhoneOff, Mic, MicOff, Video, VideoOff, Volume2, RotateCcw, X, ChevronsRight } from 'lucide-react';
 import { callService } from '../services/callService';
 import { profileService } from '../services/profileService';
+import { playSafely, applyAudioOutput } from '../lib/webrtcMedia';
 import { UserProfile, Call } from '../types';
 
 interface CallModalProps {
@@ -12,10 +13,31 @@ interface CallModalProps {
   onClose: () => void;
 }
 
-export function CallModal({ currentUser, calleeId, callType, incomingCall, onClose }: CallModalProps) {
-  const [callState, setCallState] = useState<'initiating' | 'ringing' | 'connecting' | 'connected' | 'ended'>('initiating');
+// No one answers within this long → treat it as a missed call rather than
+// ringing forever.
+const RING_TIMEOUT_MS = 45_000;
+
+// Both sides exchanged their SDP answer and are now trying to actually
+// establish the WebRTC connection (ICE + DTLS). If that hasn't finished
+// within this long, something's genuinely stuck (most commonly both ends
+// are behind NAT/firewalls that need a TURN relay to talk, and no relay
+// managed to work) — rather than leaving "Connecting..." on screen forever
+// with no way to tell it's never going to finish, give up and say so.
+const CONNECTING_TIMEOUT_MS = 20_000;
+
+// `iceConnectionState`/`connectionState` dipping to 'disconnected' is often
+// just a brief blip (a missed STUN keepalive, a momentary network switch)
+// that recovers on its own a second later — ending the call the instant
+// that happens is more aggressive than necessary. Give it a short grace
+// window to self-heal before actually treating it as a real failure.
+const DISCONNECT_GRACE_MS = 6_000;
+
+export function CallModal({ calleeId, callType, incomingCall, onClose }: CallModalProps) {
+  const [callState, setCallState] = useState<'initiating' | 'ringing' | 'connecting' | 'connected' | 'ended' | 'declined' | 'missed' | 'failed'>('initiating');
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(callType === 'audio');
+  // Audio calls should default to the earpiece, like a normal phone call —
+  // not the loud external speaker — until the user explicitly taps Speaker.
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
   const [callDuration, setCallDuration] = useState(0);
   const [error, setError] = useState('');
@@ -23,10 +45,55 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  // Audio-only calls never render the <video> element that `remoteVideoRef`
+  // points to (it only exists in the video-call layout below), so the
+  // incoming audio track had nowhere to actually play — the call could
+  // connect, the timer would run, but neither side ever heard anything.
+  // This hidden <audio> element is always mounted for audio calls
+  // specifically so there's always somewhere for the remote track to go.
+  const remoteAudioRef = useRef<HTMLAudioElement>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const callIdRef = useRef<string | null>(null);
   const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const ringTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disconnectGraceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const eventSubRef = useRef<{ unsubscribe: () => void } | null>(null);
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const remoteDescriptionSetRef = useRef(false);
+  const endedRef = useRef(false);
+  // Whether the call ever actually reached 'connected' at least once —
+  // distinguishes "never managed to connect at all" (show the explicit
+  // failure message) from "was connected and then the network dropped"
+  // (just end the call normally, like any other hangup mid-call).
+  const everConnectedRef = useRef(false);
+  // Mirrors isSpeakerOn for the ontrack callback below, which is created
+  // once inside createPeerConnection and would otherwise close over a
+  // stale value instead of picking up later taps of the Speaker button.
+  const isSpeakerOnRef = useRef(false);
+
+  const clearRingTimeout = useCallback(() => {
+    if (ringTimeoutRef.current) {
+      clearTimeout(ringTimeoutRef.current);
+      ringTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearConnectingTimeout = useCallback(() => {
+    if (connectingTimeoutRef.current) {
+      clearTimeout(connectingTimeoutRef.current);
+      connectingTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearDisconnectGrace = useCallback(() => {
+    if (disconnectGraceRef.current) {
+      clearTimeout(disconnectGraceRef.current);
+      disconnectGraceRef.current = null;
+    }
+  }, []);
 
   const cleanupCall = useCallback(() => {
     if (localStreamRef.current) {
@@ -43,15 +110,48 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
       clearInterval(durationIntervalRef.current);
       durationIntervalRef.current = null;
     }
-  }, []);
 
-  const endCall = useCallback(async () => {
+    clearRingTimeout();
+    clearConnectingTimeout();
+    clearDisconnectGrace();
+
+    if (eventSubRef.current) {
+      eventSubRef.current.unsubscribe();
+      eventSubRef.current = null;
+    }
+
+    pendingCandidatesRef.current = [];
+    pendingRemoteCandidatesRef.current = [];
+    remoteDescriptionSetRef.current = false;
+  }, [clearRingTimeout, clearConnectingTimeout, clearDisconnectGrace]);
+
+  // status defaults to 'ended' (a normal hangup); pass 'missed' for an
+  // unanswered outgoing call or 'declined' when actively rejecting one.
+  const endCall = useCallback(async (status: 'ended' | 'missed' | 'declined' = 'ended') => {
+    if (endedRef.current) return;
+    endedRef.current = true;
     if (callIdRef.current) {
-      await callService.updateCallStatus(callIdRef.current, 'ended', callDuration);
+      await callService.endCall(callIdRef.current, status, callDuration);
     }
     cleanupCall();
-    setCallState('ended');
+    setCallState(status);
     setTimeout(onClose, 1500);
+  }, [callDuration, cleanupCall, onClose]);
+
+  // Both sides answered but the actual media connection never came
+  // together (see CONNECTING_TIMEOUT_MS) — tell the backend it's over
+  // (recorded as a normal 'ended' call, same as any other hangup) but show
+  // a clear "couldn't connect" message locally instead of silently closing
+  // or leaving "Connecting..." on screen with no explanation.
+  const failConnection = useCallback(async () => {
+    if (endedRef.current) return;
+    endedRef.current = true;
+    if (callIdRef.current) {
+      await callService.endCall(callIdRef.current, 'ended', callDuration);
+    }
+    cleanupCall();
+    setCallState('failed');
+    setTimeout(onClose, 2500);
   }, [callDuration, cleanupCall, onClose]);
 
   const initializeMedia = useCallback(async () => {
@@ -64,31 +164,76 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
     localStreamRef.current = result.data;
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = result.data;
+      playSafely(localVideoRef.current);
     }
 
     return result.data;
   }, [callType]);
 
-  const createPeerConnection = useCallback(() => {
-    const pc = callService.createPeerConnection(
-      async (candidate) => {
+  const createPeerConnection = useCallback(async () => {
+    const pc = await callService.createPeerConnection(
+      (candidate) => {
+        const json = candidate.toJSON();
         if (callIdRef.current) {
-          await callService.storeIceCandidate(callIdRef.current, currentUser.id, candidate.toJSON());
+          callService.sendIceCandidate(callIdRef.current, json);
+        } else {
+          // The offer/answer round trip hasn't finished yet (we don't have
+          // a call id back from the server), so queue it instead of
+          // silently dropping it — connectivity can otherwise fail
+          // intermittently depending on how fast ICE gathering runs.
+          pendingCandidatesRef.current.push(json);
         }
       },
       (stream) => {
+        // Only one of these two refs is ever actually mounted for a given
+        // call (video calls render the <video>, audio calls render the
+        // hidden <audio>), so this never double-plays the same stream
+        // through two elements at once.
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = stream;
+          playSafely(remoteVideoRef.current);
+        }
+        if (remoteAudioRef.current) {
+          remoteAudioRef.current.srcObject = stream;
+          playSafely(remoteAudioRef.current);
+          applyAudioOutput(remoteAudioRef.current, isSpeakerOnRef.current);
         }
       },
       (state) => {
         if (state === 'connected') {
+          everConnectedRef.current = true;
+          clearRingTimeout();
+          clearConnectingTimeout();
+          clearDisconnectGrace();
           setCallState('connected');
-          durationIntervalRef.current = setInterval(() => {
-            setCallDuration((prev) => prev + 1);
-          }, 1000);
-        } else if (state === 'failed' || state === 'disconnected') {
-          endCall();
+          if (!durationIntervalRef.current) {
+            durationIntervalRef.current = setInterval(() => {
+              setCallDuration((prev) => prev + 1);
+            }, 1000);
+          }
+        } else if (state === 'failed') {
+          clearDisconnectGrace();
+          if (everConnectedRef.current) {
+            endCall('ended');
+          } else {
+            failConnection();
+          }
+        } else if (state === 'disconnected') {
+          // Don't react to the very first blip — a missed keepalive or a
+          // brief network switch is common and usually recovers on its
+          // own within a second or two. Only treat it as a real failure
+          // if it's still disconnected once the grace window elapses (the
+          // 'connected' branch above cancels this if it recovers first).
+          if (!disconnectGraceRef.current) {
+            disconnectGraceRef.current = setTimeout(() => {
+              disconnectGraceRef.current = null;
+              if (everConnectedRef.current) {
+                endCall('ended');
+              } else {
+                failConnection();
+              }
+            }, DISCONNECT_GRACE_MS);
+          }
         }
       }
     );
@@ -98,11 +243,101 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
       localStreamRef.current.getTracks().forEach((track) => {
         pc.addTrack(track, localStreamRef.current!);
       });
+      // Keep audio clear/smooth even when video is also running by giving
+      // it priority and a bandwidth floor, and capping video so it can't
+      // crowd audio out on a constrained connection.
+      callService.prioritizeAudioQuality(pc);
     }
 
     peerConnectionRef.current = pc;
     return pc;
-  }, [currentUser.id, endCall]);
+  }, [clearRingTimeout, clearConnectingTimeout, clearDisconnectGrace, endCall, failConnection]);
+
+  // Arms (or re-arms) the "give up if this never actually connects" timer
+  // — called the moment both sides have exchanged SDP and are waiting on
+  // ICE/DTLS to finish, from both the caller's and callee's code paths.
+  const startConnectingTimeout = useCallback(() => {
+    clearConnectingTimeout();
+    connectingTimeoutRef.current = setTimeout(() => {
+      connectingTimeoutRef.current = null;
+      if (!everConnectedRef.current) failConnection();
+    }, CONNECTING_TIMEOUT_MS);
+  }, [clearConnectingTimeout, failConnection]);
+
+  // Apply any ICE candidates that arrived before we had a peer connection
+  // (or before its remote description was set) ready to accept them.
+  const flushPendingRemoteCandidates = useCallback(async (pc: RTCPeerConnection) => {
+    const queued = pendingRemoteCandidatesRef.current;
+    pendingRemoteCandidatesRef.current = [];
+    for (const candidate of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Stale/invalid by the time it's applied; safe to ignore.
+      }
+    }
+  }, []);
+
+  // Subscribed once per call id. Reads peerConnectionRef live (instead of
+  // closing over a `pc`) because for an incoming call this has to start
+  // listening the moment the phone starts ringing — well before the user
+  // taps Accept and a peer connection actually exists. That matters: the
+  // caller's ICE candidates start being broadcast immediately after the
+  // offer is sent, they don't wait for an answer, so if the callee only
+  // subscribed once answering (which can be several seconds into the ring,
+  // however long someone takes to notice and respond), every one of those
+  // early candidates would already be gone — leaving nothing for ICE to
+  // connect with, which is exactly why calls were stuck on "Connecting..."
+  // forever on both ends even after being picked up.
+  const subscribeToSignaling = useCallback((callId: string) => {
+    eventSubRef.current?.unsubscribe();
+    eventSubRef.current = callService.subscribeToCallEvents({
+      onCallAnswered: async (id, answerSdp) => {
+        if (id !== callId) return;
+        const pc = peerConnectionRef.current;
+        if (!pc) return;
+        await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
+        remoteDescriptionSetRef.current = true;
+        await flushPendingRemoteCandidates(pc);
+        // On a fast/local network, ICE can finish connecting *during* the
+        // awaits above (applying a backlog of already-queued remote
+        // candidates can be enough on its own) — if that already flipped
+        // the state to 'connected' via the peer connection's own state
+        // handler, don't stomp it back to 'connecting' here. This is
+        // exactly how one side could show "Connected" with the timer
+        // already running while the other side's screen stayed on
+        // "Connecting..." forever despite the call actually working.
+        if (!everConnectedRef.current) {
+          setCallState('connecting');
+          startConnectingTimeout();
+        }
+      },
+      onCallEnded: (id, status) => {
+        if (id !== callId || endedRef.current) return;
+        endedRef.current = true;
+        cleanupCall();
+        setCallState(status === 'declined' || status === 'missed' ? status : 'ended');
+        setTimeout(onClose, 1500);
+      },
+      onIceCandidate: async (id, candidate) => {
+        if (id !== callId) return;
+        const pc = peerConnectionRef.current;
+        if (!pc || !remoteDescriptionSetRef.current) {
+          // No peer connection yet (still ringing) or its remote
+          // description isn't set yet — hold onto it instead of dropping
+          // it; it gets applied as soon as both are ready.
+          pendingRemoteCandidatesRef.current.push(candidate);
+          return;
+        }
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch {
+          // A candidate can legitimately arrive right as the connection is
+          // closing; safe to ignore.
+        }
+      },
+    });
+  }, [cleanupCall, flushPendingRemoteCandidates, onClose, startConnectingTimeout]);
 
   const initiateCall = useCallback(async () => {
     if (!calleeId) return;
@@ -112,47 +347,52 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
       setRemoteUser(profile);
 
       await initializeMedia();
+      const pc = await createPeerConnection();
 
-      const result = await callService.initiateCall(currentUser.id, calleeId, callType);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const result = await callService.initiateCall(calleeId, callType, offer);
       if (!result.success || !result.data) {
         setError(result.error || 'Failed to initiate call');
+        cleanupCall();
+        setTimeout(onClose, 2000);
+        return;
+      }
+
+      // The user may have already hit "cancel" while that request was in
+      // flight (closing the local UI and the peer connection along with
+      // it) — in that case the call row that just got created server-side,
+      // and the person we were calling, both need to be told it's over
+      // too, instead of ringing with no way to stop it.
+      if (endedRef.current) {
+        await callService.endCall(result.data.id, 'ended');
         return;
       }
 
       callIdRef.current = result.data.id;
-      const pc = createPeerConnection();
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await callService.storeOffer(result.data.id, offer);
+      // Flush any ICE candidates that were gathered before we had a call id.
+      if (pendingCandidatesRef.current.length > 0) {
+        pendingCandidatesRef.current.forEach((c) => callService.sendIceCandidate(result.data!.id, c));
+        pendingCandidatesRef.current = [];
+      }
 
       setCallState('ringing');
+      subscribeToSignaling(result.data.id);
 
-      // Subscribe to call events
-      callService.subscribeToCallEvents(currentUser.id, {
-        onCallAnswered: async (callId, answerSdp) => {
-          if (callId === callIdRef.current) {
-            await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
-            setCallState('connecting');
-          }
-        },
-        onCallEnded: (callId) => {
-          if (callId === callIdRef.current) {
-            endCall();
-          }
-        },
-        onIceCandidate: async (callId, candidate) => {
-          if (callId === callIdRef.current) {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          }
-        }
-      });
+      // No call-waiting / voicemail — if nobody answers in time, give up
+      // and record it as missed rather than ringing forever.
+      ringTimeoutRef.current = setTimeout(() => endCall('missed'), RING_TIMEOUT_MS);
     } catch (err: any) {
       console.error('Error initiating call:', err);
       setError('Failed to initiate call');
+      // We may or may not have created the call row yet — either way, make
+      // sure the callee isn't left ringing with no way to know we gave up.
+      if (callIdRef.current) await callService.endCall(callIdRef.current, 'ended');
+      cleanupCall();
       setTimeout(onClose, 2000);
     }
-  }, [calleeId, callType, createPeerConnection, currentUser.id, endCall, initializeMedia, onClose]);
+  }, [calleeId, callType, cleanupCall, createPeerConnection, endCall, initializeMedia, onClose, subscribeToSignaling]);
 
   const answerCall = useCallback(async () => {
     if (!incomingCall) return;
@@ -160,55 +400,114 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
     try {
       callIdRef.current = incomingCall.id;
 
-      const profile = await profileService.getProfile(incomingCall.caller_id);
-      setRemoteUser(profile);
+      // remoteUser was already set from the incoming-call event (or a
+      // fallback fetch) as soon as the ringing screen appeared.
+      if (!remoteUser) {
+        const profile = await profileService.getProfile(incomingCall.caller_id);
+        setRemoteUser(profile);
+      }
 
       await initializeMedia();
 
-      const pc = createPeerConnection();
+      const pc = await createPeerConnection();
 
       if (incomingCall.offer_sdp) {
         await pc.setRemoteDescription(new RTCSessionDescription(incomingCall.offer_sdp));
+        remoteDescriptionSetRef.current = true;
+        // We've been subscribed to signaling (and possibly collecting the
+        // caller's ICE candidates) since the phone started ringing, well
+        // before this peer connection existed — apply whatever came in
+        // during that wait now that there's somewhere to put it.
+        await flushPendingRemoteCandidates(pc);
       }
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await callService.storeAnswer(incomingCall.id, answer);
 
-      setCallState('connecting');
+      // This was previously called without checking its result at all —
+      // if the POST actually failed server-side (most commonly a 409
+      // because the caller had already hung up right as Accept was
+      // tapped), the code just carried on as if it had succeeded, leaving
+      // this side showing "Connecting..." against a caller who was never
+      // actually told we answered and so never sends an SDP/ICE exchange
+      // back. That silent-failure gap is one way the two sides' screens
+      // could end up disagreeing about whether the call ever connected.
+      const answerResult = await callService.answerCall(incomingCall.id, answer);
+      if (!answerResult.success) {
+        // Most likely the call is simply already over on the other end —
+        // nothing left to connect to, so just close quietly rather than
+        // reporting anything back (there's no one left to report it to).
+        endedRef.current = true;
+        cleanupCall();
+        setTimeout(onClose, 1000);
+        return;
+      }
 
-      // Subscribe to ICE candidates
-      callService.subscribeToCallEvents(currentUser.id, {
-        onIceCandidate: async (callId, candidate) => {
-          if (callId === incomingCall.id) {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          }
-        },
-        onCallEnded: (callId) => {
-          if (callId === incomingCall.id) {
-            endCall();
-          }
-        }
-      });
+      // Same guard as the caller's onCallAnswered handler — ICE/DTLS can
+      // genuinely finish while the `answerCall` request above was still in
+      // flight (everything it needed, including the caller's queued
+      // candidates, was already applied just before this), so don't
+      // overwrite an already-'connected' state back to 'connecting'.
+      if (!everConnectedRef.current) {
+        setCallState('connecting');
+        startConnectingTimeout();
+      }
+      // Already subscribed to signaling since the ringing screen appeared
+      // (see the mount effect below) — no need to subscribe again here.
     } catch (err: any) {
       console.error('Error answering call:', err);
       setError('Failed to answer call');
+      // This is a genuine local failure (camera/mic error, a bad offer,
+      // etc.) — we never actually managed to join, which is a dropped
+      // call, not a deliberate decline. Reporting it as 'declined' here
+      // used to make the caller's screen say "declined" for something
+      // that had nothing to do with anyone actually rejecting the call.
+      endedRef.current = true;
+      if (callIdRef.current) {
+        await callService.endCall(callIdRef.current, 'ended');
+      }
+      cleanupCall();
       setTimeout(onClose, 2000);
     }
-  }, [createPeerConnection, currentUser.id, endCall, incomingCall, initializeMedia, onClose]);
+  }, [cleanupCall, createPeerConnection, flushPendingRemoteCandidates, incomingCall, initializeMedia, onClose, remoteUser, startConnectingTimeout]);
 
   const declineCall = useCallback(async () => {
     if (incomingCall) {
-      await callService.updateCallStatus(incomingCall.id, 'declined');
+      endedRef.current = true;
+      await callService.endCall(incomingCall.id, 'declined');
     }
     cleanupCall();
     onClose();
   }, [cleanupCall, incomingCall, onClose]);
 
+  // The X / close button means different things depending on where we are
+  // in the call lifecycle — always treat it as *some* explicit hangup
+  // action instead of just closing the local modal and leaving the other
+  // side hanging.
+  const handleCloseButton = useCallback(() => {
+    if (incomingCall && callState === 'ringing') {
+      declineCall();
+    } else {
+      endCall('ended');
+    }
+  }, [callState, declineCall, endCall, incomingCall]);
+
   useEffect(() => {
     if (incomingCall) {
       setCallState('ringing');
-      profileService.getProfile(incomingCall.caller_id).then(setRemoteUser);
+      // Show the embedded caller profile immediately (no network round
+      // trip needed for the ringing screen to have a name/avatar); only
+      // fall back to fetching it if it wasn't included for some reason.
+      if (incomingCall.caller_profile) {
+        setRemoteUser(incomingCall.caller_profile);
+      } else {
+        profileService.getProfile(incomingCall.caller_id).then(setRemoteUser);
+      }
+      // Start listening for the caller's ICE candidates right away, not
+      // only once Accept is tapped — see subscribeToSignaling's comment
+      // for why that gap was silently breaking every call's connection.
+      callIdRef.current = incomingCall.id;
+      subscribeToSignaling(incomingCall.id);
     } else if (calleeId) {
       initiateCall();
     }
@@ -216,31 +515,45 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
     return () => {
       cleanupCall();
     };
-  }, [calleeId, cleanupCall, incomingCall, initiateCall]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [calleeId, incomingCall]);
 
+  // Toggles every audio/video track this call actually has, rather than
+  // just whatever's on localStreamRef — on at least one real-device test
+  // the Mute button visibly flipped its own icon but didn't actually stop
+  // sending audio, which points at the local MediaStream's track not being
+  // the exact same instance the peer connection's sender was still sending
+  // (possible on some mobile browsers when a device is swapped/recreated
+  // mid-setup). Walking the RTCPeerConnection's own senders directly, in
+  // addition to the local stream, means the one actually being transmitted
+  // always gets toggled too, regardless of which reference ends up stale.
   const toggleMute = () => {
-    if (localStreamRef.current) {
-      const audioTrack = localStreamRef.current.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled;
-        setIsMuted(!audioTrack.enabled);
-      }
-    }
+    const nextMuted = !isMuted;
+    const audioTracks = new Set<MediaStreamTrack>();
+    localStreamRef.current?.getAudioTracks().forEach((t) => audioTracks.add(t));
+    peerConnectionRef.current?.getSenders().forEach((sender) => {
+      if (sender.track?.kind === 'audio') audioTracks.add(sender.track);
+    });
+    audioTracks.forEach((t) => { t.enabled = !nextMuted; });
+    setIsMuted(nextMuted);
   };
 
   const toggleVideo = () => {
-    if (localStreamRef.current) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.enabled = !videoTrack.enabled;
-        setIsVideoOff(!videoTrack.enabled);
-      }
-    }
+    const nextVideoOff = !isVideoOff;
+    const videoTracks = new Set<MediaStreamTrack>();
+    localStreamRef.current?.getVideoTracks().forEach((t) => videoTracks.add(t));
+    peerConnectionRef.current?.getSenders().forEach((sender) => {
+      if (sender.track?.kind === 'video') videoTracks.add(sender.track);
+    });
+    videoTracks.forEach((t) => { t.enabled = !nextVideoOff; });
+    setIsVideoOff(nextVideoOff);
   };
 
   const toggleSpeaker = () => {
-    setIsSpeakerOn(!isSpeakerOn);
-    // In a real implementation, you'd switch audio output here
+    const next = !isSpeakerOn;
+    isSpeakerOnRef.current = next;
+    setIsSpeakerOn(next);
+    applyAudioOutput(remoteAudioRef.current, next);
   };
 
   const formatDuration = (seconds: number) => {
@@ -257,6 +570,9 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
       case 'connecting': return 'Connecting...';
       case 'connected': return formatDuration(callDuration);
       case 'ended': return 'Call ended';
+      case 'declined': return incomingCall ? 'Call declined' : `${remoteUser?.full_name || 'They'} declined`;
+      case 'missed': return 'No answer';
+      case 'failed': return 'Couldn\u2019t connect \u2014 check your connection';
       default: return '';
     }
   };
@@ -297,7 +613,7 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
           <div className="absolute top-0 left-0 right-0 p-4 safe-area-inset-top">
             <div className="flex items-center justify-between">
               <button
-                onClick={onClose}
+                onClick={handleCloseButton}
                 className="w-10 h-10 rounded-full bg-white/10 backdrop-blur-sm flex items-center justify-center text-white"
               >
                 <X className="w-5 h-5" />
@@ -314,13 +630,13 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
           <div className="absolute bottom-0 left-0 right-0 p-6 pb-10 safe-area-inset-bottom">
             {incomingCall && callState === 'ringing' ? (
               <IncomingCallControls onDecline={declineCall} onAnswer={answerCall} />
-            ) : (
+            ) : callState === 'ended' || callState === 'declined' || callState === 'missed' || callState === 'failed' ? null : (
               <VideoCallControls
                 isMuted={isMuted}
                 isVideoOff={isVideoOff}
                 onToggleMute={toggleMute}
                 onToggleVideo={toggleVideo}
-                onEndCall={endCall}
+                onEndCall={() => endCall('ended')}
                 onFlipCamera={() => {}}
               />
             )}
@@ -329,6 +645,13 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
       ) : (
         /* Audio Call View */
         <div className="relative w-full h-full flex flex-col">
+          {/* Not visible by design — this is purely so the remote party's
+              audio track has an element to actually play through. Without
+              it, an audio call could reach "Connected" and run its timer
+              with neither side ever hearing anything, since nothing was
+              ever attached to the incoming audio track. */}
+          <audio ref={remoteAudioRef} autoPlay playsInline />
+
           {/* Background Pattern */}
           <div className="absolute inset-0 overflow-hidden">
             <div className="absolute top-1/4 left-1/2 -translate-x-1/2 w-[600px] h-[600px] rounded-full bg-gradient-to-br from-violet-500/20 to-purple-600/20 blur-3xl" />
@@ -338,7 +661,7 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
           {/* Close Button */}
           <div className="absolute top-4 left-4 z-10 safe-area-inset-top">
             <button
-              onClick={onClose}
+              onClick={handleCloseButton}
               className="w-10 h-10 rounded-full bg-white/10 backdrop-blur-sm flex items-center justify-center text-white hover:bg-white/20 transition-colors"
             >
               <X className="w-5 h-5" />
@@ -392,7 +715,7 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
               <p className={`text-lg ${
                 callState === 'connected'
                   ? 'text-green-400 font-semibold tabular-nums'
-                  : error
+                  : error || callState === 'failed'
                     ? 'text-red-400'
                     : 'text-white/70'
               }`}>
@@ -405,13 +728,13 @@ export function CallModal({ currentUser, calleeId, callType, incomingCall, onClo
           <div className="px-6 pb-12 safe-area-inset-bottom relative z-10">
             {incomingCall && callState === 'ringing' ? (
               <IncomingCallControls onDecline={declineCall} onAnswer={answerCall} />
-            ) : (
+            ) : callState === 'ended' || callState === 'declined' || callState === 'missed' || callState === 'failed' ? null : (
               <AudioCallControls
                 isMuted={isMuted}
                 isSpeakerOn={isSpeakerOn}
                 onToggleMute={toggleMute}
                 onToggleSpeaker={toggleSpeaker}
-                onEndCall={endCall}
+                onEndCall={() => endCall('ended')}
               />
             )}
           </div>
@@ -430,28 +753,171 @@ function IncomingCallControls({
   onAnswer: () => void;
 }) {
   return (
-    <div className="flex items-center justify-center gap-16">
+    <div className="flex flex-col items-center gap-8 w-full">
       {/* Decline Button */}
       <div className="flex flex-col items-center gap-2">
         <button
           onClick={onDecline}
-          className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 active:scale-95 transition-all"
+          className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 hover:scale-105 active:scale-90 active:shadow-red-500/70 transition-all duration-150"
         >
           <PhoneOff className="w-7 h-7" />
         </button>
         <span className="text-white/70 text-sm">Decline</span>
       </div>
 
-      {/* Answer Button */}
-      <div className="flex flex-col items-center gap-2">
-        <button
-          onClick={onAnswer}
-          className="w-16 h-16 rounded-full bg-green-500 flex items-center justify-center text-white shadow-lg shadow-green-500/40 hover:bg-green-600 active:scale-95 transition-all animate-pulse"
-        >
-          <Phone className="w-7 h-7" />
-        </button>
-        <span className="text-white/70 text-sm">Accept</span>
+      {/* Slide to answer */}
+      <SlideToAnswer onAnswer={onAnswer} />
+    </div>
+  );
+}
+
+// Slide-to-answer gesture control. A plain tappable button answered the
+// call the instant it was touched, with barely any visible feedback that
+// anything had happened — easy to trigger by accident and didn't feel
+// like a deliberate action. Dragging the handle all the way across gives
+// continuous, obvious visual feedback the whole time (the handle follows
+// your finger exactly, the track fills in as you go) and makes answering
+// a clear, intentional gesture instead of a single ambiguous tap.
+function SlideToAnswer({ onAnswer }: { onAnswer: () => void }) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const handleRef = useRef<HTMLButtonElement>(null);
+  const fillRef = useRef<HTMLDivElement>(null);
+  const hintRef = useRef<HTMLDivElement>(null);
+  const dragXRef = useRef(0);
+  const trackWidthRef = useRef(1);
+  const maxDragRef = useRef(1);
+  const originXRef = useRef(0);
+  const draggingRef = useRef(false);
+  const completedRef = useRef(false);
+  // Coalesces pointermove into at most one DOM write per animation frame.
+  // Pointer events can fire well above display refresh rate (high-polling
+  // touch/mouse hardware easily hits 120-240Hz); writing styles on every
+  // single one does strictly wasted work the compositor throws away
+  // anyway, and that extra work is exactly what was eating into frame
+  // budget and making the drag look like it was skipping/lagging behind
+  // the finger instead of tracking it 1:1.
+  const rafRef = useRef<number | null>(null);
+
+  const HANDLE_SIZE = 56;
+
+  // Pure transform-based positioning (translate3d + scaleX) — never
+  // touches `width`, `left`, or anything else that forces layout. Layout
+  // properties force the browser to re-measure the whole box tree before
+  // it can even get to painting, which is the single biggest source of
+  // per-frame jank in drag gestures; transform/opacity changes are
+  // compositor-only and can be handled entirely on the GPU thread, so
+  // they stay smooth even if the main thread is briefly busy.
+  const applyPosition = (x: number, animate: boolean) => {
+    const handle = handleRef.current;
+    const fill = fillRef.current;
+    const hint = hintRef.current;
+    const transition = animate ? 'transform 180ms cubic-bezier(0.22, 1, 0.36, 1)' : 'none';
+    if (handle) {
+      handle.style.transition = transition;
+      handle.style.transform = `translate3d(${x}px, 0, 0)`;
+    }
+    if (fill) {
+      fill.style.transition = transition;
+      const scale = (x + HANDLE_SIZE / 2) / trackWidthRef.current;
+      fill.style.transform = `scaleX(${Math.min(1, Math.max(0, scale))})`;
+    }
+    if (hint) {
+      const progress = maxDragRef.current > 0 ? x / maxDragRef.current : 0;
+      hint.style.opacity = String(Math.max(0, 1 - progress * 1.6));
+    }
+  };
+
+  const recalcTrack = () => {
+    const track = trackRef.current;
+    if (!track) return;
+    trackWidthRef.current = Math.max(1, track.clientWidth);
+    maxDragRef.current = Math.max(1, track.clientWidth - HANDLE_SIZE);
+  };
+
+  useEffect(() => {
+    recalcTrack();
+    applyPosition(0, false);
+    window.addEventListener('resize', recalcTrack);
+    return () => {
+      window.removeEventListener('resize', recalcTrack);
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const scheduleApply = () => {
+    if (rafRef.current != null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      applyPosition(dragXRef.current, false);
+    });
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (completedRef.current) return;
+    recalcTrack();
+    originXRef.current = e.clientX - dragXRef.current;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    draggingRef.current = true;
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (!draggingRef.current || completedRef.current) return;
+    const next = Math.min(Math.max(0, e.clientX - originXRef.current), maxDragRef.current);
+    dragXRef.current = next;
+    scheduleApply();
+  };
+
+  const finishDrag = () => {
+    if (completedRef.current || !draggingRef.current) return;
+    draggingRef.current = false;
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    if (dragXRef.current / maxDragRef.current > 0.7) {
+      completedRef.current = true;
+      dragXRef.current = maxDragRef.current;
+      applyPosition(maxDragRef.current, true);
+      onAnswer();
+    } else {
+      dragXRef.current = 0;
+      applyPosition(0, true);
+    }
+  };
+
+  return (
+    <div
+      ref={trackRef}
+      className="relative h-14 w-full max-w-sm rounded-full bg-white/15 backdrop-blur-sm overflow-hidden select-none touch-none"
+    >
+      {/* Fill trailing the handle, scaled from the left edge instead of
+          resized, so it's a pure compositor transform like the handle. */}
+      <div
+        ref={fillRef}
+        className="absolute inset-0 bg-green-500/30 rounded-full pointer-events-none origin-left will-change-transform"
+        style={{ transform: `scaleX(${HANDLE_SIZE / 2 / trackWidthRef.current})` }}
+      />
+      {/* Hint text, fades out as the handle covers it */}
+      <div
+        ref={hintRef}
+        className="absolute inset-0 flex items-center justify-center gap-1 text-white/80 text-sm font-medium pointer-events-none"
+      >
+        <span>Slide to answer</span>
+        <ChevronsRight className="w-4 h-4 animate-pulse" />
       </div>
+      {/* Draggable handle */}
+      <button
+        ref={handleRef}
+        aria-label="Slide to answer call"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={finishDrag}
+        onPointerCancel={finishDrag}
+        className="absolute top-0 left-0 w-14 h-14 rounded-full bg-green-500 flex items-center justify-center text-white shadow-lg shadow-green-500/40 touch-none will-change-transform"
+      >
+        <Phone className="w-6 h-6" />
+      </button>
     </div>
   );
 }
@@ -476,7 +942,7 @@ function AudioCallControls({
       <div className="flex flex-col items-center gap-2">
         <button
           onClick={onToggleMute}
-          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all active:scale-95 ${
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-150 hover:scale-105 active:scale-90 ${
             isMuted
               ? 'bg-white text-slate-900'
               : 'bg-white/15 backdrop-blur-sm text-white hover:bg-white/25'
@@ -491,7 +957,7 @@ function AudioCallControls({
       <div className="flex flex-col items-center gap-2">
         <button
           onClick={onEndCall}
-          className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 active:scale-95 transition-all"
+          className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 hover:scale-105 active:scale-90 active:shadow-red-500/70 transition-all duration-150"
         >
           <PhoneOff className="w-7 h-7" />
         </button>
@@ -502,7 +968,7 @@ function AudioCallControls({
       <div className="flex flex-col items-center gap-2">
         <button
           onClick={onToggleSpeaker}
-          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all active:scale-95 ${
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-150 hover:scale-105 active:scale-90 ${
             isSpeakerOn
               ? 'bg-white text-slate-900'
               : 'bg-white/15 backdrop-blur-sm text-white hover:bg-white/25'
@@ -537,7 +1003,7 @@ function VideoCallControls({
       {/* Flip Camera */}
       <button
         onClick={onFlipCamera}
-        className="w-12 h-12 rounded-full bg-white/15 backdrop-blur-sm flex items-center justify-center text-white hover:bg-white/25 active:scale-95 transition-all"
+        className="w-12 h-12 rounded-full bg-white/15 backdrop-blur-sm flex items-center justify-center text-white hover:bg-white/25 hover:scale-105 active:scale-90 transition-all duration-150"
       >
         <RotateCcw className="w-5 h-5" />
       </button>
@@ -545,7 +1011,7 @@ function VideoCallControls({
       {/* Toggle Video */}
       <button
         onClick={onToggleVideo}
-        className={`w-12 h-12 rounded-full flex items-center justify-center transition-all active:scale-95 ${
+        className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-150 hover:scale-105 active:scale-90 ${
           isVideoOff
             ? 'bg-white text-slate-900'
             : 'bg-white/15 backdrop-blur-sm text-white hover:bg-white/25'
@@ -557,7 +1023,7 @@ function VideoCallControls({
       {/* Toggle Mute */}
       <button
         onClick={onToggleMute}
-        className={`w-12 h-12 rounded-full flex items-center justify-center transition-all active:scale-95 ${
+        className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-150 hover:scale-105 active:scale-90 ${
           isMuted
             ? 'bg-white text-slate-900'
             : 'bg-white/15 backdrop-blur-sm text-white hover:bg-white/25'
@@ -569,7 +1035,7 @@ function VideoCallControls({
       {/* End Call */}
       <button
         onClick={onEndCall}
-        className="w-14 h-14 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 active:scale-95 transition-all"
+        className="w-14 h-14 rounded-full bg-red-500 flex items-center justify-center text-white shadow-lg shadow-red-500/40 hover:bg-red-600 hover:scale-105 active:scale-90 active:shadow-red-500/70 transition-all duration-150"
       >
         <PhoneOff className="w-6 h-6" />
       </button>

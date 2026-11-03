@@ -14,8 +14,8 @@ import { friendService } from '../services/friendService';
 import { groupService, GroupWithMembers } from '../services/groupService';
 import { callService } from '../services/callService';
 import { profileService } from '../services/profileService';
-import { Contact, UserProfile, FriendRequest, CallHistory } from '../types';
-import { api, convex } from '../lib/convexClient';
+import { Contact, UserProfile, FriendRequest, CallHistory, Message } from '../types';
+import { realtimeClient } from '../lib/realtimeClient';
 
 // ============================================
 // INSTANT CACHE UTILITIES
@@ -142,7 +142,57 @@ const INITIAL_DATA: AppData = {
 // Global in-memory cache - persists across re-renders
 let globalCache: AppData = { ...INITIAL_DATA };
 
-export function useAppData(userId: string) {
+// Run the one-time local-storage repair (see chatService.repairLocalMessageStore)
+// at most once per page load, regardless of how many times useAppData mounts.
+let localMessageStoreRepaired = false;
+
+/**
+ * Merge a freshly-fetched (server-authoritative) chat list with whatever is
+ * already in local state, without ever letting the fetch regress a chat the
+ * client already knows more about.
+ *
+ * getChatList() is called from several places (initial load, periodic
+ * friends/requests refreshes, pull-to-refresh) that can land at any time,
+ * including moments after a live message or read-receipt event already
+ * patched `unreadCount`/`lastMessage` in place locally. If that local patch
+ * happens to be newer than what this particular fetch captured (a normal
+ * race — the fetch was in flight before the live event landed, or the
+ * server's own read model hasn't caught up with a write that just
+ * happened), blindly replacing the whole list with the fetch's result would
+ * snap an already-correct unread badge back to a stale value, making it
+ * flicker or disappear for no reason visible to the user.
+ */
+function mergeChatLists(serverChats: Contact[], localChats: Contact[]): Contact[] {
+  if (localChats.length === 0) return serverChats;
+  const localByUser = new Map(localChats.map(c => [c.user_id, c]));
+
+  return serverChats.map(serverChat => {
+    const local = localByUser.get(serverChat.user_id);
+    if (!local) return serverChat;
+
+    const serverTime = serverChat.lastMessage ? new Date(serverChat.lastMessage.created_at).getTime() : 0;
+    const localTime = local.lastMessage ? new Date(local.lastMessage.created_at).getTime() : 0;
+
+    if (localTime > serverTime) {
+      // Local state has seen a newer message than this fetch did — trust
+      // its lastMessage/unreadCount instead of overwriting them.
+      return { ...serverChat, lastMessage: local.lastMessage, unreadCount: local.unreadCount };
+    }
+
+    if (localTime === serverTime && (local.unreadCount || 0) !== (serverChat.unreadCount || 0)) {
+      // Same latest message, but the unread counts disagree (e.g. the
+      // client already zeroed it on open while this fetch still reflects
+      // the pre-read-receipt count) — prefer whichever is lower, since the
+      // only way they'd disagree here is one side already knowing about a
+      // read that the other hasn't caught up with yet.
+      return { ...serverChat, unreadCount: Math.min(local.unreadCount || 0, serverChat.unreadCount || 0) };
+    }
+
+    return serverChat;
+  });
+}
+
+export function useAppData(userId: string, activeChatUserId?: string | null) {
   // INSTANT: Try localStorage cache first (synchronous, 0ms)
   const [data, setData] = useState<AppData>(() => {
     // First check global memory cache
@@ -164,11 +214,26 @@ export function useAppData(userId: string) {
   const subscriptionsRef = useRef<Array<{ unsubscribe: () => void }>>([]);
   const isLoadingRef = useRef(false);
 
-  // Update both state and global cache, and save to localStorage
-  const updateData = useCallback((updates: Partial<AppData>) => {
-    globalCache = { ...globalCache, ...updates };
+  // The chat the user currently has open (if any) — used so a live message
+  // from that exact contact never spuriously bumps the unread badge for a
+  // conversation the user is already looking at.
+  const activeChatUserIdRef = useRef<string | null>(activeChatUserId ?? null);
+  useEffect(() => {
+    activeChatUserIdRef.current = activeChatUserId ?? null;
+  }, [activeChatUserId]);
+
+  // Update both state and global cache, and save to localStorage. Accepts
+  // either a plain partial object or an updater function (needed for
+  // patches that must read the latest `chats` array, e.g. live message
+  // events, without racing other state updates).
+  const updateData = useCallback((updates: Partial<AppData> | ((prev: AppData) => Partial<AppData>)) => {
     setData(prev => {
-      const newData = { ...prev, ...updates };
+      const patch = typeof updates === 'function' ? updates(prev) : updates;
+      // Bail out without triggering a re-render if the patch is a no-op
+      // (e.g. a live event for a chat that isn't in the list to patch).
+      if (!patch || Object.keys(patch).length === 0) return prev;
+      const newData = { ...prev, ...patch };
+      globalCache = newData;
       // Save to localStorage for instant load next time
       saveInstantCache(userId, newData);
       return newData;
@@ -193,7 +258,7 @@ export function useAppData(userId: string) {
         groupService.getUserGroups(userId),
         friendService.getRequests(userId),
         profileService.getAllProfiles(),
-        callService.getCallHistory(userId)
+        callService.getCallHistory()
       ]);
 
       // Process friends
@@ -284,8 +349,8 @@ export function useAppData(userId: string) {
         }
       }
 
-      updateData({
-        chats,
+      updateData(prev => ({
+        chats: mergeChatLists(chats, prev.chats),
         friends,
         groups,
         friendRequests,
@@ -293,7 +358,7 @@ export function useAppData(userId: string) {
         sentRequestIds,
         callHistory: historyItems,
         isReady: true
-      });
+      }));
 
     } catch (error) {
       console.error('Error loading app data:', error);
@@ -308,9 +373,116 @@ export function useAppData(userId: string) {
     const friendIds = data.friends.map(f => f.id);
     if (friendIds.length > 0) {
       const chats = await chatService.getChatList(userId, friendIds);
-      updateData({ chats });
+      updateData(prev => ({ chats: mergeChatLists(chats, prev.chats) }));
     }
   }, [userId, data.friends, updateData]);
+
+  // Debounced fallback used only when a live message event can't be applied
+  // in place (e.g. a brand-new chat we don't have a Contact entry for yet).
+  const refreshChatsRef = useRef(refreshChats);
+  useEffect(() => {
+    refreshChatsRef.current = refreshChats;
+  }, [refreshChats]);
+  const fallbackRefreshChats = useMemo(() => debounce(() => refreshChatsRef.current(), 300), []);
+
+  // Patch the Chats list instantly from a live message event — no network
+  // round trip, so the list feels exactly as instant as an open
+  // conversation. Falls back to a full (debounced) refresh only if the
+  // chat isn't in the list yet (e.g. very first message with a new friend).
+  const applyIncomingMessage = useCallback((message: Message) => {
+    const otherUserId = message.sender_id === userId ? message.receiver_id : message.sender_id;
+    const isIncoming = message.receiver_id === userId;
+    const isActivelyViewing = isIncoming && activeChatUserIdRef.current === message.sender_id;
+
+    // Keep chatService's per-conversation message cache warm even while that
+    // chat is closed. Without this, opening the chat afterwards has to rely
+    // on a full server round trip to pick up messages that arrived while it
+    // was shut, and would show a stale list for a moment in the meantime.
+    // (Idempotent — if ChatView is open for this exact chat it will have
+    // already applied the same update itself.)
+    chatService.updateCache(userId, otherUserId, message);
+    // Also persist it to IndexedDB right away so local storage has it even
+    // if the chat never gets opened again before the app is reloaded.
+    chatService.persistIncomingMessage(userId, otherUserId, message).catch(() => {});
+
+    updateData((prev) => {
+      const idx = prev.chats.findIndex(c => c.user_id === otherUserId);
+      if (idx === -1) {
+        // Unknown contact yet — fetch the real chat list so the new
+        // conversation (with its profile) appears correctly.
+        fallbackRefreshChats();
+        return {};
+      }
+
+      const existing = prev.chats[idx];
+      const updatedChat: Contact = {
+        ...existing,
+        lastMessage: message,
+        unreadCount: isActivelyViewing
+          ? 0
+          : isIncoming
+            ? (existing.unreadCount || 0) + 1
+            : existing.unreadCount
+      };
+
+      // Move the updated chat to the top (most recent conversation first),
+      // matching how the server list is already sorted.
+      const rest = prev.chats.filter((_, i) => i !== idx);
+      return { chats: [updatedChat, ...rest] };
+    });
+  }, [userId, updateData, fallbackRefreshChats]);
+
+  // Patch an edited/deleted message or a new reaction into the Chats list
+  // preview, if it happens to be that chat's last message.
+  const applyMessageUpdate = useCallback((updated: Message) => {
+    updateData((prev) => {
+      const idx = prev.chats.findIndex(c => c.lastMessage?.id === updated.id);
+      if (idx === -1) return {};
+      const nextChats = [...prev.chats];
+      nextChats[idx] = {
+        ...nextChats[idx],
+        lastMessage: { ...(nextChats[idx].lastMessage as Message), ...updated }
+      };
+      return { chats: nextChats };
+    });
+  }, [updateData]);
+
+  // Patch the "seen" tick instantly when the other person reads messages we
+  // sent them — this is what makes delivery status visible outside an open
+  // chat (previously nothing ever told the Chats list about read receipts).
+  const applyReadReceipt = useCallback((readerId: string, messageIds: string[]) => {
+    updateData((prev) => {
+      const idx = prev.chats.findIndex(c => c.user_id === readerId);
+      if (idx === -1) return {};
+      const chat = prev.chats[idx];
+      if (!chat.lastMessage || !messageIds.includes(chat.lastMessage.id)) return {};
+      const nextChats = [...prev.chats];
+      nextChats[idx] = { ...chat, lastMessage: { ...chat.lastMessage, is_read: true } };
+      return { chats: nextChats };
+    });
+  }, [updateData]);
+
+  // Instantly zero a chat's unread badge — called the moment a conversation
+  // is opened, rather than waiting for the next full chats refresh (which
+  // could otherwise race with the server-side mark-as-read call and leave a
+  // stale unread count showing after the user already read everything).
+  const markChatRead = useCallback((contactId: string) => {
+    updateData((prev) => {
+      const idx = prev.chats.findIndex(c => c.user_id === contactId);
+      if (idx === -1) return {};
+      const chat = prev.chats[idx];
+      if (!chat.unreadCount && (!chat.lastMessage || chat.lastMessage.is_read)) return {};
+      const nextChats = [...prev.chats];
+      nextChats[idx] = {
+        ...chat,
+        unreadCount: 0,
+        lastMessage: chat.lastMessage && chat.lastMessage.receiver_id === userId
+          ? { ...chat.lastMessage, is_read: true }
+          : chat.lastMessage
+      };
+      return { chats: nextChats };
+    });
+  }, [userId, updateData]);
 
   const refreshFriends = useCallback(async () => {
     const result = await friendService.getFriends(userId);
@@ -323,7 +495,7 @@ export function useAppData(userId: string) {
       // Also refresh chats since friend list changed
       if (result.data.friendIds.length > 0) {
         const chats = await chatService.getChatList(userId, result.data.friendIds);
-        updateData({ chats });
+        updateData(prev => ({ chats: mergeChatLists(chats, prev.chats) }));
       }
     }
   }, [userId, updateData]);
@@ -334,6 +506,23 @@ export function useAppData(userId: string) {
       updateData({ groups: result.data });
     }
   }, [userId, updateData]);
+
+  // Instantly zero a group's unread badge the moment it's opened — same
+  // reasoning as markChatRead above: GroupChatView's own
+  // groupService.markAsRead() call races the next debounced groups
+  // refetch (up to 45s away), which would otherwise leave a stale badge
+  // showing on a group the user is already looking at.
+  const markGroupRead = useCallback((groupId: string) => {
+    updateData((prev) => {
+      const idx = prev.groups.findIndex(g => g.id === groupId);
+      if (idx === -1) return {};
+      const group = prev.groups[idx];
+      if (!group.unreadCount) return {};
+      const nextGroups = [...prev.groups];
+      nextGroups[idx] = { ...group, unreadCount: 0 };
+      return { groups: nextGroups };
+    });
+  }, [updateData]);
 
   const refreshRequests = useCallback(async () => {
     const [requestsResult, allProfiles, friendsResult] = await Promise.all([
@@ -369,10 +558,26 @@ export function useAppData(userId: string) {
       });
 
     updateData({ friendRequests, suggestions, sentRequestIds });
+
+    // Keep the Friends tab (and Chats tab) in sync too — accepting/declining
+    // a request, or cancelling a sent one, changes the friend list, but this
+    // function already fetched it above so reuse it instead of a 2nd call.
+    if (friendsResult.success && friendsResult.data) {
+      const friends: Friend[] = friendsResult.data.friends.map(profile => ({
+        id: profile.id,
+        profile
+      }));
+      updateData({ friends });
+      if (friendIds.length > 0) {
+        const chats = await chatService.getChatList(userId, friendIds);
+        updateData(prev => ({ chats: mergeChatLists(chats, prev.chats) }));
+      }
+    }
   }, [userId, updateData]);
 
+
   const refreshCallHistory = useCallback(async () => {
-    const result = await callService.getCallHistory(userId);
+    const result = await callService.getCallHistory();
     if (result.success && result.data) {
       const historyItems: HistoryItem[] = result.data.map((call: CallHistory) => {
         const isOutgoing = call.caller_id === userId;
@@ -432,19 +637,17 @@ export function useAppData(userId: string) {
       // Refresh in background
       loadAllData();
     }
+
+    // Self-heal any local message storage left corrupted by a past sync bug
+    // (see offlineStorage.repairDuplicateClientMessageIds) — fire-and-forget,
+    // once per page load, so it never blocks or delays anything visible.
+    if (!localMessageStoreRepaired) {
+      localMessageStoreRepaired = true;
+      chatService.repairLocalMessageStore().catch(() => {});
+    }
   }, [loadAllData]);
 
   // DEBOUNCED refresh functions - prevents excessive updates
-  const debouncedRefreshChats = useMemo(
-    () => debounce(refreshChats, 300),
-    [refreshChats]
-  );
-
-  const debouncedRefreshFriends = useMemo(
-    () => debounce(refreshFriends, 300),
-    [refreshFriends]
-  );
-
   const debouncedRefreshGroups = useMemo(
     () => debounce(refreshGroups, 300),
     [refreshGroups]
@@ -464,46 +667,89 @@ export function useAppData(userId: string) {
     [refreshFriends, refreshRequests]
   );
 
-  // Set up real-time subscriptions with DEBOUNCED callbacks
+  // Set up real-time subscriptions.
+  // Messages and friend events arrive instantly over the shared per-user
+  // WebSocket (src/lib/realtimeClient.ts, backed by the Worker's Durable
+  // Objects). Chat-list updates (new message preview, unread badge, "seen"
+  // ticks) are applied in place from the event payload — no network round
+  // trip — so the list outside an open chat feels exactly as instant as the
+  // chat itself. Groups/calls don't have that wiring yet, so they fall back
+  // to light polling in the meantime — still "actually works", just not instant.
   useEffect(() => {
-    // Messages subscription - debounced to batch rapid messages
+    realtimeClient.connect(userId);
+
+    // Messages - applied instantly (see applyIncomingMessage/applyMessageUpdate)
     const messagesChannel = chatService.subscribeToMessages(
       userId,
-      () => debouncedRefreshChats(),
-      () => debouncedRefreshChats()
+      (message) => applyIncomingMessage(message),
+      (message) => applyMessageUpdate(message)
     );
     subscriptionsRef.current.push(messagesChannel);
 
-    // Friend requests + friendships polling (replaces Supabase realtime)
-    const friendsInterval = setInterval(
-      () => debouncedRefreshFriendsAndRequests(),
-      5000
+    // Read receipts - updates the "seen" tick on the Chats list instantly
+    const readReceiptChannel = chatService.subscribeToReadReceipts(
+      userId,
+      (messageIds, readerId) => applyReadReceipt(readerId, messageIds)
     );
-    subscriptionsRef.current.push({ unsubscribe: () => clearInterval(friendsInterval) });
+    subscriptionsRef.current.push(readReceiptChannel);
 
-    // Groups subscription (polling; message polls also trigger this)
-    const groupsInterval = setInterval(() => debouncedRefreshGroups(), 8000);
-    subscriptionsRef.current.push({ unsubscribe: () => clearInterval(groupsInterval) });
+    // Friend requests sent to me, acceptances/declines of requests I sent,
+    // and the other side unfriending me — all need to refresh both the
+    // Friends and Chats tabs live.
+    const friendRequestSub = realtimeClient.on('friend:request', () => debouncedRefreshFriendsAndRequests());
+    const friendAcceptedSub = realtimeClient.on('friend:accepted', () => debouncedRefreshFriendsAndRequests());
+    const friendDeclinedSub = realtimeClient.on('friend:declined', () => debouncedRefreshFriendsAndRequests());
+    const friendRemovedSub = realtimeClient.on('friend:removed', () => debouncedRefreshFriendsAndRequests());
+    subscriptionsRef.current.push(friendRequestSub, friendAcceptedSub, friendDeclinedSub, friendRemovedSub);
 
-    // Profiles / presence subscription (polling for online status)
-    const profilesInterval = setInterval(() => {
-      debouncedRefreshFriends();
-      debouncedRefreshChats();
-    }, 10000);
-    subscriptionsRef.current.push({ unsubscribe: () => clearInterval(profilesInterval) });
+    // Groups: created/renamed/deleted, and any membership change (joined,
+    // left, promoted/demoted) all just trigger a full refetch rather than
+    // trying to hand-merge a partial payload — getUserGroups() is the one
+    // source of truth for the shape the Groups list and an open group
+    // chat's header both render from.
+    const groupCreatedOrUpdatedSub = realtimeClient.on('group:created', () => debouncedRefreshGroups());
+    const groupUpdatedSub = realtimeClient.on('group:updated', () => debouncedRefreshGroups());
+    const groupDeletedSub = realtimeClient.on('group:deleted', () => debouncedRefreshGroups());
+    const groupMemberJoinedSub = realtimeClient.on('group-member:joined', () => debouncedRefreshGroups());
+    const groupMemberLeftSub = realtimeClient.on('group-member:left', () => debouncedRefreshGroups());
+    const groupMemberUpdatedSub = realtimeClient.on('group-member:updated', () => debouncedRefreshGroups());
+    // A new group message changes the list's "last message" preview too.
+    const groupMessageSub = realtimeClient.on('group-message:new', () => debouncedRefreshGroups());
+    subscriptionsRef.current.push(
+      groupCreatedOrUpdatedSub,
+      groupUpdatedSub,
+      groupDeletedSub,
+      groupMemberJoinedSub,
+      groupMemberLeftSub,
+      groupMemberUpdatedSub,
+      groupMessageSub
+    );
 
-    // Call history subscription
-    const callsInterval = setInterval(() => {
-      convex.query(api.calls.current, {}).catch(() => null);
-      debouncedRefreshCallHistory();
-    }, 5000);
-    subscriptionsRef.current.push({ unsubscribe: () => clearInterval(callsInterval) });
+    // Call history: a call landing in the History tab the moment it ends
+    // (rather than up to 30s later) matters since that's also how a missed
+    // call notification would be noticed.
+    const callEndedSub = realtimeClient.on('call:ended', () => debouncedRefreshCallHistory());
+    subscriptionsRef.current.push(callEndedSub);
+
+    // These intervals are now just a safety net in case a realtime event is
+    // ever missed (e.g. a brief reconnect gap) — both are kept live above.
+    const groupsInterval = setInterval(() => debouncedRefreshGroups(), 45000);
+    const callsInterval = setInterval(() => debouncedRefreshCallHistory(), 45000);
+
+    // Online/offline status has no realtime push of its own (it's a simple
+    // heartbeat timestamp in D1, see profileService.updateLastSeen) — poll
+    // friends/chats/suggestions periodically so "Online"/"Last seen" stays
+    // reasonably fresh everywhere it's shown.
+    const presenceInterval = setInterval(() => debouncedRefreshFriendsAndRequests(), 25000);
 
     return () => {
       subscriptionsRef.current.forEach(sub => sub.unsubscribe());
       subscriptionsRef.current = [];
+      clearInterval(groupsInterval);
+      clearInterval(callsInterval);
+      clearInterval(presenceInterval);
     };
-  }, [userId, debouncedRefreshChats, debouncedRefreshFriends, debouncedRefreshGroups, debouncedRefreshFriendsAndRequests, debouncedRefreshCallHistory]);
+  }, [userId, applyIncomingMessage, applyMessageUpdate, applyReadReceipt, debouncedRefreshGroups, debouncedRefreshFriendsAndRequests, debouncedRefreshCallHistory]);
 
   return {
     ...data,
@@ -514,6 +760,8 @@ export function useAppData(userId: string) {
     refreshGroups,
     refreshRequests,
     refreshCallHistory,
+    markChatRead,
+    markGroupRead,
     addSentRequest,
     reload: loadAllData
   };

@@ -1,26 +1,84 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
+import { Toaster, toast } from 'sonner';
 import { MessageCircle, Circle, UsersRound, Compass, Clock } from 'lucide-react';
 import { Auth } from './components/Auth';
-import { ProfileSetup } from './components/ProfileSetup';
 import { Chats } from './components/Chats';
 import { ChatView } from './components/ChatView';
 import { Status } from './components/Status';
 import { Groups } from './components/Groups';
-import { GroupChatView } from './components/GroupChatView';
-import { CreateGroup } from './components/CreateGroup';
 import { Discover } from './components/Discover';
 import { History } from './components/History';
-import { Settings } from './components/Settings';
-import { CallModal } from './components/CallModal';
-import { authService } from './services/authService';
+
+// These stay eager (bundled into the initial download) because they're the
+// app's main surfaces — the five bottom-tab screens plus opening a chat —
+// and switching between them has to be instant with zero loading state,
+// the same way WhatsApp's own tabs never show a spinner. Everything below
+// is reached one tap deeper (Settings, a group, creating a group, a call,
+// a profile preview, first-time onboarding) and is loaded on demand
+// instead, then aggressively prefetched in the background right after
+// login so it's normally already cached by the time it's actually opened.
+const ProfileSetup = lazy(() => import('./components/ProfileSetup').then((m) => ({ default: m.ProfileSetup })));
+const GroupChatView = lazy(() => import('./components/GroupChatView').then((m) => ({ default: m.GroupChatView })));
+const GroupInfo = lazy(() => import('./components/GroupInfo').then((m) => ({ default: m.GroupInfo })));
+const CreateGroup = lazy(() => import('./components/CreateGroup').then((m) => ({ default: m.CreateGroup })));
+const Settings = lazy(() => import('./components/Settings').then((m) => ({ default: m.Settings })));
+const CallModal = lazy(() => import('./components/CallModal').then((m) => ({ default: m.CallModal })));
+const GroupCallModal = lazy(() => import('./components/GroupCallModal').then((m) => ({ default: m.GroupCallModal })));
+const ProfileView = lazy(() => import('./components/ProfileView').then((m) => ({ default: m.ProfileView })));
+import { authService, ProfileResolution } from './services/authService';
 import { profileService } from './services/profileService';
+import {
+  markProfileComplete,
+  getCurrentUserId as getStoredUserIdSync,
+  getStoredAuth,
+  wasProfileEverComplete,
+  getCachedUserProfile,
+} from './lib/apiClient';
 import { callService } from './services/callService';
+import { groupCallService, GroupCallSession } from './services/groupCallService';
 import { GroupWithMembers } from './services/groupService';
 import { UserProfile, Contact, Call } from './types';
-import { api, convex } from './lib/convexClient';
+import { realtimeClient } from './lib/realtimeClient';
 import { useAppData } from './hooks/useAppData';
+import { useVisualViewportHeight } from './hooks/useVisualViewportHeight';
 
 type AppView = 'chats' | 'status' | 'groups' | 'discover' | 'history';
+
+// Shared fallback shown for the brief moment a lazy-loaded screen's code is
+// still downloading (effectively only on its very first visit — the
+// browser caches the chunk after that). Matches the existing cold-start
+// loading screen so a lazy chunk load never looks like a different app.
+function AppLoadingScreen() {
+  return (
+    <div className="h-screen flex flex-col items-center justify-center bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50">
+      <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500 via-purple-500 to-fuchsia-500 flex items-center justify-center shadow-xl shadow-purple-500/40 animate-pulse">
+        <MessageCircle className="w-10 h-10 text-white" />
+      </div>
+      <h1 className="mt-4 text-xl font-bold bg-gradient-to-r from-violet-600 to-fuchsia-600 bg-clip-text text-transparent">
+        NChat
+      </h1>
+    </div>
+  );
+}
+
+// The handful of screens still loaded on demand (one tap deeper than the
+// main tabs/chat) are fetched immediately — not waiting on idle time — the
+// instant the authenticated app shell mounts, so they're already sitting in
+// the browser's cache well before a user could physically read the screen
+// and tap into one of them. That's what lets their <Suspense> fallback stay
+// `null`: with this head start it practically never has anything to show.
+let prefetchedAppScreens = false;
+function prefetchAppScreens() {
+  if (prefetchedAppScreens) return;
+  prefetchedAppScreens = true;
+  void import('./components/GroupChatView');
+  void import('./components/GroupInfo');
+  void import('./components/CreateGroup');
+  void import('./components/Settings');
+  void import('./components/CallModal');
+  void import('./components/GroupCallModal');
+  void import('./components/ProfileView');
+}
 
 interface CallState {
   active: boolean;
@@ -29,7 +87,14 @@ interface CallState {
   incomingCall?: Call;
 }
 
-export default function App() {
+interface GroupCallState {
+  active: boolean;
+  group?: GroupWithMembers;
+  callType: 'audio' | 'video';
+  incomingCall?: GroupCallSession;
+}
+
+function App() {
   // Auth state
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [needsProfileSetup, setNeedsProfileSetup] = useState(false);
@@ -37,6 +102,10 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [userId, setUserId] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState<string>('');
+  // Session is valid but we couldn't confirm the profile after retrying
+  // (server/network hiccup) — show a "try again" screen instead of guessing
+  // (never assume a dropped request means "new user, needs onboarding").
+  const [sessionError, setSessionError] = useState(false);
 
   // App state
   const [activeTab, setActiveTab] = useState<AppView>('chats');
@@ -48,86 +117,193 @@ export default function App() {
     active: false,
     callType: 'audio'
   });
-
-  // Check auth on mount
+  const [groupCallState, setGroupCallState] = useState<GroupCallState>({
+    active: false,
+    callType: 'audio'
+  });
+  // No call-waiting support for either kind of call — both of the
+  // incoming-call subscriptions below need to know if the *other* kind is
+  // already active before ringing a second one in on top of it, without
+  // forcing either subscription effect to re-run every time the other
+  // one's state changes.
+  const anyCallActiveRef = useRef(false);
   useEffect(() => {
-    const checkAuth = async () => {
-      try {
-        const authState = await authService.checkSession();
-        setIsAuthenticated(authState.isAuthenticated);
-        setNeedsProfileSetup(authState.needsProfileSetup);
-        setCurrentUser(authState.user);
+    anyCallActiveRef.current = callState.active || groupCallState.active;
+  }, [callState.active, groupCallState.active]);
 
-        if (authState.isAuthenticated) {
-          const id = await authService.getCurrentUserId();
-          setUserId(id);
-
-          // Get email from the profile or user record
-          const profile = await profileService.getProfile(id);
-          if (profile?.email) {
-            setUserEmail(profile.email);
-          }
-        }
-      } catch (error) {
-        console.error('Auth check error:', error);
-      } finally {
-        setLoading(false);
+  // Applies the result of authService.resolveProfileState to app state.
+  // Shared by the background reconciliation below and by the SIGNED_IN
+  // handler, so both treat every outcome the same safe way — in
+  // particular, a mere "couldn't confirm it this time" (sessionError) must
+  // never interrupt someone who's already looking at the app with a
+  // perfectly good cached profile; only a *confirmed* dead session
+  // (sessionInvalid) is ever allowed to do that.
+  const applyProfileResolution = useCallback((userId: string, resolution: ProfileResolution) => {
+    if (resolution.sessionInvalid) {
+      realtimeClient.disconnect();
+      setIsAuthenticated(false);
+      setCurrentUser(null);
+      setNeedsProfileSetup(false);
+      setUserId(null);
+      setUserEmail('');
+      setSessionError(false);
+      return;
+    }
+    if (resolution.user) {
+      setCurrentUser(resolution.user);
+      setNeedsProfileSetup(false);
+      setSessionError(false);
+      if (resolution.user.email) setUserEmail(resolution.user.email);
+      return;
+    }
+    if (resolution.sessionError) {
+      // Couldn't confirm the profile this time. If we (or the cache-first
+      // bootstrap below) already have a known-good cached profile for this
+      // exact account, just keep it — there's nothing to show the user
+      // over a background check that didn't pan out. Only show the "try
+      // again" screen when there's truly nothing to fall back to.
+      const cached = getCachedUserProfile(userId);
+      if (cached) {
+        setCurrentUser(cached);
+        setNeedsProfileSetup(false);
+        setSessionError(false);
+      } else {
+        setSessionError(true);
       }
-    };
+      return;
+    }
+    // Retried and it genuinely never looked complete — a real, brand-new
+    // account that hasn't finished onboarding yet.
+    setNeedsProfileSetup(true);
+  }, []);
 
+  // Check auth on mount (and whenever the user retries from the session-error screen)
+  const checkAuth = useCallback(async () => {
+    const userId = getStoredUserIdSync();
+    const auth = getStoredAuth();
+
+    // Cache-first bootstrap: if we've ever confirmed this exact account's
+    // profile as complete on this device before, open straight into the
+    // app right now using whatever's cached — the same way WhatsApp/
+    // Telegram/Messenger open to your chats immediately and reconcile with
+    // the server quietly afterward, rather than gating every single
+    // launch on a network round trip that can (and, per the reports this
+    // was built to fix, does) occasionally fail for reasons that have
+    // nothing to do with whether the account is actually fine. A single
+    // failed check here can therefore never again bounce an established
+    // user back to onboarding or a blocking error screen; only a
+    // *confirmed* dead session (handled inside applyProfileResolution)
+    // can sign them out from this point on.
+    if (userId && auth && wasProfileEverComplete(userId)) {
+      const bestEffortProfile: UserProfile =
+        getCachedUserProfile(userId) ?? {
+          id: auth.user.id,
+          email: auth.user.email,
+          full_name: auth.user.full_name || '',
+        };
+      setIsAuthenticated(true);
+      setCurrentUser(bestEffortProfile);
+      setNeedsProfileSetup(false);
+      setSessionError(false);
+      setUserId(userId);
+      if (bestEffortProfile.email) setUserEmail(bestEffortProfile.email);
+      setLoading(false);
+
+      void authService.resolveProfileState(userId).then((resolution) => {
+        applyProfileResolution(userId, resolution);
+      });
+      return;
+    }
+
+    // No local evidence this account has ever finished onboarding on this
+    // device (brand-new signup, first-ever visit here, or genuinely signed
+    // out) — this is the only situation where it's actually correct to
+    // gate the UI on the network: there's nothing honest to show yet.
+    setLoading(true);
+    try {
+      const authState = await authService.checkSession();
+      setSessionError(!!authState.sessionError);
+      setIsAuthenticated(authState.isAuthenticated);
+      setNeedsProfileSetup(authState.needsProfileSetup);
+      setCurrentUser(authState.user);
+
+      if (authState.isAuthenticated) {
+        setUserId(userId);
+
+        if (authState.user?.email) {
+          setUserEmail(authState.user.email);
+        }
+      }
+    } catch (error) {
+      console.error('Auth check error:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, [applyProfileResolution]);
+
+  useEffect(() => {
     checkAuth();
 
     // Listen for auth changes
     const { data: { subscription } } = authService.onAuthChange(async (event, session) => {
       if (event === 'SIGNED_IN' && session) {
+        setSessionError(false);
         setIsAuthenticated(true);
         setUserId(session.user.id);
         setUserEmail(session.user.email || '');
 
-        // Check profile
-        const profile = await profileService.getProfile(session.user.id);
-        if (profile && profile.full_name && profile.username && profile.avatar_url) {
-          setCurrentUser(profile);
-          setNeedsProfileSetup(false);
-        } else {
-          setNeedsProfileSetup(true);
-        }
+        // Resolve the profile the same safe way checkSession does: a
+        // dropped request here must never be confused with "brand new
+        // user" and silently drop them into onboarding again.
+        const resolution = await authService.resolveProfileState(session.user.id);
+        applyProfileResolution(session.user.id, resolution);
       } else if (event === 'SIGNED_OUT') {
+        // Also covers another tab signing out (see the cross-tab 'storage'
+        // sync in lib/apiClient.ts) — make sure the realtime socket this
+        // tab opened doesn't linger on a now-dead session.
+        realtimeClient.disconnect();
         setIsAuthenticated(false);
         setCurrentUser(null);
         setNeedsProfileSetup(false);
         setUserId(null);
         setUserEmail('');
+        setSessionError(false);
       }
     });
 
     return () => {
       subscription.unsubscribe();
     };
-  }, []);
+  }, [checkAuth, applyProfileResolution]);
 
-  // Update online status via Convex presence
+  // Update online status.
+  // The Worker derives is_online server-side from a presence heartbeat
+  // timestamp (see worker/src/routes/users.ts POST /presence) — there's no
+  // explicit "set offline" call; a user is simply considered offline once
+  // their last heartbeat is older than the server's threshold.
   useEffect(() => {
     if (!currentUser?.id) return;
 
-    const heartbeat = async () => {
-      try {
-        await convex.mutation(api.typing.upsertPresence, {});
-      } catch { /* ignore */ }
+    const sendHeartbeat = () => {
+      void profileService.updateLastSeen(currentUser.id);
     };
 
-    heartbeat();
+    sendHeartbeat();
 
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') heartbeat();
+      if (document.visibilityState === 'visible') {
+        sendHeartbeat();
+      }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    const interval = setInterval(heartbeat, 30000);
+
+    // Periodic heartbeat
+    const heartbeat = setInterval(sendHeartbeat, 30000);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      clearInterval(interval);
+      clearInterval(heartbeat);
     };
   }, [currentUser?.id]);
 
@@ -135,9 +311,22 @@ export default function App() {
   useEffect(() => {
     if (!currentUser?.id) return;
 
-    const unsubscribe = callService.subscribeToIncomingCalls(currentUser.id, (callSession) => {
-      if (callSession.status === 'initiated' || callSession.status === 'ringing') {
-        // Convert CallSession to Call type for the modal
+    const unsubscribe = callService.subscribeToIncomingCalls((callSession) => {
+      if (callSession.status !== 'initiated' && callSession.status !== 'ringing') return;
+
+      // No call-waiting support (1:1 or group): if we're already on a
+      // call of either kind, automatically decline the new one instead of
+      // silently dropping it (which would otherwise leave the second
+      // caller ringing forever with no feedback).
+      if (anyCallActiveRef.current) {
+        callService.endCall(callSession.id, 'declined');
+        return;
+      }
+      setCallState((prev) => {
+        if (prev.active) {
+          callService.endCall(callSession.id, 'declined');
+          return prev;
+        }
         const incomingCall: Call = {
           id: callSession.id,
           caller_id: callSession.callerId,
@@ -145,14 +334,46 @@ export default function App() {
           call_type: callSession.callType,
           status: callSession.status,
           created_at: callSession.startedAt,
-          offer_sdp: callSession.offerSdp
+          offer_sdp: callSession.offerSdp,
+          caller_profile: callSession.callerProfile
         };
-        setCallState({
+        return {
           active: true,
           callType: callSession.callType,
           incomingCall
-        });
+        };
+      });
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [currentUser?.id]);
+
+  // Subscribe to incoming group calls — mirrors the 1:1 subscription
+  // immediately above (same shared personal-room transport, same
+  // no-call-waiting rule), but rings in GroupCallModal instead of CallModal.
+  useEffect(() => {
+    if (!currentUser?.id) return;
+
+    const unsubscribe = groupCallService.subscribeToIncomingGroupCalls((call) => {
+      if (call.status !== 'active') return;
+
+      if (anyCallActiveRef.current) {
+        groupCallService.declineCall(call.id);
+        return;
       }
+      setGroupCallState((prev) => {
+        if (prev.active) {
+          groupCallService.declineCall(call.id);
+          return prev;
+        }
+        return {
+          active: true,
+          callType: call.callType,
+          incomingCall: call
+        };
+      });
     });
 
     return () => {
@@ -162,24 +383,23 @@ export default function App() {
 
   const handleAuthSuccess = useCallback(async () => {
     const id = await authService.getCurrentUserId();
-    if (id) {
-      setUserId(id);
-      const profile = await profileService.getProfile(id);
-      if (profile && profile.full_name && profile.username && profile.avatar_url) {
-        setCurrentUser(profile);
-        setNeedsProfileSetup(false);
-      } else {
-        setNeedsProfileSetup(true);
-      }
-      setIsAuthenticated(true);
-
-      if (profile?.email) {
-        setUserEmail(profile.email);
-      }
-    }
-  }, []);
+    if (!id) return;
+    setUserId(id);
+    // The login/signup call that led here already proves the session is
+    // valid — resolveProfileState below only needs to figure out the
+    // profile side of things (and applyProfileResolution still handles the
+    // rare case where something's gone more seriously wrong).
+    setIsAuthenticated(true);
+    const resolution = await authService.resolveProfileState(id);
+    applyProfileResolution(id, resolution);
+  }, [applyProfileResolution]);
 
   const handleProfileComplete = useCallback((profile: UserProfile) => {
+    // Record it right away (not just on the next bootstrap's
+    // resolveProfileState call) so the "never send an already-set-up user
+    // back through onboarding" safety net in authService is active from
+    // this moment on, even if the app gets backgrounded immediately after.
+    if (profile.id) markProfileComplete(profile.id);
     setCurrentUser(profile);
     setNeedsProfileSetup(false);
   }, []);
@@ -202,6 +422,24 @@ export default function App() {
 
   const handleCloseCall = useCallback(() => {
     setCallState({
+      active: false,
+      callType: 'audio'
+    });
+  }, []);
+
+  // group is passed explicitly (rather than reading selectedGroup here)
+  // so this stays correct even if it's ever wired to a group row outside
+  // the currently-open chat.
+  const handleGroupCall = useCallback((group: GroupWithMembers, type: 'voice' | 'video') => {
+    setGroupCallState({
+      active: true,
+      group,
+      callType: type === 'voice' ? 'audio' : 'video'
+    });
+  }, []);
+
+  const handleCloseGroupCall = useCallback(() => {
+    setGroupCallState({
       active: false,
       callType: 'audio'
     });
@@ -246,6 +484,7 @@ export default function App() {
   }, []);
 
   const handleLogout = useCallback(() => {
+    realtimeClient.disconnect();
     setIsAuthenticated(false);
     setCurrentUser(null);
     setShowSettings(false);
@@ -255,18 +494,17 @@ export default function App() {
     setCurrentUser(profile);
   }, []);
 
+  // Warm the remaining on-demand screens' code the moment the user is in
+  // the app — not waiting on idle time — so they're already cached well
+  // before anyone could realistically tap into one of them.
+  useEffect(() => {
+    if (!isAuthenticated || !currentUser) return;
+    prefetchAppScreens();
+  }, [isAuthenticated, currentUser]);
+
   // Loading state - Static splash, no spinner
   if (loading) {
-    return (
-      <div className="h-screen flex flex-col items-center justify-center bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50">
-        <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500 via-purple-500 to-fuchsia-500 flex items-center justify-center shadow-xl shadow-purple-500/40 animate-pulse">
-          <MessageCircle className="w-10 h-10 text-white" />
-        </div>
-        <h1 className="mt-4 text-xl font-bold bg-gradient-to-r from-violet-600 to-fuchsia-600 bg-clip-text text-transparent">
-          NChat
-        </h1>
-      </div>
-    );
+    return <AppLoadingScreen />;
   }
 
   // Auth screen
@@ -274,14 +512,39 @@ export default function App() {
     return <Auth onAuthSuccess={handleAuthSuccess} />;
   }
 
+  // Your session is fine, but we couldn't confirm your profile after
+  // retrying (server/network hiccup) — never guess "needs onboarding" here,
+  // just let the user retry.
+  if (sessionError) {
+    return (
+      <div className="h-screen flex flex-col items-center justify-center gap-4 bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 px-6 text-center">
+        <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-violet-500 via-purple-500 to-fuchsia-500 flex items-center justify-center shadow-xl shadow-purple-500/40">
+          <MessageCircle className="w-8 h-8 text-white" />
+        </div>
+        <h1 className="text-lg font-bold text-slate-800">Couldn't reach NChat</h1>
+        <p className="text-sm text-slate-500 max-w-xs">
+          You're still signed in — we just couldn't load your profile. Check your connection and try again.
+        </p>
+        <button
+          onClick={() => checkAuth()}
+          className="mt-2 px-6 py-2.5 rounded-xl bg-gradient-to-r from-violet-500 via-purple-500 to-fuchsia-500 text-white text-sm font-semibold shadow-lg shadow-violet-500/30 hover:scale-105 active:scale-95 transition-transform"
+        >
+          Try Again
+        </button>
+      </div>
+    );
+  }
+
   // Profile setup screen
   if (needsProfileSetup && userId) {
     return (
-      <ProfileSetup
-        userId={userId}
-        email={userEmail}
-        onComplete={handleProfileComplete}
-      />
+      <Suspense fallback={<AppLoadingScreen />}>
+        <ProfileSetup
+          userId={userId}
+          email={userEmail}
+          onComplete={handleProfileComplete}
+        />
+      </Suspense>
     );
   }
 
@@ -299,10 +562,13 @@ export default function App() {
       setShowCreateGroup={setShowCreateGroup}
       showSettings={showSettings}
       callState={callState}
+      groupCallState={groupCallState}
       handleOpenChat={handleOpenChat}
       handleBackToChats={handleBackToChats}
       handleCall={handleCall}
       handleCloseCall={handleCloseCall}
+      handleGroupCall={handleGroupCall}
+      handleCloseGroupCall={handleCloseGroupCall}
       handleOpenGroup={handleOpenGroup}
       handleBackFromGroup={handleBackFromGroup}
       handleGroupCreated={handleGroupCreated}
@@ -326,10 +592,13 @@ function MainApp({
   setShowCreateGroup,
   showSettings,
   callState,
+  groupCallState,
   handleOpenChat,
   handleBackToChats,
   handleCall,
   handleCloseCall,
+  handleGroupCall,
+  handleCloseGroupCall,
   handleOpenGroup,
   handleBackFromGroup,
   handleGroupCreated,
@@ -348,10 +617,13 @@ function MainApp({
   setShowCreateGroup: (show: boolean) => void;
   showSettings: boolean;
   callState: CallState;
+  groupCallState: GroupCallState;
   handleOpenChat: (contact: Contact) => void;
   handleBackToChats: () => void;
   handleCall: (userId: string, type: 'voice' | 'video') => void;
   handleCloseCall: () => void;
+  handleGroupCall: (group: GroupWithMembers, type: 'voice' | 'video') => void;
+  handleCloseGroupCall: () => void;
   handleOpenGroup: (group: GroupWithMembers) => void;
   handleBackFromGroup: () => void;
   handleGroupCreated: (groupId: string) => void;
@@ -361,11 +633,141 @@ function MainApp({
   handleProfileUpdate: (profile: UserProfile) => void;
   handleMessageFromHistory: (userId: string) => void;
 }) {
-  // Preload ALL data on mount - this is the key to instant tabs
-  const appData = useAppData(currentUser.id);
+  // Real visible height (keyboard-aware) — see the hook's doc comment for
+  // why `h-screen`/100vh alone can't be trusted to keep the chat input
+  // visible above the on-screen keyboard on every Android browser/WebView
+  // this runs in. Falls back to plain `h-screen` CSS (null) wherever
+  // visualViewport isn't available at all.
+  const visibleHeight = useVisualViewportHeight();
+
+  // Preload ALL data on mount - this is the key to instant tabs. Passing the
+  // currently-open chat's id lets the hook avoid bumping that chat's unread
+  // badge for messages the user is already looking at live.
+  const appData = useAppData(currentUser.id, selectedChat?.user_id ?? null);
+
+  // The moment a chat is opened (from the Chats list, Discover, or call
+  // history), its unread badge should disappear instantly rather than
+  // waiting for the next full chats refresh — which could otherwise race
+  // with the server-side mark-as-read call and leave a stale badge showing.
+  useEffect(() => {
+    if (selectedChat?.user_id) {
+      appData.markChatRead(selectedChat.user_id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedChat?.user_id]);
+
+  // Same instant-zero treatment for a group's unread badge the moment its
+  // chat is opened — mirrors the 1:1 effect right above.
+  useEffect(() => {
+    if (selectedGroup?.id) {
+      appData.markGroupRead(selectedGroup.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedGroup?.id]);
+
+  // `selectedChat` is a snapshot taken at the moment a chat was opened (from
+  // the Chats list, Discover, or history), so its `profile` (online status,
+  // avatar, etc.) would otherwise stay frozen for as long as the chat stays
+  // open. Re-derive it from the live chats/friends lists (refreshed by
+  // realtime events + the presence poll in useAppData) so things like the
+  // "Online"/"Offline" header and typing indicator reflect reality while
+  // you're actively looking at the conversation.
+  const liveSelectedChat = useMemo(() => {
+    if (!selectedChat) return null;
+    const liveChat = appData.chats.find(c => c.user_id === selectedChat.user_id);
+    if (liveChat) return liveChat;
+    const liveFriend = appData.friends.find(f => f.id === selectedChat.user_id);
+    if (liveFriend) return { ...selectedChat, profile: liveFriend.profile };
+    return selectedChat;
+  }, [selectedChat, appData.chats, appData.friends]);
+
+  // Same idea as liveSelectedChat, but for the currently-open group: a
+  // rename, avatar change, member joining/leaving/being promoted, or the
+  // group being deleted out from under you should all show up immediately
+  // in the open chat's header/member list instead of only after reopening
+  // it, since appData.groups is already kept fresh by realtime events +
+  // refreshGroups() (see useAppData.ts).
+  const liveSelectedGroup = useMemo(() => {
+    if (!selectedGroup) return null;
+    return appData.groups.find(g => g.id === selectedGroup.id) || selectedGroup;
+  }, [selectedGroup, appData.groups]);
+
+  const [showGroupInfo, setShowGroupInfo] = useState(false);
+
+  // Profile preview — a lightweight overlay that can be opened from anywhere
+  // (a chat header, a friends/discover row, a group member, call history)
+  // to view someone's profile, independent of whichever tab/screen is
+  // currently showing.
+  const [viewProfile, setViewProfile] = useState<{ userId: string; initialProfile?: UserProfile } | null>(null);
+
+  const handleViewProfile = useCallback((userId: string, initialProfile?: UserProfile) => {
+    // Viewing your own profile here doesn't make sense — Settings already
+    // owns that, with editing. Route it there instead of showing a
+    // read-only duplicate.
+    if (userId === currentUser.id) {
+      handleOpenSettings();
+      return;
+    }
+    setViewProfile({ userId, initialProfile });
+  }, [currentUser.id, handleOpenSettings]);
+
+  const handleCloseProfileView = useCallback(() => {
+    setViewProfile(null);
+  }, []);
+
+  const handleProfileRelationChanged = useCallback(() => {
+    appData.refreshFriends();
+    appData.refreshRequests();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // If someone else removes you from a group (or deletes it) while you
+  // still have it open, appData.groups (kept live by realtime events) will
+  // stop containing it. Rather than silently leaving you on a now-stale
+  // view where sending a message would fail with a confusing 403, back out
+  // of it automatically with a plain-language explanation — exactly the
+  // kind of "frustrating error" this should never surface as.
+  useEffect(() => {
+    if (!appData.isReady || !selectedGroup) return;
+    const stillIn = appData.groups.some(g => g.id === selectedGroup.id);
+    if (!stillIn) {
+      toast.info('You are no longer in this group');
+      setShowGroupInfo(false);
+      handleBackFromGroup();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appData.isReady, appData.groups, selectedGroup]);
+
+  const handleManageGroup = useCallback(() => {
+    setShowGroupInfo(true);
+  }, []);
+
+  const handleGroupInfoChanged = useCallback(() => {
+    // Optimistic refresh for the person who just made the change — the
+    // Worker also broadcasts the same event back to them over realtime
+    // (see useAppData.ts), so this just avoids waiting on that round trip.
+    appData.refreshGroups();
+  }, [appData]);
+
+  const handleGroupLeftOrDeleted = useCallback(() => {
+    setShowGroupInfo(false);
+    handleBackFromGroup();
+    appData.refreshGroups();
+  }, [appData, handleBackFromGroup]);
+
+  // Wrap the outer App's onGroupCreated so the brand-new group shows up in
+  // the Groups tab immediately instead of waiting for the next realtime
+  // event or the 45s safety-net poll.
+  const handleGroupCreatedWithRefresh = useCallback(async (groupId: string) => {
+    await appData.refreshGroups();
+    handleGroupCreated(groupId);
+  }, [appData, handleGroupCreated]);
 
   return (
-    <div className="h-screen flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 relative overflow-hidden">
+    <div
+      className="h-screen flex flex-col bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 relative overflow-hidden"
+      style={visibleHeight ? { height: `${visibleHeight}px` } : undefined}
+    >
       {/* Animated Background Blobs */}
       <div className="absolute inset-0 overflow-hidden pointer-events-none">
         <div className="absolute top-0 -left-4 w-64 h-64 bg-purple-300 rounded-full mix-blend-multiply filter blur-xl opacity-60 animate-blob"></div>
@@ -375,6 +777,7 @@ function MainApp({
 
       {/* Main Content */}
       <div className="flex-1 overflow-hidden relative z-10">
+        <Suspense fallback={null}>
         {showSettings ? (
           <Settings
             currentUser={currentUser}
@@ -382,24 +785,37 @@ function MainApp({
             onLogout={handleLogout}
             onProfileUpdate={handleProfileUpdate}
           />
-        ) : selectedChat ? (
+        ) : liveSelectedChat ? (
           <ChatView
             currentUser={currentUser}
-            contact={selectedChat}
+            contact={liveSelectedChat}
             onBack={handleBackToChats}
-            onCall={(type) => handleCall(selectedChat.user_id, type)}
+            onCall={(type) => handleCall(liveSelectedChat.user_id, type)}
+            onViewProfile={() => handleViewProfile(liveSelectedChat.user_id, liveSelectedChat.profile)}
           />
-        ) : selectedGroup ? (
+        ) : liveSelectedGroup && showGroupInfo ? (
+          <GroupInfo
+            currentUser={currentUser}
+            group={liveSelectedGroup}
+            friends={appData.friends}
+            onBack={() => setShowGroupInfo(false)}
+            onChanged={handleGroupInfoChanged}
+            onLeftOrDeleted={handleGroupLeftOrDeleted}
+            onViewProfile={handleViewProfile}
+          />
+        ) : liveSelectedGroup ? (
           <GroupChatView
             currentUser={currentUser}
-            group={selectedGroup}
+            group={liveSelectedGroup}
             onBack={handleBackFromGroup}
+            onGroupCall={(type) => handleGroupCall(liveSelectedGroup, type)}
+            onManageGroup={handleManageGroup}
           />
         ) : showCreateGroup ? (
           <CreateGroup
             currentUser={currentUser}
             onBack={handleBackFromGroup}
-            onGroupCreated={handleGroupCreated}
+            onGroupCreated={handleGroupCreatedWithRefresh}
           />
         ) : (
           <>
@@ -437,6 +853,7 @@ function MainApp({
                 onRefresh={appData.refreshRequests}
                 onMessage={handleOpenChat}
                 onCall={handleCall}
+                onViewProfile={handleViewProfile}
               />
             )}
             {activeTab === 'history' && (
@@ -445,10 +862,12 @@ function MainApp({
                 history={appData.callHistory}
                 onCall={handleCall}
                 onMessage={handleMessageFromHistory}
+                onViewProfile={handleViewProfile}
               />
             )}
           </>
         )}
+        </Suspense>
       </div>
 
       {/* Bottom Navigation */}
@@ -555,14 +974,61 @@ function MainApp({
 
       {/* Call Modal */}
       {callState.active && (
-        <CallModal
-          currentUser={currentUser}
-          calleeId={callState.calleeId}
-          callType={callState.callType}
-          incomingCall={callState.incomingCall}
-          onClose={handleCloseCall}
-        />
+        <Suspense fallback={null}>
+          <CallModal
+            currentUser={currentUser}
+            calleeId={callState.calleeId}
+            callType={callState.callType}
+            incomingCall={callState.incomingCall}
+            onClose={handleCloseCall}
+          />
+        </Suspense>
+      )}
+
+      {/* Group Call Modal */}
+      {groupCallState.active && (
+        <Suspense fallback={null}>
+          <GroupCallModal
+            currentUser={currentUser}
+            group={groupCallState.group}
+            callType={groupCallState.callType}
+            incomingCall={groupCallState.incomingCall}
+            onClose={handleCloseGroupCall}
+          />
+        </Suspense>
+      )}
+
+      {/* Profile Preview — overlays whatever screen is open */}
+      {viewProfile && (
+        <Suspense fallback={null}>
+          <ProfileView
+            currentUser={currentUser}
+            userId={viewProfile.userId}
+            initialProfile={viewProfile.initialProfile}
+            onClose={handleCloseProfileView}
+            onMessage={handleOpenChat}
+            onCall={handleCall}
+            onChanged={handleProfileRelationChanged}
+          />
+        </Suspense>
       )}
     </div>
+  );
+}
+
+/** Mounts the toast notification system alongside the app, regardless of which screen is active. */
+export default function AppRoot() {
+  return (
+    <>
+      <App />
+      <Toaster
+        position="top-center"
+        richColors
+        closeButton
+        toastOptions={{
+          style: { borderRadius: '1rem' },
+        }}
+      />
+    </>
   );
 }

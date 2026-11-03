@@ -10,6 +10,7 @@
  */
 
 import { Message, UserProfile } from '../types';
+import { log } from './logger';
 
 const DB_NAME = 'NChat_Offline_v2';
 const DB_VERSION = 2;
@@ -43,6 +44,7 @@ export interface PendingMessage {
   type: string;
   messageType?: 'direct' | 'group';  // To distinguish message types
   duration?: number;
+  waveform?: string;
   replyToId?: string;
   createdAt: string;
   retryCount: number;
@@ -142,7 +144,16 @@ export const saveMessages = async (messages: LocalMessage[]): Promise<void> => {
   const store = transaction.objectStore(STORES.MESSAGES);
 
   for (const message of messages) {
-    store.put(message);
+    const request = store.put(message);
+    // Never let one bad/colliding record (e.g. a duplicate unique-index
+    // value from a stale local row) abort the whole batch — that would
+    // silently drop every other message in this sync, including ones that
+    // have nothing wrong with them. Log it and let the rest of the batch
+    // continue to commit.
+    request.onerror = (event) => {
+      log.warn('Failed to save one message to local cache, skipping it', request.error, 'offlineStorage');
+      event.preventDefault();
+    };
   }
 
   return new Promise((resolve, reject) => {
@@ -184,21 +195,27 @@ export const getChatMessages = async (
   const db = await openDB();
   const transaction = db.transaction(STORES.MESSAGES, 'readonly');
   const store = transaction.objectStore(STORES.MESSAGES);
-  const index = store.index('chatId');
+  // Use the compound [chatId, created_at] index, not the plain `chatId` one.
+  // A plain-index cursor over records that all share the same chatId value
+  // (i.e. every message in a real conversation) secondarily sorts by
+  // *primary key* — here a random UUID — not by time. Walking it 'prev'
+  // therefore returned an arbitrary ~`limit` messages ordered by UUID, not
+  // the most recent ones: whichever side's message ids happened to sort
+  // later would dominate the result, and the other person's messages could
+  // be entirely squeezed out once a chat had more than `limit` messages.
+  const index = store.index('chatId_created');
+  const upper = beforeTimestamp ?? '\uffff';
+  const range = IDBKeyRange.bound([chatId, ''], [chatId, upper], false, !!beforeTimestamp);
 
   return new Promise((resolve, reject) => {
     const messages: LocalMessage[] = [];
-    const request = index.openCursor(IDBKeyRange.only(chatId), 'prev');
+    const request = index.openCursor(range, 'prev');
 
     request.onsuccess = (event) => {
       const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result;
 
       if (cursor && messages.length < limit) {
-        const msg = cursor.value as LocalMessage;
-
-        if (!beforeTimestamp || msg.created_at < beforeTimestamp) {
-          messages.push(msg);
-        }
+        messages.push(cursor.value as LocalMessage);
         cursor.continue();
       } else {
         resolve(messages.reverse());
@@ -226,9 +243,28 @@ export const updateMessageSyncStatus = async (
       const message = getRequest.result;
       if (message) {
         message.syncStatus = syncStatus;
-        if (serverId) message.id = serverId;
         if (serverCreatedAt) message.serverCreatedAt = serverCreatedAt;
-        store.put(message);
+
+        if (serverId && serverId !== messageId) {
+          // The record's primary key (`id`, the object store's keyPath) is
+          // changing from a local optimistic id to the server-assigned one.
+          // `store.put()` would otherwise INSERT a new row under the new key
+          // while leaving the old one behind — a leftover duplicate that
+          // still carries the same `clientMessageId`. Since that field has
+          // a unique index, every future sync batch that re-saves this same
+          // message (now fetched from the server) collides with that
+          // leftover row and throws, silently aborting the ENTIRE batch
+          // transaction — which can make a whole chat's messages vanish
+          // from local storage even though nothing is wrong with them.
+          // Deleting the old key first turns this into a clean rename.
+          message.id = serverId;
+          const deleteRequest = store.delete(messageId);
+          deleteRequest.onsuccess = () => {
+            store.put(message);
+          };
+        } else {
+          store.put(message);
+        }
       }
     };
 
@@ -246,6 +282,70 @@ export const deleteMessage = async (messageId: string): Promise<void> => {
   return new Promise((resolve, reject) => {
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error);
+  });
+};
+
+/**
+ * One-time self-heal for a bug (now fixed in updateMessageSyncStatus) that
+ * could leave a leftover row behind when a locally-sent message's temporary
+ * id was swapped for the real server id: instead of being renamed, a
+ * duplicate row stuck around under the old temp id, still claiming the same
+ * (unique-indexed) clientMessageId as the new, correctly-keyed row. Every
+ * future sync that tried to re-save that message then hit a constraint
+ * violation and silently aborted its *entire* batch — which could wipe out
+ * someone else's messages from local storage even though nothing was wrong
+ * with them. This repairs any such leftover rows already sitting in a
+ * user's browser from before the fix, since shipping the fix alone doesn't
+ * touch data that's already on their device. Safe to run repeatedly.
+ */
+export const repairDuplicateClientMessageIds = async (): Promise<number> => {
+  const db = await openDB();
+  const transaction = db.transaction(STORES.MESSAGES, 'readwrite');
+  const store = transaction.objectStore(STORES.MESSAGES);
+
+  return new Promise((resolve) => {
+    const groups = new Map<string, LocalMessage[]>();
+    const request = store.openCursor();
+    let removed = 0;
+
+    request.onsuccess = (event) => {
+      const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result;
+      if (cursor) {
+        const msg = cursor.value as LocalMessage;
+        const key = msg.clientMessageId || msg.id;
+        const existing = groups.get(key);
+        if (existing) existing.push(msg);
+        else groups.set(key, [msg]);
+        cursor.continue();
+        return;
+      }
+
+      // Cursor done — resolve which duplicates to drop.
+      for (const rows of groups.values()) {
+        if (rows.length < 2) continue;
+
+        // Prefer a row that looks like it has a real server id and isn't
+        // stuck pending/failed; fall back to the most recently synced one.
+        const isTempId = (id: string) => id.startsWith('temp_');
+        const best = rows.reduce((a, b) => {
+          const aGood = !isTempId(a.id) && a.syncStatus !== 'pending' && a.syncStatus !== 'failed';
+          const bGood = !isTempId(b.id) && b.syncStatus !== 'pending' && b.syncStatus !== 'failed';
+          if (aGood !== bGood) return aGood ? a : b;
+          return (b.serverCreatedAt || b.localCreatedAt) > (a.serverCreatedAt || a.localCreatedAt) ? b : a;
+        });
+
+        for (const row of rows) {
+          if (row.id !== best.id) {
+            store.delete(row.id);
+            removed++;
+          }
+        }
+      }
+    };
+
+    request.onerror = () => resolve(0);
+    transaction.oncomplete = () => resolve(removed);
+    transaction.onerror = () => resolve(removed);
   });
 };
 

@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { toast } from 'sonner';
 import {
   ArrowLeft,
   User,
@@ -13,7 +14,6 @@ import {
   X,
   UserX,
   Shield,
-  Loader2,
   Users,
   Database,
   Activity,
@@ -28,7 +28,7 @@ import { profileService } from '../services/profileService';
 import { privacyService, PrivacySettings, PrivacyOption } from '../services/privacyService';
 import { friendService } from '../services/friendService';
 import { mediaService } from '../services/mediaService';
-import { api, convex } from '../lib/convexClient';
+import { apiFetch } from '../lib/apiClient';
 import { ImageCropper } from './ImageCropper';
 
 interface SettingsProps {
@@ -45,6 +45,17 @@ const ADMIN_EMAIL = 'kazmiinasir6@gmail.com';
 
 // Check if current user is admin
 const isAdmin = (email: string) => email.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+
+/** Renders an avatar image, falling back to an initial if there's no URL or the image fails to load. */
+function AvatarOrInitial({ src, alt, initial }: { src?: string | null; alt: string; initial: string }) {
+  const [broken, setBroken] = useState(false);
+
+  if (!src || broken) {
+    return <span>{initial}</span>;
+  }
+
+  return <img src={src} alt={alt} onError={() => setBroken(true)} />;
+}
 
 export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: SettingsProps) {
   const [section, setSection] = useState<SettingsSection>('main');
@@ -81,9 +92,11 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
   // Load privacy settings
   useEffect(() => {
     const loadPrivacy = async () => {
-      const result = await privacyService.getSettings(currentUser.id);
+      const result = await privacyService.getSettings();
       if (result.success && result.data) {
         setPrivacySettings(result.data);
+      } else {
+        toast.error('Could not load privacy settings.');
       }
     };
     loadPrivacy();
@@ -114,14 +127,18 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
     if (section === 'admin' && isAdmin(currentUser.email)) {
       const loadStats = async () => {
         try {
-          const allProfiles = await convex.query(api.users.getAllProfiles, {});
-          const totalUsers = (allProfiles as unknown[]).length;
-          // Convex doesn't have a direct count query, but we can use a lightweight approach
+          const stats = await apiFetch<{
+            totalUsers: number;
+            onlineUsers: number;
+            totalMessages: number;
+            totalGroups: number;
+          }>('/admin/stats');
+
           setAdminStats({
-            totalUsers,
-            onlineUsers: 0,
-            totalMessages: 0,
-            totalGroups: 0,
+            totalUsers: stats.totalUsers || 0,
+            onlineUsers: stats.onlineUsers || 0,
+            totalMessages: stats.totalMessages || 0,
+            totalGroups: stats.totalGroups || 0,
             loadingStats: false
           });
         } catch (error) {
@@ -147,37 +164,38 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
     e.target.value = '';
   };
 
-  // Handle cropped image upload — compress, upload, save, then refresh
-  const [avatarError, setAvatarError] = useState('');
+  // Handle cropped image upload
   const handleCroppedImage = async (blob: Blob) => {
     setShowCropper(false);
     setCropImageUrl(null);
     setSaving(true);
-    setAvatarError('');
 
     try {
-      const { compressImage } = await import('../services/mediaService');
-      const compressed = await compressImage(blob, 320, 0.85);
-      const file = new File([compressed], `avatar_${Date.now()}.jpg`, { type: 'image/jpeg' });
-      const result = await mediaService.uploadMedia(file, currentUser.id);
+      const file = new File([blob], `avatar_${Date.now()}.jpg`, { type: 'image/jpeg' });
+      const result = await mediaService.uploadAvatar(file, currentUser.id);
 
-      if (result.success && result.url) {
-        await profileService.updateProfile(currentUser.id, {
-          avatar_url: result.url
-        });
-        // Optimistically update the UI immediately
-        onProfileUpdate({ ...currentUser, avatar_url: result.url });
-        // Then re-fetch to get the canonical server URL
-        const updatedProfile = await profileService.getProfile(currentUser.id);
-        if (updatedProfile) {
-          onProfileUpdate(updatedProfile);
-        }
-      } else {
-        setAvatarError(result.error || 'Photo upload failed. Please try again.');
+      if (!result.success || !result.url) {
+        toast.error(result.error || 'Failed to upload photo. Please try again.');
+        return;
       }
-    } catch (error) {
+
+      const updateResult = await profileService.updateProfile(currentUser.id, {
+        avatar_url: result.url
+      });
+
+      if (!updateResult.success) {
+        toast.error(updateResult.error || 'Photo uploaded but could not be saved to your profile.');
+        return;
+      }
+
+      const updatedProfile = await profileService.getProfile(currentUser.id);
+      if (updatedProfile) {
+        onProfileUpdate(updatedProfile);
+      }
+      toast.success('Profile photo updated');
+    } catch (error: any) {
       console.error('Error updating avatar:', error);
-      setAvatarError('Photo update failed. Please try again.');
+      toast.error(error?.message || 'Something went wrong while updating your photo.');
     } finally {
       setSaving(false);
     }
@@ -191,12 +209,11 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
         full_name: name.trim()
       });
       if (result.success) {
-        // Optimistically update immediately
-        onProfileUpdate({ ...currentUser, full_name: name.trim() });
-        setEditingName(false);
-        // Then re-fetch from server for canonical data
         const updatedProfile = await profileService.getProfile(currentUser.id);
-        if (updatedProfile) onProfileUpdate(updatedProfile);
+        if (updatedProfile) {
+          onProfileUpdate(updatedProfile);
+        }
+        setEditingName(false);
       }
     } catch (error) {
       console.error('Error updating name:', error);
@@ -212,10 +229,11 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
         bio: bio.trim()
       });
       if (result.success) {
-        onProfileUpdate({ ...currentUser, bio: bio.trim() });
-        setEditingBio(false);
         const updatedProfile = await profileService.getProfile(currentUser.id);
-        if (updatedProfile) onProfileUpdate(updatedProfile);
+        if (updatedProfile) {
+          onProfileUpdate(updatedProfile);
+        }
+        setEditingBio(false);
       }
     } catch (error) {
       console.error('Error updating bio:', error);
@@ -227,10 +245,16 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
   const handlePrivacyChange = async (key: keyof PrivacySettings, value: PrivacyOption | boolean) => {
     if (!privacySettings) return;
 
+    const previous = privacySettings;
     const updated = { ...privacySettings, [key]: value };
     setPrivacySettings(updated);
 
-    await privacyService.updateSettings(currentUser.id, { [key]: value });
+    const result = await privacyService.updateSettings({ [key]: value });
+    if (!result.success) {
+      // Roll back so the toggle doesn't show a setting that didn't actually save.
+      setPrivacySettings(previous);
+      toast.error('Could not update privacy setting. Please try again.');
+    }
   };
 
   const handleLogout = async () => {
@@ -315,10 +339,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           {/* Profile Card */}
           <button onClick={() => setSection('profile')} className="settings-profile-card">
             <div className="settings-avatar">
-              {currentUser.avatar_url ? (
-                <img src={currentUser.avatar_url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-              ) : null}
-              <span style={{ display: currentUser.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{currentUser.full_name?.charAt(0)}</span>
+              <AvatarOrInitial
+                key={currentUser.avatar_url || 'none'}
+                src={currentUser.avatar_url}
+                alt=""
+                initial={currentUser.full_name?.charAt(0) || '?'}
+              />
             </div>
             <div className="settings-profile-info">
               <h2>{currentUser.full_name}</h2>
@@ -480,10 +506,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           <div className="profile-avatar-section">
             <div className="profile-avatar-wrapper">
               <div className="profile-avatar-large">
-                {currentUser.avatar_url ? (
-                  <img src={currentUser.avatar_url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-                ) : null}
-                <span style={{ display: currentUser.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{currentUser.full_name?.charAt(0)}</span>
+                <AvatarOrInitial
+                  key={currentUser.avatar_url || 'none'}
+                  src={currentUser.avatar_url}
+                  alt=""
+                  initial={currentUser.full_name?.charAt(0) || '?'}
+                />
               </div>
               <label className="profile-camera-btn">
                 <Camera className={`w-5 h-5 ${saving ? 'opacity-50' : ''}`} />
@@ -495,15 +523,6 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
                 />
               </label>
             </div>
-            {avatarError && !saving && (
-              <p className="text-xs text-red-500 font-medium mt-2 text-center">{avatarError}</p>
-            )}
-            {saving && (
-              <p className="text-xs text-violet-600 font-medium mt-2 text-center flex items-center justify-center gap-1">
-                <Loader2 className="w-3 h-3 animate-spin" />
-                Updating photo…
-              </p>
-            )}
           </div>
 
           {/* Profile Info */}
@@ -744,10 +763,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
               {blockedUsers.map((user) => (
                 <div key={user.id} className="blocked-user-item">
                   <div className="blocked-user-avatar">
-                    {user.avatar_url ? (
-                      <img src={user.avatar_url} alt={user.full_name} onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-                    ) : null}
-                    <span style={{ display: user.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{user.full_name?.charAt(0).toUpperCase()}</span>
+                    <AvatarOrInitial
+                      key={user.avatar_url || 'none'}
+                      src={user.avatar_url}
+                      alt={user.full_name}
+                      initial={user.full_name?.charAt(0).toUpperCase() || '?'}
+                    />
                   </div>
                   <div className="blocked-user-info">
                     <span className="blocked-user-name">{user.full_name}</span>
@@ -787,10 +808,12 @@ export function Settings({ currentUser, onBack, onLogout, onProfileUpdate }: Set
           {/* Admin Badge */}
           <div className="admin-badge">
             <div className="admin-badge-avatar">
-              {currentUser.avatar_url ? (
-                <img src={currentUser.avatar_url} alt="" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-              ) : null}
-              <span style={{ display: currentUser.avatar_url ? 'none' : 'flex' }} className="items-center justify-center w-full h-full">{currentUser.full_name?.charAt(0)}</span>
+              <AvatarOrInitial
+                key={currentUser.avatar_url || 'none'}
+                src={currentUser.avatar_url}
+                alt=""
+                initial={currentUser.full_name?.charAt(0) || '?'}
+              />
             </div>
             <div className="admin-badge-info">
               <div className="admin-badge-name">
@@ -1176,8 +1199,8 @@ const settingsStyles = `
   }
 
   .profile-avatar-large {
-    width: 88px;
-    height: 88px;
+    width: 120px;
+    height: 120px;
     border-radius: 50%;
     background: linear-gradient(135deg, #a855f7 0%, #7c3aed 100%);
     display: flex;
@@ -1678,12 +1701,12 @@ const settingsStyles = `
     }
 
     .profile-avatar-large {
-      width: 72px;
-      height: 72px;
+      width: 100px;
+      height: 100px;
     }
 
     .profile-avatar-large span {
-      font-size: 28px;
+      font-size: 36px;
     }
   }
 `;

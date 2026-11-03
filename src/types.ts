@@ -123,6 +123,9 @@ export interface Call {
   ended_at?: string;
   offer_sdp?: RTCSessionDescriptionInit;
   answer_sdp?: RTCSessionDescriptionInit;
+  /** Sent along with the incoming-call event so the ringing screen can show
+   *  a name/avatar immediately, without waiting on a separate profile fetch. */
+  caller_profile?: UserProfile;
 }
 
 export interface CallHistory {
@@ -154,7 +157,13 @@ export interface GroupMember {
   group_id: string;
   user_id: string;
   role: 'admin' | 'member';
+  is_muted?: boolean;
   joined_at: string;
+  // ISO timestamp of the last time this member opened the group chat.
+  // Undefined if they've never read it, or if they've disabled their
+  // read-receipts privacy setting (in which case it's hidden from
+  // everyone but themselves — see worker/src/routes/groups.ts).
+  last_read_at?: string;
   profile?: UserProfile;
 }
 
@@ -174,6 +183,9 @@ export interface GroupMessage {
   sender_profile?: UserProfile;
   is_edited?: boolean;
   edited_at?: string;
+  media_url?: string;
+  thumbnail_url?: string;
+  duration?: string;
 }
 
 export interface FriendRequest {

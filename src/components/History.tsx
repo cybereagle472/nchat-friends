@@ -18,9 +18,10 @@ interface HistoryProps {
   history: HistoryItem[];
   onCall: (userId: string, type: 'voice' | 'video') => void;
   onMessage: (userId: string) => void;
+  onViewProfile?: (userId: string, initialProfile?: UserProfile) => void;
 }
 
-export function History({ history, onCall, onMessage }: HistoryProps) {
+export function History({ history, onCall, onMessage, onViewProfile }: HistoryProps) {
   const [filter, setFilter] = useState<'all' | 'voice' | 'video' | 'missed'>('all');
 
   const formatTimestamp = (timestamp: string) => {
@@ -127,21 +128,28 @@ export function History({ history, onCall, onMessage }: HistoryProps) {
               style={{ animationDelay: `${index * 30}ms` }}
               className="flex items-center gap-3 p-3 mb-2 rounded-2xl backdrop-blur-xl bg-white/70 border border-white/70 hover:bg-white/90 hover:shadow-lg hover:shadow-purple-500/15 transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] animate-slide-up group"
             >
-              <div
-                className={`w-12 h-12 rounded-xl flex items-center justify-center text-xl flex-shrink-0 shadow-md group-hover:scale-105 transition-transform duration-300 overflow-hidden ${
+              <button
+                onClick={() => onViewProfile?.(item.userId, { id: item.userId, email: '', full_name: item.name, avatar_url: item.avatar })}
+                disabled={!onViewProfile}
+                className={`w-12 h-12 rounded-full flex items-center justify-center text-xl flex-shrink-0 shadow-md group-hover:scale-105 transition-transform duration-300 overflow-hidden disabled:cursor-default ${
                   item.direction === 'missed'
                     ? 'bg-gradient-to-br from-red-400 to-rose-400 shadow-red-500/20'
                     : 'bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 shadow-purple-500/20'
                 }`}
+                aria-label="View profile"
               >
                 {item.avatar ? (
                   <img src={item.avatar} alt={item.name} className="w-full h-full object-cover" />
                 ) : (
                   <span className="text-white font-semibold">{item.name.charAt(0).toUpperCase()}</span>
                 )}
-              </div>
+              </button>
 
-              <div className="flex-1 min-w-0">
+              <button
+                onClick={() => onViewProfile?.(item.userId, { id: item.userId, email: '', full_name: item.name, avatar_url: item.avatar })}
+                disabled={!onViewProfile}
+                className="flex-1 min-w-0 text-left disabled:cursor-default"
+              >
                 <div className="flex items-center gap-2 mb-0.5">
                   <h3
                     className={`text-sm font-semibold truncate ${
@@ -178,7 +186,7 @@ export function History({ history, onCall, onMessage }: HistoryProps) {
                 <p className="text-[10px] text-slate-500 font-medium">
                   {formatTimestamp(item.timestamp)}
                 </p>
-              </div>
+              </button>
 
               <div className="flex items-center gap-1 flex-shrink-0">
                 <button

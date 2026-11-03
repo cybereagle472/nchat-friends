@@ -1,9 +1,12 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { authService } from '../services/authService';
 
 interface AuthProps {
   onAuthSuccess: () => void;
 }
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+type EmailCheckStatus = 'idle' | 'checking' | 'available' | 'taken';
 
 export function Auth({ onAuthSuccess }: AuthProps) {
   const [isLogin, setIsLogin] = useState(true);
@@ -16,10 +19,56 @@ export function Auth({ onAuthSuccess }: AuthProps) {
   const [error, setError] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
 
+  // Real-time "is this email already registered" detection while signing
+  // up — tells the user right away instead of letting them fill out the
+  // whole form only to be rejected on submit.
+  const [emailStatus, setEmailStatus] = useState<EmailCheckStatus>('idle');
+  const emailCheckTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const emailCheckSeqRef = useRef(0);
+
+  useEffect(() => {
+    return () => {
+      if (emailCheckTimeoutRef.current) clearTimeout(emailCheckTimeoutRef.current);
+    };
+  }, []);
+
+  const handleEmailChange = (value: string) => {
+    setEmail(value);
+    setEmailStatus('idle');
+    if (emailCheckTimeoutRef.current) clearTimeout(emailCheckTimeoutRef.current);
+
+    // Only meaningful when creating a new account — logging in already
+    // gets clear, specific feedback from the server on submit.
+    if (isLogin) return;
+
+    const trimmed = value.trim();
+    if (!EMAIL_RE.test(trimmed)) return;
+
+    setEmailStatus('checking');
+    const seq = ++emailCheckSeqRef.current;
+    emailCheckTimeoutRef.current = setTimeout(async () => {
+      const { exists, valid } = await authService.checkEmailExists(trimmed);
+      if (seq !== emailCheckSeqRef.current) return; // a newer keystroke superseded this check
+      if (!valid) {
+        setEmailStatus('idle');
+        return;
+      }
+      setEmailStatus(exists ? 'taken' : 'available');
+    }, 500);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading) return; // guard against double-submit (e.g. Enter + click racing)
     setError('');
     setSuccessMessage('');
+
+    const trimmedEmail = email.trim();
+
+    if (!EMAIL_RE.test(trimmedEmail)) {
+      setError('Please enter a valid email address');
+      return;
+    }
 
     if (!isLogin && password !== confirmPassword) {
       setError('Passwords do not match');
@@ -31,18 +80,23 @@ export function Auth({ onAuthSuccess }: AuthProps) {
       return;
     }
 
+    if (!isLogin && emailStatus === 'taken') {
+      setError('This email is already registered — log in instead');
+      return;
+    }
+
     setLoading(true);
 
     try {
       if (isLogin) {
-        const result = await authService.login(email, password);
+        const result = await authService.login(trimmedEmail, password);
         if (result.success) {
           onAuthSuccess();
         } else {
           setError(result.error || 'Login failed');
         }
       } else {
-        const result = await authService.signUp(email, password);
+        const result = await authService.signUp(trimmedEmail, password);
         if (result.success) {
           if (result.needsEmailConfirmation) {
             setSuccessMessage('Check your email to confirm your account!');
@@ -62,6 +116,8 @@ export function Auth({ onAuthSuccess }: AuthProps) {
 
   const switchMode = () => {
     setIsLogin(!isLogin);
+    setEmailStatus('idle');
+    if (emailCheckTimeoutRef.current) clearTimeout(emailCheckTimeoutRef.current);
     setError('');
     setSuccessMessage('');
     setPassword('');
@@ -149,11 +205,39 @@ export function Auth({ onAuthSuccess }: AuthProps) {
                   type="email"
                   placeholder="Enter your email"
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  onChange={(e) => handleEmailChange(e.target.value)}
                   required
+                  disabled={loading}
                   autoComplete="email"
+                  className={!isLogin ? 'has-status-indicator' : undefined}
                 />
+                {!isLogin && emailStatus !== 'idle' && (
+                  <span className="email-status-indicator" aria-live="polite">
+                    {emailStatus === 'checking' && <span className="email-status-spinner" />}
+                    {emailStatus === 'available' && (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="email-status-icon email-status-ok">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                      </svg>
+                    )}
+                    {emailStatus === 'taken' && (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="email-status-icon email-status-warn">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    )}
+                  </span>
+                )}
               </div>
+              {!isLogin && emailStatus === 'taken' && (
+                <p className="field-hint field-hint-warn">
+                  This email is already registered.{' '}
+                  <button type="button" className="field-hint-link" onClick={switchMode}>
+                    Log in instead
+                  </button>
+                </p>
+              )}
+              {!isLogin && emailStatus === 'available' && (
+                <p className="field-hint field-hint-ok">Email available</p>
+              )}
             </div>
 
             {/* Password Field */}
@@ -171,6 +255,7 @@ export function Auth({ onAuthSuccess }: AuthProps) {
                   onChange={(e) => setPassword(e.target.value)}
                   required
                   minLength={6}
+                  disabled={loading}
                   autoComplete={isLogin ? 'current-password' : 'new-password'}
                 />
                 <button
@@ -208,6 +293,7 @@ export function Auth({ onAuthSuccess }: AuthProps) {
                     onChange={(e) => setConfirmPassword(e.target.value)}
                     required
                     minLength={6}
+                    disabled={loading}
                     autoComplete="new-password"
                   />
                   <button
@@ -231,7 +317,11 @@ export function Auth({ onAuthSuccess }: AuthProps) {
             )}
 
             {/* Submit Button */}
-            <button type="submit" className="submit-btn" disabled={loading}>
+            <button
+              type="submit"
+              className="submit-btn"
+              disabled={loading || (!isLogin && emailStatus === 'taken')}
+            >
               {loading ? (
                 <span className="loading-spinner" />
               ) : (
@@ -489,6 +579,71 @@ export function Auth({ onAuthSuccess }: AuthProps) {
           border-color: #a855f7;
           background: #ffffff;
           box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.1);
+        }
+
+        .input-wrapper input:disabled {
+          opacity: 0.65;
+          cursor: not-allowed;
+        }
+
+        .input-wrapper input.has-status-indicator {
+          padding-right: 40px;
+        }
+
+        .email-status-indicator {
+          position: absolute;
+          right: 14px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 18px;
+          height: 18px;
+        }
+
+        .email-status-spinner {
+          width: 16px;
+          height: 16px;
+          border: 2px solid #e5e7eb;
+          border-top-color: #a855f7;
+          border-radius: 50%;
+          animation: spin 0.8s linear infinite;
+        }
+
+        .email-status-icon {
+          width: 18px;
+          height: 18px;
+        }
+
+        .email-status-ok {
+          color: #22c55e;
+        }
+
+        .email-status-warn {
+          color: #ef4444;
+        }
+
+        .field-hint {
+          font-size: 12px;
+          margin: 6px 0 0 2px;
+        }
+
+        .field-hint-ok {
+          color: #16a34a;
+        }
+
+        .field-hint-warn {
+          color: #dc2626;
+        }
+
+        .field-hint-link {
+          background: none;
+          border: none;
+          padding: 0;
+          font-size: 12px;
+          font-weight: 600;
+          color: #7c3aed;
+          text-decoration: underline;
+          cursor: pointer;
         }
 
         .password-toggle {

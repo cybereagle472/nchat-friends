@@ -1,0 +1,85 @@
+name: Build Android APK
+
+# Manual trigger only, on purpose — this repo isn't ready to build on every
+# push yet (we're still actively changing web app features). Run this from
+# the Actions tab → "Build Android APK" → "Run workflow" whenever you
+# actually want a fresh APK. Switch to `on: push: branches: [main]` later
+# once the native app itself is something you want rebuilt automatically.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install web app dependencies
+        run: npm ci
+
+      - name: Build web app
+        # These VITE_* values get baked into the built JS at this step —
+        # Vite is a static site builder, there's no "configure at runtime"
+        # for them once the APK exists. Without VITE_API_URL explicitly
+        # set, the app would silently fall back to localhost:8787, which
+        # doesn't exist on a real phone. Set these as this repo's Actions
+        # → Settings → "Variables"/"Secrets" before actually running this
+        # workflow for real (Settings → Secrets and variables → Actions):
+        #   - VITE_API_URL              (your deployed Worker URL, e.g.
+        #                                 https://nchat-friends.<you>.workers.dev)
+        #   - VITE_VAPID_PUBLIC_KEY     (optional, push notifications)
+        #   - VITE_GIPHY_API_KEY        (optional, GIF picker)
+        #   - VITE_TURN_SERVER_URL / VITE_TURN_SERVER_USERNAME /
+        #     VITE_TURN_SERVER_CREDENTIAL (optional — only needed if not
+        #     already using the Cloudflare TURN route in the Worker)
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+          VITE_VAPID_PUBLIC_KEY: ${{ vars.VITE_VAPID_PUBLIC_KEY }}
+          VITE_GIPHY_API_KEY: ${{ vars.VITE_GIPHY_API_KEY }}
+          VITE_TURN_SERVER_URL: ${{ vars.VITE_TURN_SERVER_URL }}
+          VITE_TURN_SERVER_USERNAME: ${{ vars.VITE_TURN_SERVER_USERNAME }}
+          VITE_TURN_SERVER_CREDENTIAL: ${{ secrets.VITE_TURN_SERVER_CREDENTIAL }}
+        run: npm run build
+
+      - name: Sync web build into the native Android project
+        run: npx cap sync android
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nchat-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

@@ -1,5 +1,15 @@
-import { api, convex } from '../lib/convexClient';
-import type { UserProfile, FriendRequest } from '../types';
+/**
+ * Friend Service — Cloudflare Worker API
+ *
+ * Replaces the old direct-to-Supabase implementation. All reads/writes go
+ * through the Worker's /friends/* routes (backed by D1), and incoming
+ * friend-request / accept / decline events arrive live over the shared
+ * realtime WebSocket (see src/lib/realtimeClient.ts).
+ */
+
+import { apiFetch, ApiError } from '../lib/apiClient';
+import { realtimeClient } from '../lib/realtimeClient';
+import { UserProfile, FriendRequest, Friendship } from '../types';
 
 export interface ServiceResult<T = void> {
   success: boolean;
@@ -18,179 +28,194 @@ export interface RequestData {
   sent: FriendRequest[];
 }
 
-function mapProfile(u: Record<string, unknown> | null | undefined): UserProfile {
-  if (!u) return { id: '', full_name: 'Unknown', email: '' };
-  return {
-    id: u.id as string,
-    full_name: (u.full_name as string) || (u.name as string) || 'User',
-    username: u.username as string | undefined,
-    email: (u.email as string) ?? '',
-    avatar_url: (u.avatar_url ?? u.image) as string | undefined,
-    bio: u.bio as string | undefined,
-    is_online: false,
-  };
-}
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-async function findPendingConnectionId(
-  requesterId: string
-): Promise<string | null> {
-  const raw = await convex.query(api.friends.listAllRequests, {});
-  const { received } = raw as { received: Array<Record<string, unknown>> };
-  const match = received.find((r) => r.sender_id === requesterId);
-  return (match?.id as string) ?? null;
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message;
+  if (err instanceof Error) return err.message;
+  return fallback;
 }
 
 export const friendService = {
+  /** Get all friends for a user */
   async getFriends(_userId: string): Promise<ServiceResult<FriendData>> {
     try {
-      const friends = await convex.query(api.friends.listFriends, {});
-      const profiles = (friends as unknown as Array<Record<string, unknown>>).map(mapProfile);
-      return {
-        success: true,
-        data: { friends: profiles, friendIds: profiles.map((p) => p.id) },
-      };
-    } catch (err) {
-      return { success: false, error: errMsg(err), code: 'UNKNOWN_ERROR' };
-    }
-  },
-
-  async getRequests(_userId: string): Promise<ServiceResult<RequestData>> {
-    try {
-      const raw = await convex.query(api.friends.listAllRequests, {});
-      const { received, sent } = raw as {
-        received: Array<Record<string, unknown>>;
-        sent: Array<Record<string, unknown>>;
-      };
+      const { friends } = await apiFetch<{ friends: { id: string; profile: UserProfile }[] }>('/friends');
       return {
         success: true,
         data: {
-          received: received.map(
-            (r) =>
-              ({
-                id: r.id as string,
-                sender_id: r.sender_id as string,
-                receiver_id: '',
-                sender_profile: mapProfile(r.sender_profile as never),
-                created_at: (r.created_at as string) ?? new Date().toISOString(),
-              }) as FriendRequest
-          ),
-          sent: sent.map(
-            (r) =>
-              ({
-                id: r.id as string,
-                sender_id: '',
-                receiver_id: r.receiver_id as string,
-                receiver_profile: mapProfile(r.receiver_profile as never),
-                created_at: (r.created_at as string) ?? new Date().toISOString(),
-              }) as FriendRequest
-          ),
-        },
+          friends: friends.map((f) => f.profile),
+          friendIds: friends.map((f) => f.id)
+        }
       };
     } catch (err) {
-      return { success: false, error: errMsg(err), code: 'UNKNOWN_ERROR' };
+      return { success: false, error: errorMessage(err, 'Failed to load friends') };
     }
   },
 
-  async sendRequest(
-    _senderId: string,
-    receiverId: string,
-    _skipChecks = false
-  ): Promise<ServiceResult> {
+  /** Check if two users are friends */
+  async areFriends(userId1: string, userId2: string): Promise<boolean> {
+    const result = await this.getFriends(userId1);
+    return !!result.data?.friendIds.includes(userId2);
+  },
+
+  /** Get friend requests (received and sent) */
+  async getRequests(_userId: string): Promise<ServiceResult<RequestData>> {
     try {
-      await convex.mutation(api.friends.sendFriendRequest, {
-        addresseeId: receiverId as never,
-      });
-      return { success: true };
+      const [{ requests }, sentResult] = await Promise.all([
+        apiFetch<{ requests: FriendRequest[] }>('/friends/requests'),
+        apiFetch<{ requests: { id: string; receiver_id: string; created_at: string; updated_at: string }[] }>(
+          '/friends/sent'
+        )
+      ]);
+
+      const sent: FriendRequest[] = sentResult.requests.map((r) => ({
+        id: r.id,
+        sender_id: _userId,
+        receiver_id: r.receiver_id,
+        status: 'pending',
+        created_at: r.created_at,
+        updated_at: r.updated_at
+      }));
+
+      return { success: true, data: { received: requests, sent } };
     } catch (err) {
-      return { success: false, error: errMsg(err), code: 'REQUEST_FAILED' };
+      return { success: false, error: errorMessage(err, 'Failed to load friend requests') };
     }
   },
 
+  /** Send a friend request */
+  async sendRequest(_senderId: string, receiverId: string, _skipChecks = false): Promise<ServiceResult> {
+    if (!receiverId) return { success: false, error: 'Invalid user id', code: 'INVALID_INPUT' };
+    try {
+      const data = await apiFetch<{ success: boolean; id: string }>('/friends/request', {
+        method: 'POST',
+        body: JSON.stringify({ receiver_id: receiverId })
+      });
+      return { success: true, data: data as any };
+    } catch (err) {
+      return { success: false, error: errorMessage(err, 'Failed to send friend request') };
+    }
+  },
+
+  /** Cancel a sent friend request */
   async cancelRequest(_senderId: string, receiverId: string): Promise<ServiceResult> {
     try {
-      await convex.mutation(api.friends.cancelRequest, {
-        addresseeId: receiverId as never,
-      });
+      const { requests } = await apiFetch<{ requests: { id: string; receiver_id: string }[] }>('/friends/sent');
+      const request = requests.find((r) => r.receiver_id === receiverId);
+      if (!request) return { success: true }; // already gone — nothing to do
+
+      await apiFetch(`/friends/request/${request.id}`, { method: 'DELETE' });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      return { success: false, error: errorMessage(err, 'Failed to cancel request') };
     }
   },
 
+  /** Accept a friend request */
   async acceptRequest(requesterId: string, _accepterId: string): Promise<ServiceResult> {
     try {
-      const id = await findPendingConnectionId(requesterId);
-      if (!id) return { success: false, error: 'Request not found' };
-      await convex.mutation(api.friends.respondToFriendRequest, {
-        connectionId: id as never,
-        accept: true,
+      const { requests } = await apiFetch<{ requests: FriendRequest[] }>('/friends/requests');
+      const request = requests.find((r) => r.sender_id === requesterId);
+      if (!request) return { success: false, error: 'Request not found or already processed' };
+
+      await apiFetch(`/friends/${request.id}/respond`, {
+        method: 'POST',
+        body: JSON.stringify({ accept: true })
       });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      return { success: false, error: errorMessage(err, 'Failed to accept request') };
     }
   },
 
-  async declineRequest(requesterId: string, _accepterId: string): Promise<ServiceResult> {
+  /** Decline a friend request */
+  async declineRequest(requesterId: string, _declinerId: string): Promise<ServiceResult> {
     try {
-      const id = await findPendingConnectionId(requesterId);
-      if (!id) return { success: false, error: 'Request not found' };
-      await convex.mutation(api.friends.respondToFriendRequest, {
-        connectionId: id as never,
-        accept: false,
+      const { requests } = await apiFetch<{ requests: FriendRequest[] }>('/friends/requests');
+      const request = requests.find((r) => r.sender_id === requesterId);
+      if (!request) return { success: false, error: 'Request not found or already processed' };
+
+      await apiFetch(`/friends/${request.id}/respond`, {
+        method: 'POST',
+        body: JSON.stringify({ accept: false })
       });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      return { success: false, error: errorMessage(err, 'Failed to decline request') };
     }
   },
 
+  /** Remove a friend (unfriend) */
   async removeFriend(_userId: string, friendId: string): Promise<ServiceResult> {
     try {
-      await convex.mutation(api.friends.removeFriend, {
-        friendId: friendId as never,
-      });
+      await apiFetch(`/friends/${friendId}`, { method: 'DELETE' });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      return { success: false, error: errorMessage(err, 'Failed to remove friend') };
     }
   },
 
-  async blockUser(_userId: string, blockedUserId: string): Promise<ServiceResult> {
+  /** Block a user */
+  async blockUser(_userId: string, blockUserId: string): Promise<ServiceResult> {
     try {
-      await convex.mutation(api.friends.blockUser, {
-        userId: blockedUserId as never,
-      });
+      await apiFetch('/friends/block', { method: 'POST', body: JSON.stringify({ user_id: blockUserId }) });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      return { success: false, error: errorMessage(err, 'Failed to block user') };
     }
   },
 
+  /** Unblock a user */
   async unblockUser(_userId: string, blockedUserId: string): Promise<ServiceResult> {
     try {
-      await convex.mutation(api.friends.unblockUser, {
-        userId: blockedUserId as never,
-      });
+      await apiFetch('/friends/unblock', { method: 'POST', body: JSON.stringify({ user_id: blockedUserId }) });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      return { success: false, error: errorMessage(err, 'Failed to unblock user') };
     }
   },
 
+  /** Get blocked users list */
   async getBlockedUsers(_userId: string): Promise<ServiceResult<UserProfile[]>> {
     try {
-      const blocked = await convex.query(api.friends.listBlocked, {});
-      return {
-        success: true,
-        data: (blocked as unknown as Array<Record<string, unknown>>).map(mapProfile),
-      };
+      const { blocked } = await apiFetch<{ blocked: UserProfile[] }>('/friends/blocked');
+      return { success: true, data: blocked };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      return { success: false, error: errorMessage(err, 'Failed to load blocked users') };
     }
   },
+
+  /** Check if a user is blocked (either direction) */
+  async isBlocked(userId: string, checkUserId: string): Promise<boolean> {
+    const result = await this.getBlockedUsers(userId);
+    return !!result.data?.some((u) => u.id === checkUserId);
+  },
+
+  /** Subscribe to friend-related realtime events (new request / accepted / declined) */
+  subscribeToFriendEvents(
+    _userId: string,
+    callbacks: {
+      onNewRequest?: (request: FriendRequest) => void;
+      onRequestUpdate?: (request: FriendRequest) => void;
+      onFriendshipCreated?: (friendship: Friendship) => void;
+      onFriendshipDeleted?: (friendshipId: string) => void;
+    }
+  ) {
+    const subs = [
+      realtimeClient.on('friend:request', (payload) => {
+        callbacks.onNewRequest?.(payload.request as FriendRequest);
+      }),
+      realtimeClient.on('friend:accepted', (payload) => {
+        callbacks.onFriendshipCreated?.({
+          id: '',
+          user1_id: _userId,
+          user2_id: payload.friend?.id,
+          created_at: new Date().toISOString()
+        });
+      })
+    ];
+
+    return {
+      unsubscribe: () => subs.forEach((s) => s.unsubscribe())
+    };
+  }
 };

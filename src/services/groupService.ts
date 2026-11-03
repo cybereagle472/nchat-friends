@@ -1,11 +1,18 @@
 /**
- * Group Service - Convex-backed implementation.
- * Same public surface as the original Supabase service, backed by the
- * Convex conversations (isGroup) and messages tables.
+ * Group Service — Group Chat Management (Cloudflare Worker backend)
+ *
+ * Mirrors chatService.ts's shape and conventions: apiFetch against the
+ * Worker's /groups routes (worker/src/routes/groups.ts), realtime updates
+ * over the single shared per-user WebSocket (src/lib/realtimeClient.ts)
+ * instead of Supabase Realtime channels, and the same ServiceResult<T>
+ * envelope the rest of the app already expects.
  */
 
-import { api, convex } from '../lib/convexClient';
+import { apiFetch, ApiError } from '../lib/apiClient';
+import { realtimeClient } from '../lib/realtimeClient';
+import { mediaService } from './mediaService';
 import { Group, GroupMember, GroupMessage, UserProfile } from '../types';
+import { generateClientMessageId } from '../utils/offlineStorage';
 
 export interface ServiceResult<T> {
   success: boolean;
@@ -27,6 +34,12 @@ export interface SendGroupMessageParams {
   content: string;
   type?: GroupMessage['type'];
   replyToId?: string;
+  clientMessageId?: string;
+  /** Voice message length in seconds (mirrors chatService's 1:1 param). */
+  duration?: number;
+  /** Downsampled waveform string, stored server-side in thumbnail_url
+   *  (same reuse-the-column trick as 1:1 messages — see chatService). */
+  waveform?: string;
 }
 
 export interface GroupWithMembers extends Group {
@@ -35,426 +48,454 @@ export interface GroupWithMembers extends Group {
   unreadCount?: number;
 }
 
-type AnyRec = Record<string, any>;
-
-function mapProfile(u: AnyRec | null | undefined): UserProfile {
-  if (!u) return { id: '', full_name: 'Unknown', email: '' };
-  return {
-    id: u._id ?? u.id,
-    full_name: u.full_name || u.name || 'User',
-    username: u.username,
-    email: u.email ?? '',
-    avatar_url: u.avatar_url ?? u.image,
-    bio: u.bio,
-    is_online: false,
-  };
+export interface GroupSubscription {
+  unsubscribe: () => void;
 }
 
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-function mapGroupMessage(m: AnyRec, groupId: string): GroupMessage {
-  return {
-    id: m._id,
-    group_id: groupId,
-    sender_id: m.senderId,
-    content: m.body ?? '',
-    type: m.attachmentFileId ? ((m.attachmentType as string) ?? 'file') : 'text',
-    created_at: new Date(m.createdAt).toISOString(),
-    is_read: false,
-    is_deleted: !!m.isDeleted,
-    is_edited: !!m.editedAt,
-    edited_at: m.editedAt ? new Date(m.editedAt).toISOString() : undefined,
-    reactions: (m.reactions as unknown as Record<string, string[]>) ?? {},
-    client_message_id: m.clientMessageId ?? undefined,
-    syncStatus: 'sent',
-  } as unknown as GroupMessage;
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message;
+  if (err instanceof Error) return err.message;
+  return fallback;
 }
 
 class GroupService {
-  async createGroup(
-    params: CreateGroupParams
-  ): Promise<ServiceResult<{ group: Group; members: GroupMember[] }>> {
+  /**
+   * Create a new group
+   */
+  async createGroup(params: CreateGroupParams): Promise<ServiceResult<{ group: Group; members: GroupMember[] }>> {
+    const { name, description, avatarFile, memberIds } = params;
+
+    if (!name.trim()) {
+      return { success: false, error: 'Group name is required' };
+    }
+
+    if (memberIds.length === 0) {
+      return { success: false, error: 'At least one member is required' };
+    }
+
     try {
-      void params.avatarFile; // avatar upload handled via mediaService separately
-      const groupId = await convex.mutation(api.groups.create, {
-        name: params.name,
-        memberIds: params.memberIds as never,
+      let avatar_url: string | undefined;
+      if (avatarFile) {
+        // Best-effort: a failed avatar upload shouldn't block creating the
+        // group at all — it just ends up with no picture.
+        const uploaded = await mediaService.uploadGroupAvatar(avatarFile, 'new');
+        if (uploaded.success) avatar_url = uploaded.url;
+      }
+
+      const { group } = await apiFetch<{ group: GroupWithMembers }>('/groups', {
+        method: 'POST',
+        body: JSON.stringify({ name: name.trim(), description: description?.trim(), avatar_url, memberIds })
       });
-      const group: Group = {
-        id: groupId,
-        name: params.name,
-        description: params.description,
-        created_by: params.createdBy,
-        created_at: new Date().toISOString(),
-      };
-      const members: GroupMember[] = [params.createdBy, ...params.memberIds].map(
-        (uid) => ({
-          group_id: groupId,
-          user_id: uid,
-          role: uid === params.createdBy ? ('admin' as const) : ('member' as const),
-          joined_at: new Date().toISOString(),
-        })
-      );
-      return { success: true, data: { group, members } };
+
+      return { success: true, data: { group, members: group.members } };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      console.error('[GroupService] createGroup error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to create group') };
     }
   }
 
+  /**
+   * Get user's groups with members and last message
+   */
   async getUserGroups(_userId: string): Promise<ServiceResult<GroupWithMembers[]>> {
     try {
-      const { conversations } = await convex.query(api.conversations.list, {});
-      const groups = (conversations as unknown as AnyRec[]).filter((c) => c.isGroup);
+      const { groups } = await apiFetch<{ groups: GroupWithMembers[] }>('/groups');
 
-      const result: GroupWithMembers[] = [];
-      for (const g of groups) {
-        const detail = await this.getGroup(g._id as string);
-        if (detail.success && detail.data) result.push(detail.data);
-      }
-      return { success: true, data: result };
+      const sorted = [...groups].sort((a, b) => {
+        const aTime = a.lastMessage?.created_at || a.created_at;
+        const bTime = b.lastMessage?.created_at || b.created_at;
+        return new Date(bTime).getTime() - new Date(aTime).getTime();
+      });
+
+      return { success: true, data: sorted };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      console.error('[GroupService] getUserGroups error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to load groups') };
     }
   }
 
+  /**
+   * Get group by ID with members
+   */
   async getGroup(groupId: string): Promise<ServiceResult<GroupWithMembers>> {
     try {
-      const conv = await convex.query(api.conversations.get, {
-        conversationId: groupId as never,
-      });
-      if (!conv) return { success: false, error: 'Group not found' };
-
-      const membersRaw = (await convex
-        .query(api.groups.members, { conversationId: groupId as never })
-        .catch(() => [])) as unknown as AnyRec[];
-
-      const members: (GroupMember & { profile?: UserProfile })[] = membersRaw.map(
-        (m) => ({
-          group_id: groupId,
-          user_id: m._id,
-          role: m.isAdmin ? ('admin' as const) : ('member' as const),
-          joined_at: new Date(0).toISOString(),
-          profile: mapProfile(m),
-        })
-      );
-
-      // Latest message for preview
-      let lastMessage: GroupMessage | undefined;
-      try {
-        const res = await convex.query(api.conversations.messages, {
-          conversationId: groupId as never,
-        });
-        const msgs = res.messages as unknown as AnyRec[];
-        const last = msgs[msgs.length - 1];
-        if (last && !last.isDeleted) lastMessage = mapGroupMessage(last, groupId);
-      } catch {
-        /* no messages */
-      }
-
-      return {
-        success: true,
-        data: {
-          id: conv._id,
-          name: conv.name ?? 'Group',
-          created_by: conv.createdById ?? '',
-          created_at: new Date(conv._creationTime).toISOString(),
-          members,
-          lastMessage,
-          unreadCount: 0,
-        },
-      };
+      const { group } = await apiFetch<{ group: GroupWithMembers }>(`/groups/${groupId}`);
+      return { success: true, data: group };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      console.error('[GroupService] getGroup error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to load group') };
     }
   }
 
+  /**
+   * Update group info (name/description/avatar) — admins only
+   */
   async updateGroup(
     groupId: string,
-    userId: string,
-    updates: Partial<Pick<Group, 'name' | 'description' | 'avatar_url'>>
-  ): Promise<ServiceResult<GroupWithMembers>> {
+    _userId: string,
+    updates: { name?: string; description?: string; avatarFile?: File }
+  ): Promise<ServiceResult<Group>> {
     try {
-      void userId;
-      if (updates.name !== undefined) {
-        await convex.mutation(api.groups.rename, {
-          conversationId: groupId as never,
-          name: updates.name,
-        });
+      let avatar_url: string | undefined;
+      if (updates.avatarFile) {
+        const uploaded = await mediaService.uploadGroupAvatar(updates.avatarFile, groupId);
+        if (!uploaded.success) return { success: false, error: uploaded.error || 'Failed to upload avatar' };
+        avatar_url = uploaded.url;
       }
-      return await this.getGroup(groupId);
-    } catch (err) {
-      return { success: false, error: errMsg(err) };
-    }
-  }
 
-  async deleteGroup(groupId: string, _userId: string): Promise<ServiceResult<void>> {
-    // Leave until the group auto-deletes (<2 members remain).
-    return this.leaveGroup(groupId, _userId);
-  }
-
-  async addMember(
-    groupId: string,
-    _adminId: string,
-    newMemberId: string
-  ): Promise<ServiceResult<GroupMember>> {
-    try {
-      await convex.mutation(api.groups.addMembers, {
-        conversationId: groupId as never,
-        userIds: [newMemberId] as never,
+      const { group } = await apiFetch<{ group: Group }>(`/groups/${groupId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          name: updates.name?.trim(),
+          description: updates.description?.trim(),
+          avatar_url
+        })
       });
-      return {
-        success: true,
-        data: {
-          group_id: groupId,
-          user_id: newMemberId,
-          role: 'member',
-          joined_at: new Date().toISOString(),
-        },
-      };
+
+      return { success: true, data: group };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      console.error('[GroupService] updateGroup error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to update group') };
     }
   }
 
-  async removeMember(
-    groupId: string,
-    _adminId: string,
-    memberId: string
-  ): Promise<ServiceResult<void>> {
+  /**
+   * Delete group (admin only)
+   */
+  async deleteGroup(groupId: string, _userId: string): Promise<ServiceResult<void>> {
     try {
-      await convex.mutation(api.groups.removeMember, {
-        conversationId: groupId as never,
-        memberId: memberId as never,
+      await apiFetch(`/groups/${groupId}`, { method: 'DELETE' });
+      return { success: true };
+    } catch (err) {
+      console.error('[GroupService] deleteGroup error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to delete group') };
+    }
+  }
+
+  /**
+   * Add a member to a group (admin only)
+   */
+  async addMember(groupId: string, _adminId: string, newMemberId: string): Promise<ServiceResult<void>> {
+    try {
+      await apiFetch(`/groups/${groupId}/members`, {
+        method: 'POST',
+        body: JSON.stringify({ memberIds: [newMemberId] })
       });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      console.error('[GroupService] addMember error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to add member') };
     }
   }
 
+  /**
+   * Remove a member from a group (admin only, or yourself)
+   */
+  async removeMember(groupId: string, _adminId: string, memberId: string): Promise<ServiceResult<void>> {
+    try {
+      await apiFetch(`/groups/${groupId}/members/${memberId}`, { method: 'DELETE' });
+      return { success: true };
+    } catch (err) {
+      console.error('[GroupService] removeMember error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to remove member') };
+    }
+  }
+
+  /**
+   * Leave group
+   */
   async leaveGroup(groupId: string, _userId: string): Promise<ServiceResult<void>> {
     try {
-      await convex.mutation(api.groups.leave, {
-        conversationId: groupId as never,
-      });
+      await apiFetch(`/groups/${groupId}/leave`, { method: 'POST' });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      console.error('[GroupService] leaveGroup error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to leave group') };
     }
   }
 
-  async promoteMember(_g: string, _a: string, _m: string): Promise<ServiceResult<void>> {
-    return { success: false, error: 'Roles are fixed in this version' };
+  /**
+   * Promote member to admin
+   */
+  async promoteMember(groupId: string, _adminId: string, memberId: string): Promise<ServiceResult<void>> {
+    try {
+      await apiFetch(`/groups/${groupId}/members/${memberId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ role: 'admin' })
+      });
+      return { success: true };
+    } catch (err) {
+      console.error('[GroupService] promoteMember error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to promote member') };
+    }
   }
 
-  async demoteMember(_g: string, _a: string, _m: string): Promise<ServiceResult<void>> {
-    return { success: false, error: 'Roles are fixed in this version' };
+  /**
+   * Demote admin to member
+   */
+  async demoteMember(groupId: string, _adminId: string, memberId: string): Promise<ServiceResult<void>> {
+    try {
+      await apiFetch(`/groups/${groupId}/members/${memberId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ role: 'member' })
+      });
+      return { success: true };
+    } catch (err) {
+      console.error('[GroupService] demoteMember error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to demote member') };
+    }
   }
 
+  /**
+   * Get group messages with pagination
+   */
   async getMessages(
     groupId: string,
-    opts?: { limit?: number; beforeTimestamp?: string | number }
+    options: { limit?: number; beforeTimestamp?: string } = {}
   ): Promise<ServiceResult<GroupMessage[]>> {
+    const { limit = 50, beforeTimestamp } = options;
+
     try {
-      const rawBefore = opts?.beforeTimestamp;
-      const cursor = rawBefore ? new Date(rawBefore).getTime() : undefined;
-      const res = await convex.query(api.conversations.messages, {
-        conversationId: groupId as never,
-        cursor,
-      });
-      const all = (res.messages as unknown as AnyRec[]).filter(
-        (m) => !m.isDeleted
-      );
-      const limit = opts?.limit ?? all.length;
-      // Return the OLDEST `limit` messages when paginating backwards.
-      const page = all.slice(0, Math.min(limit, all.length));
-      const msgs = page.map((m) => mapGroupMessage(m, groupId));
-      return { success: true, data: msgs };
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (beforeTimestamp) params.set('before', beforeTimestamp);
+
+      const { messages } = await apiFetch<{ messages: GroupMessage[] }>(`/groups/${groupId}/messages?${params}`);
+      return { success: true, data: messages };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      console.error('[GroupService] getMessages error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to load messages') };
     }
   }
 
-  async sendMessage(
-    params: SendGroupMessageParams
-  ): Promise<
-    ServiceResult<{ message: GroupMessage; clientMessageId: string; isOffline: boolean }>
-  > {
-    const clientMessageId = `gm_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  /**
+   * Send group message
+   */
+  async sendMessage(params: SendGroupMessageParams): Promise<ServiceResult<{ message: GroupMessage; clientMessageId: string; isOffline: boolean }>> {
+    const { groupId, senderId, content, type = 'text', replyToId, duration, waveform } = params;
+
+    if (!content.trim() && type === 'text') {
+      return { success: false, error: 'Message content is required' };
+    }
+
+    const clientMessageId = params.clientMessageId || generateClientMessageId();
+
     try {
-      const type = params.type ?? 'text';
-      let messageId: string;
-      if (type === 'text') {
-        messageId = await convex.mutation(api.messages.send, {
-          conversationId: params.groupId as never,
-          body: params.content,
-          clientMessageId,
-        });
-      } else {
-        messageId = await convex.mutation(api.messages.sendWithAttachment, {
-          conversationId: params.groupId as never,
-          body: '',
-          clientMessageId,
-          attachmentFileId: params.content,
-          attachmentName: String(type),
-          attachmentType: String(type),
-        });
-      }
-      const message: GroupMessage = mapGroupMessage(
-        { _id: messageId, senderId: params.senderId, body: params.content, createdAt: Date.now(), clientMessageId, attachmentType: type === 'text' ? null : type, attachmentFileId: type === 'text' ? null : params.content },
-        params.groupId
-      );
+      const { message } = await apiFetch<{ message: GroupMessage }>(`/groups/${groupId}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({
+          content: content.trim(),
+          type,
+          duration,
+          thumbnail_url: waveform,
+          reply_to: replyToId,
+          client_message_id: clientMessageId
+        })
+      });
+
       return {
         success: true,
-        data: { message, clientMessageId, isOffline: false },
+        data: { message, clientMessageId, isOffline: false }
       };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      return {
+        success: false,
+        error: errorMessage(err, 'Failed to send message'),
+        data: {
+          message: {
+            id: clientMessageId,
+            group_id: groupId,
+            sender_id: senderId,
+            content: content.trim(),
+            type,
+            created_at: new Date().toISOString(),
+            reply_to: replyToId,
+            client_message_id: clientMessageId
+          } as GroupMessage,
+          clientMessageId,
+          isOffline: true
+        }
+      };
     }
   }
 
+  /**
+   * Delete message for self
+   */
   async deleteMessageForMe(messageId: string, _userId: string): Promise<ServiceResult<void>> {
-    // Local-only deletion isn't persisted in this version.
-    void messageId;
-    return { success: true };
+    try {
+      await apiFetch(`/groups/messages/${messageId}/delete-for-me`, { method: 'POST' });
+      return { success: true };
+    } catch (err) {
+      console.error('[GroupService] deleteMessageForMe error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to delete message') };
+    }
   }
 
+  /**
+   * Delete message for everyone (sender only, within time limit)
+   */
   async deleteMessageForEveryone(messageId: string, _senderId: string): Promise<ServiceResult<void>> {
     try {
-      await convex.mutation(api.messages.deleteMessage, {
-        messageId: messageId as never,
-      });
+      await apiFetch(`/groups/messages/${messageId}/delete-for-everyone`, { method: 'POST' });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      console.error('[GroupService] deleteMessageForEveryone error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to delete message') };
     }
   }
 
+  /**
+   * Toggle a reaction (adds it if the user hasn't reacted with this emoji
+   * yet, removes it otherwise) — same semantics as the 1:1 chat reaction
+   * endpoint this mirrors.
+   */
+  private async toggleReaction(messageId: string, emoji: string): Promise<ServiceResult<void>> {
+    try {
+      await apiFetch(`/groups/messages/${messageId}/reaction`, {
+        method: 'POST',
+        body: JSON.stringify({ emoji })
+      });
+      return { success: true };
+    } catch (err) {
+      console.error('[GroupService] reaction error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to update reaction') };
+    }
+  }
+
+  /** Add reaction to message */
   async addReaction(messageId: string, _userId: string, emoji: string): Promise<ServiceResult<void>> {
-    try {
-      await convex.mutation(api.messages.toggleReaction, {
-        messageId: messageId as never,
-        emoji,
-      });
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: errMsg(err) };
-    }
+    return this.toggleReaction(messageId, emoji);
   }
 
+  /** Remove reaction from message */
   async removeReaction(messageId: string, _userId: string, emoji: string): Promise<ServiceResult<void>> {
-    try {
-      await convex.mutation(api.messages.toggleReaction, {
-        messageId: messageId as never,
-        emoji,
-      });
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: errMsg(err) };
-    }
+    return this.toggleReaction(messageId, emoji);
   }
 
+  /**
+   * Mark a group as read as of now (POST /groups/:id/read). Updates this
+   * member's read high-water-mark server-side (worker/migrations/
+   * 0004_group_read_state.sql) — drives both the Groups list unread badge
+   * and, once broadcast out via subscribeToGroupReadReceipts, the
+   * double-check "read" tick on messages this user has sent.
+   */
   async markAsRead(groupId: string, _userId: string): Promise<ServiceResult<void>> {
     try {
-      await convex.mutation(api.conversations.markRead, {
-        conversationId: groupId as never,
-      });
+      await apiFetch(`/groups/${groupId}/read`, { method: 'POST' });
       return { success: true };
     } catch (err) {
-      return { success: false, error: errMsg(err) };
+      console.error('[GroupService] markAsRead error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to mark group as read') };
     }
   }
 
-  /** Polling substitute for Supabase realtime channel. */
+  /**
+   * Mute/unmute group for the current user
+   */
+  async toggleMute(groupId: string, _userId: string, muted: boolean): Promise<ServiceResult<void>> {
+    try {
+      await apiFetch(`/groups/${groupId}/mute`, {
+        method: 'PATCH',
+        body: JSON.stringify({ muted })
+      });
+      return { success: true };
+    } catch (err) {
+      console.error('[GroupService] toggleMute error:', err);
+      return { success: false, error: errorMessage(err, 'Failed to update mute setting') };
+    }
+  }
+
+  /**
+   * Subscribe to new/updated/deleted messages for a group. Backed by the
+   * single shared per-user WebSocket (src/lib/realtimeClient.ts) — the
+   * Worker fans group events out to every member's personal room, so this
+   * just filters for the group this caller cares about.
+   */
   subscribeToGroupMessages(
     groupId: string,
     onNewMessage: (message: GroupMessage) => void,
-    onUpdate?: (message: GroupMessage) => void
-  ): { unsubscribe: () => void } {
-    const seen = new Set<string>();
-    const known = new Map<string, string>();
+    onMessageUpdate?: (message: GroupMessage) => void,
+    onMessageDelete?: (messageId: string) => void
+  ): GroupSubscription {
+    const subs: GroupSubscription[] = [];
 
-    const poll = async () => {
-      try {
-        const res = await convex.query(api.conversations.messages, {
-          conversationId: groupId as never,
-        });
-        for (const m of res.messages as unknown as AnyRec[]) {
-          if (!seen.has(m._id)) {
-            seen.add(m._id);
-            known.set(m._id, JSON.stringify(m));
-            onNewMessage(mapGroupMessage(m, groupId));
-          } else {
-            const curr = JSON.stringify(m);
-            if (known.get(m._id) !== curr) {
-              known.set(m._id, curr);
-              onUpdate?.(mapGroupMessage(m, groupId));
-            }
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    };
+    subs.push(
+      realtimeClient.on('group-message:new', (payload) => {
+        if (payload?.message?.group_id !== groupId) return;
+        onNewMessage(payload.message as GroupMessage);
+      })
+    );
 
-    poll();
-    const interval = setInterval(poll, 2500);
-    return { unsubscribe: () => clearInterval(interval) };
+    subs.push(
+      realtimeClient.on('group-message:reaction', (payload) => {
+        if (payload?.group_id !== groupId || !onMessageUpdate) return;
+        onMessageUpdate({ id: payload.message_id, reactions: payload.reactions } as GroupMessage);
+      })
+    );
+
+    subs.push(
+      realtimeClient.on('group-message:delete', (payload) => {
+        if (payload?.group_id !== groupId) return;
+        onMessageDelete?.(payload.message_id);
+      })
+    );
+
+    return { unsubscribe: () => subs.forEach((s) => s.unsubscribe()) };
   }
 
+  /**
+   * Subscribe to group membership changes (join/leave/role change).
+   */
   subscribeToGroupMembers(
     groupId: string,
-    onJoin: (member: GroupMember & { profile?: UserProfile }) => void,
-    onLeave?: (userId: string) => void,
-    onUpdate?: (member: GroupMember & { profile?: UserProfile }) => void
-  ): { unsubscribe: () => void } {
-    let knownIds = new Set<string>();
-    let knownSig = new Map<string, string>();
-    let firstRun = true;
+    onMemberJoin: (member: GroupMember) => void,
+    onMemberLeave: (userId: string) => void,
+    onMemberUpdate?: (member: GroupMember) => void
+  ): GroupSubscription {
+    const subs: GroupSubscription[] = [];
 
-    const poll = async () => {
-      try {
-        const raw = (await convex.query(api.groups.members, {
-          conversationId: groupId as never,
-        })) as unknown as AnyRec[];
-        const members: (GroupMember & { profile?: UserProfile })[] = raw.map(
-          (m) => ({
-            group_id: groupId,
-            user_id: m._id,
-            role: m.isAdmin ? ('admin' as const) : ('member' as const),
-            joined_at: new Date(0).toISOString(),
-            profile: mapProfile(m),
-          })
-        );
-        const ids = new Set(members.map((m) => m.user_id));
+    subs.push(
+      realtimeClient.on('group-member:joined', (payload) => {
+        if (payload?.group_id !== groupId) return;
+        (payload.members as GroupMember[] | undefined)?.forEach(onMemberJoin);
+      })
+    );
 
-        if (!firstRun) {
-          for (const m of members) {
-            if (!knownIds.has(m.user_id)) onJoin(m);
-            else if (knownSig.get(m.user_id) !== JSON.stringify(m)) onUpdate?.(m);
-          }
-          for (const id of knownIds) {
-            if (!ids.has(id)) onLeave?.(id);
-          }
-        }
-        firstRun = false;
-        knownIds = ids;
-        knownSig = new Map(members.map((m) => [m.user_id, JSON.stringify(m)]));
-      } catch {
-        /* ignore */
-      }
-    };
-    poll();
-    const interval = setInterval(poll, 5000);
-    return { unsubscribe: () => clearInterval(interval) };
+    subs.push(
+      realtimeClient.on('group-member:left', (payload) => {
+        if (payload?.group_id !== groupId) return;
+        onMemberLeave(payload.user_id);
+      })
+    );
+
+    subs.push(
+      realtimeClient.on('group-member:updated', (payload) => {
+        if (payload?.group_id !== groupId || !onMemberUpdate) return;
+        (payload.members as GroupMember[] | undefined)?.forEach(onMemberUpdate);
+      })
+    );
+
+    return { unsubscribe: () => subs.forEach((s) => s.unsubscribe()) };
   }
 
-  async toggleMute(_groupId: string, _userId: string, _muted: boolean): Promise<ServiceResult<void>> {
-    /* Mute state is local-only in this version */
-    return { success: true };
+  /**
+   * Subscribe to "member X has read this group up to now" events (POST
+   * /groups/:id/read on the Worker). Only fires for members who have read
+   * receipts enabled — see that route for the privacy rule. The caller is
+   * responsible for turning a stream of these into "is my message read by
+   * everyone" (see useGroupChat.ts).
+   */
+  subscribeToGroupReadReceipts(
+    groupId: string,
+    onRead: (userId: string, readAt: string) => void
+  ): GroupSubscription {
+    const sub = realtimeClient.on('group-message:read', (payload) => {
+      if (payload?.group_id !== groupId) return;
+      onRead(payload.reader_id, payload.read_at);
+    });
+    return { unsubscribe: () => sub.unsubscribe() };
   }
 }
 
 export const groupService = new GroupService();
+export default groupService;

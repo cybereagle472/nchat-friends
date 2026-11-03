@@ -3,7 +3,7 @@
  * WhatsApp-style message actions: Reactions, Edit, Delete, Forward
  */
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Smile,
@@ -61,6 +61,7 @@ export function MessageActions({
   const [editText, setEditText] = useState(message.content);
   const [isProcessing, setIsProcessing] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
 
   // Close on click outside
   useEffect(() => {
@@ -72,6 +73,36 @@ export function MessageActions({
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [onClose]);
+
+  // Position the context menu using its *real* rendered size instead of a
+  // guessed width/height — the quick-reactions row alone (6 emoji buttons
+  // plus the "more" button) is wider than a 200px guess, and the action
+  // list's height varies with how many rows actually show (Edit only for
+  // your own recent text messages, Copy only for text messages, etc.), so
+  // a fixed estimate reliably left part of the menu rendered off-screen.
+  // Measuring synchronously after mount (before the browser paints) and
+  // only revealing the menu once positioned avoids any visible flash at
+  // the wrong spot.
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!el || showEditModal || showDeleteConfirm || showAllReactions) return;
+    const margin = 8;
+    const rect = el.getBoundingClientRect();
+    let left = position.x;
+    let top = position.y;
+
+    if (left + rect.width + margin > window.innerWidth) {
+      left = window.innerWidth - rect.width - margin;
+    }
+    if (left < margin) left = margin;
+
+    if (top + rect.height + margin > window.innerHeight) {
+      top = window.innerHeight - rect.height - margin;
+    }
+    if (top < margin) top = margin;
+
+    setMenuPos({ left, top });
+  }, [position.x, position.y, showEditModal, showDeleteConfirm, showAllReactions]);
 
   // Check if message can be edited (only text, within 15 minutes, own message)
   const canEdit = isOwn &&
@@ -169,28 +200,6 @@ export function MessageActions({
   const handleReply = () => {
     onReply?.(message);
     onClose();
-  };
-
-  // Calculate menu position to keep it in viewport
-  const getMenuStyle = () => {
-    const menuWidth = 200;
-    const menuHeight = 300;
-    let x = position.x;
-    let y = position.y;
-
-    // Adjust horizontal position
-    if (x + menuWidth > window.innerWidth) {
-      x = window.innerWidth - menuWidth - 16;
-    }
-    if (x < 16) x = 16;
-
-    // Adjust vertical position
-    if (y + menuHeight > window.innerHeight) {
-      y = window.innerHeight - menuHeight - 16;
-    }
-    if (y < 16) y = 16;
-
-    return { left: x, top: y };
   };
 
   // All modal content rendered via Portal to escape stacking context
@@ -333,7 +342,12 @@ export function MessageActions({
       <div
         ref={menuRef}
         className="absolute bg-white rounded-2xl shadow-2xl overflow-hidden animate-scale-in min-w-[200px]"
-        style={{ ...getMenuStyle(), zIndex: 100000 }}
+        style={{
+          left: menuPos?.left ?? position.x,
+          top: menuPos?.top ?? position.y,
+          visibility: menuPos ? 'visible' : 'hidden',
+          zIndex: 100000
+        }}
         onClick={e => e.stopPropagation()}
       >
         {/* Quick Reactions */}

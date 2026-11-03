@@ -1,18 +1,18 @@
 /**
- * useGroupChat Hook - Offline-First Group Chat Management
+ * useGroupChat Hook - Group Chat Management (Cloudflare Worker backend)
  *
  * Provides:
  * - Group message loading with pagination
  * - Optimistic message sending
- * - Realtime subscriptions
+ * - Realtime subscriptions (single shared per-user WebSocket, see groupService)
  * - Sync status tracking
- * - Member profile caching
+ * - Member profiles (sourced straight from groupService.getGroup(), which
+ *   already joins each member's profile server-side — no separate lookup)
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { GroupMessage, GroupMember, UserProfile } from '../types';
-import { groupService } from '../services/groupService';
-import { supabase } from '../supabaseClient';
+import { groupService, GroupSubscription } from '../services/groupService';
 import { isOnline, setupConnectivityListeners } from '../utils/offlineStorage';
 
 export type GroupMessageSyncStatus = 'pending' | 'sending' | 'sent' | 'failed';
@@ -40,6 +40,7 @@ export interface UseGroupChatReturn {
   isOnline: boolean;
   error: string | null;
   hasMore: boolean;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   sendMessage: (content: string, type?: GroupMessage['type'], extras?: any) => Promise<void>;
   loadMessages: (forceRefresh?: boolean) => Promise<void>;
   loadMoreMessages: () => Promise<void>;
@@ -63,31 +64,28 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
   const [error, setError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(true);
 
-  const messagesChannelRef = useRef<any>(null);
-  const membersChannelRef = useRef<any>(null);
+  const messagesSubRef = useRef<GroupSubscription | null>(null);
+  const membersSubRef = useRef<GroupSubscription | null>(null);
+  const readReceiptSubRef = useRef<GroupSubscription | null>(null);
   const oldestMessageRef = useRef<string | null>(null);
 
-  // Fetch member profiles
-  const fetchMemberProfiles = useCallback(async (memberList: GroupMember[]) => {
-    const userIds = memberList.map(m => m.user_id);
-    if (userIds.length === 0) return;
+  // Per-member "read up to" timestamps (ISO strings), used to derive the
+  // double-check "read by everyone" tick on messages *I* sent. Seeded from
+  // each member's last_read_at (groupWithMembers() on the Worker) and kept
+  // live by subscribeToGroupReadReceipts below — no refetch needed when
+  // someone reads the chat while it's open.
+  const [readStates, setReadStates] = useState<Record<string, string>>({});
 
-    try {
-      const { data: profiles } = await supabase
-        .from('profiles')
-        .select('*')
-        .in('id', userIds);
-
-      if (profiles) {
-        const profileMap: Record<string, UserProfile> = {};
-        profiles.forEach(p => {
-          profileMap[p.id] = p;
-        });
-        setMemberProfiles(prev => ({ ...prev, ...profileMap }));
-      }
-    } catch (err) {
-      console.error('[useGroupChat] fetchMemberProfiles error:', err);
-    }
+  const applyMembers = useCallback((memberList: GroupMember[]) => {
+    setMembers(memberList);
+    const profileMap: Record<string, UserProfile> = {};
+    const readMap: Record<string, string> = {};
+    memberList.forEach((m) => {
+      if (m.profile) profileMap[m.user_id] = m.profile;
+      if (m.last_read_at) readMap[m.user_id] = m.last_read_at;
+    });
+    setMemberProfiles((prev) => ({ ...prev, ...profileMap }));
+    setReadStates((prev) => ({ ...prev, ...readMap }));
   }, []);
 
   // Setup connectivity listeners
@@ -105,6 +103,7 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
     );
 
     return cleanup;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupId, userId]);
 
   // Load messages
@@ -130,26 +129,11 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
         }
 
         setHasMore(result.data.length === 50);
-      } else {
-        // Handle specific RLS policy errors gracefully
-        const errorMessage = result.error || 'Failed to load messages';
-        if (errorMessage.includes('infinite recursion') || errorMessage.includes('policy')) {
-          // This is a database configuration issue - don't show technical error to user
-          console.error('[useGroupChat] RLS Policy Error:', errorMessage);
-          setError(null); // Clear error - messages will load from cache if available
-        } else {
-          setError(errorMessage);
-        }
+      } else if (result.error) {
+        setError(result.error);
       }
     } catch (err: any) {
-      const errorMessage = err.message || 'Failed to load messages';
-      // Handle specific RLS policy errors gracefully
-      if (errorMessage.includes('infinite recursion') || errorMessage.includes('policy')) {
-        console.error('[useGroupChat] RLS Policy Error:', errorMessage);
-        setError(null);
-      } else {
-        setError(errorMessage);
-      }
+      setError(err.message || 'Failed to load messages');
     } finally {
       setIsLoading(false);
     }
@@ -182,10 +166,7 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
         setHasMore(result.data.length === 50);
       }
     } catch (err: any) {
-      const errorMessage = err.message || 'Failed to load more messages';
-      if (!errorMessage.includes('infinite recursion') && !errorMessage.includes('policy')) {
-        setError(errorMessage);
-      }
+      setError(err.message || 'Failed to load more messages');
     } finally {
       setIsLoading(false);
     }
@@ -208,13 +189,15 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
         senderId: userId,
         content,
         type,
-        replyToId: extras.replyToId
+        replyToId: extras.replyToId,
+        duration: extras.duration,
+        waveform: extras.waveform
       });
 
       if (result.data) {
         const messageWithStatus: GroupMessageWithStatus = {
           ...result.data.message,
-          syncStatus: result.data.isOffline ? 'pending' : (result.success ? 'sent' : 'failed'),
+          syncStatus: result.data.isOffline ? 'failed' : 'sent',
           clientMessageId: result.data.clientMessageId,
           sender_profile: memberProfiles[userId]
         };
@@ -337,7 +320,8 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
         groupId: msg.group_id,
         senderId: msg.sender_id,
         content: msg.content,
-        type: msg.type
+        type: msg.type,
+        clientMessageId: msg.clientMessageId || msg.client_message_id
       });
 
       setMessages(prev => prev.map(m =>
@@ -346,6 +330,7 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
           : m
       ));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
   // Load initial data and subscribe
@@ -354,39 +339,23 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
 
     const loadInitialData = async () => {
       try {
-        // Load group with members
         const groupResult = await groupService.getGroup(groupId);
         if (groupResult.success && groupResult.data) {
-          setMembers(groupResult.data.members);
-          await fetchMemberProfiles(groupResult.data.members);
+          applyMembers(groupResult.data.members);
         } else if (groupResult.error) {
-          // Handle RLS policy errors gracefully
-          const errorMessage = groupResult.error;
-          if (errorMessage.includes('infinite recursion') || errorMessage.includes('policy')) {
-            console.error('[useGroupChat] RLS Policy Error in getGroup:', errorMessage);
-            // Don't set error - just log it
-          }
+          setError(groupResult.error);
         }
 
-        // Load messages
         await loadMessages();
-
-        // Mark as read
         await markAsRead();
       } catch (err: any) {
-        const errorMessage = err.message || '';
-        if (!errorMessage.includes('infinite recursion') && !errorMessage.includes('policy')) {
-          setError(errorMessage);
-        } else {
-          console.error('[useGroupChat] RLS Policy Error:', errorMessage);
-        }
+        setError(err.message || 'Failed to load group');
       }
     };
 
     loadInitialData();
 
-    // Subscribe to messages
-    messagesChannelRef.current = groupService.subscribeToGroupMessages(
+    messagesSubRef.current = groupService.subscribeToGroupMessages(
       groupId,
       (newMessage) => {
         setMessages(prev => {
@@ -408,21 +377,41 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
           return prev;
         });
         onNewMessage?.(newMessage);
+
+        // Keep advancing my read high-water-mark while the chat stays
+        // open, same as ChatView does for 1:1 — otherwise my last_read_at
+        // would freeze at "whenever I opened this screen" and every
+        // message that arrives afterwards would still count as unread the
+        // moment I leave, even though I was looking right at it.
+        if (newMessage.sender_id !== userId) {
+          markAsRead();
+        }
       },
       (updatedMessage) => {
         setMessages(prev => prev.map(m =>
-          m.id === updatedMessage.id ? { ...updatedMessage, syncStatus: 'sent' } : m
+          m.id === updatedMessage.id ? { ...m, ...updatedMessage, syncStatus: 'sent' } : m
         ));
         onMessageUpdate?.(updatedMessage);
+      },
+      (deletedMessageId) => {
+        setMessages(prev => prev.map(m =>
+          m.id === deletedMessageId ? { ...m, is_deleted: true, content: 'This message was deleted' } : m
+        ));
       }
     );
 
-    // Subscribe to members
-    membersChannelRef.current = groupService.subscribeToGroupMembers(
+    readReceiptSubRef.current = groupService.subscribeToGroupReadReceipts(
       groupId,
-      async (newMember) => {
-        setMembers(prev => [...prev, newMember]);
-        await fetchMemberProfiles([newMember]);
+      (readerId, readAt) => {
+        setReadStates(prev => ({ ...prev, [readerId]: readAt }));
+      }
+    );
+
+    membersSubRef.current = groupService.subscribeToGroupMembers(
+      groupId,
+      (newMember) => {
+        setMembers(prev => (prev.some(m => m.user_id === newMember.user_id) ? prev : [...prev, newMember]));
+        if (newMember.profile) setMemberProfiles(prev => ({ ...prev, [newMember.user_id]: newMember.profile! }));
         onMemberJoin?.(newMember);
       },
       (leftUserId) => {
@@ -437,17 +426,30 @@ export function useGroupChat(options: UseGroupChatOptions): UseGroupChatReturn {
     );
 
     return () => {
-      if (messagesChannelRef.current) {
-        supabase.removeChannel(messagesChannelRef.current);
-      }
-      if (membersChannelRef.current) {
-        supabase.removeChannel(membersChannelRef.current);
-      }
+      messagesSubRef.current?.unsubscribe();
+      membersSubRef.current?.unsubscribe();
+      readReceiptSubRef.current?.unsubscribe();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupId, userId]);
 
-  // Filter out deleted messages for current user
-  const filteredMessages = messages.filter(m => !m.deleted_for?.includes(userId || ''));
+  // Filter out deleted messages for current user, and derive the
+  // double-check "read by everyone" tick on my own sent messages from the
+  // live readStates map — a message is read once every *other* current
+  // member's last known read timestamp is at or after it was sent. (Other
+  // members' own incoming messages don't carry a meaningful is_read here;
+  // the UI only ever renders this for the current user's own bubbles.)
+  const otherMemberIds = members.filter(m => m.user_id !== userId).map(m => m.user_id);
+  const filteredMessages = messages
+    .filter(m => !m.deleted_for?.includes(userId || ''))
+    .map(m => {
+      if (m.sender_id !== userId) return m;
+      const isRead = otherMemberIds.length > 0 && otherMemberIds.every(id => {
+        const readAt = readStates[id];
+        return !!readAt && readAt >= m.created_at;
+      });
+      return isRead === m.is_read ? m : { ...m, is_read: isRead };
+    });
 
   return {
     messages: filteredMessages,

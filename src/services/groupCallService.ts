@@ -1,614 +1,217 @@
 /**
- * Group Call Service
- * Supports up to 8 participants using WebRTC mesh network
- * Uses Supabase Realtime for signaling (FREE)
- * Uses free STUN servers, optional TURN for NAT traversal
+ * Group Call Service — WebRTC Signaling for group voice/video calls
+ * (Cloudflare Worker backend).
+ *
+ * Mirrors callService.ts's shape and conventions exactly (apiFetch against
+ * the Worker, events delivered over the shared per-user WebSocket), but
+ * for worker/src/routes/groupCalls.ts's group-aware routes instead of
+ * calls.ts's 1:1 ones. The actual WebRTC primitives (getUserMedia,
+ * RTCPeerConnection, ICE server config, audio-bitrate tuning) are generic
+ * and not 1:1-specific at all — GroupCallModal.tsx calls `callService`
+ * directly for those instead of this module duplicating them.
  */
 
-import { supabase } from '../supabaseClient';
+import { apiFetch } from '../lib/apiClient';
+import { realtimeClient } from '../lib/realtimeClient';
 import { UserProfile } from '../types';
 
-// Free STUN servers (Google, Twilio)
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' },
-  { urls: 'stun:global.stun.twilio.com:3478' }
-];
-
-export type CallType = 'audio' | 'video';
-export type ParticipantState = 'connecting' | 'connected' | 'disconnected' | 'failed';
-
-export interface GroupCallParticipant {
-  id: string;
-  profile: UserProfile;
-  state: ParticipantState;
-  stream?: MediaStream;
-  isMuted: boolean;
-  isVideoOff: boolean;
-  isSpeaking: boolean;
+export interface GroupCallParticipantBrief {
+  userId: string;
+  fullName: string;
+  avatarUrl?: string;
 }
 
-export interface GroupCall {
+export interface GroupCallSession {
   id: string;
   groupId: string;
-  type: CallType;
-  hostId: string;
-  participants: Map<string, GroupCallParticipant>;
+  callerId: string;
+  callType: 'audio' | 'video';
+  status: 'active' | 'ended';
   startedAt: string;
-  isActive: boolean;
+  groupName?: string;
+  groupAvatarUrl?: string;
+  callerProfile?: UserProfile;
 }
 
-type SignalType = 'offer' | 'answer' | 'ice-candidate' | 'join' | 'leave' | 'mute' | 'video-off';
-
-interface SignalMessage {
-  type: SignalType;
-  from: string;
-  to?: string;
-  payload?: any;
+export interface ServiceResult<T = void> {
+  success: boolean;
+  data?: T;
+  error?: string;
 }
 
-class GroupCallService {
-  private currentCall: GroupCall | null = null;
-  private localStream: MediaStream | null = null;
-  private peerConnections: Map<string, RTCPeerConnection> = new Map();
-  private signalingChannel: any = null;
-  private onParticipantChange?: (participants: GroupCallParticipant[]) => void;
-  private onCallEnd?: () => void;
-  private currentUserId: string = '';
+interface WireCall {
+  id: string;
+  group_id: string;
+  caller_id: string;
+  call_type: 'audio' | 'video';
+  status: 'active' | 'ended';
+  created_at: string;
+  group_name?: string;
+  group_avatar_url?: string;
+  caller_profile?: UserProfile;
+}
 
-  private readonly MAX_PARTICIPANTS = 8;
+interface WireParticipant {
+  user_id: string;
+  full_name: string;
+  avatar_url?: string;
+}
 
+function toSession(call: WireCall): GroupCallSession {
+  return {
+    id: call.id,
+    groupId: call.group_id,
+    callerId: call.caller_id,
+    callType: call.call_type,
+    status: call.status,
+    startedAt: call.created_at,
+    groupName: call.group_name,
+    groupAvatarUrl: call.group_avatar_url,
+    callerProfile: call.caller_profile,
+  };
+}
+
+function toParticipants(rows: WireParticipant[]): GroupCallParticipantBrief[] {
+  return rows.map((r) => ({ userId: r.user_id, fullName: r.full_name, avatarUrl: r.avatar_url }));
+}
+
+export const groupCallService = {
   /**
-   * Initialize a group call
+   * Start a call for this group, or — if the group already has one
+   * running — transparently join it instead. Always the right call for
+   * a "Call" button tap in a group chat; it never needs to know whether
+   * someone beat it to starting the call.
    */
-  async initializeCall(
+  async startOrJoinCall(
     groupId: string,
-    userId: string,
-    userProfile: UserProfile,
-    callType: CallType,
-    onParticipantChange: (participants: GroupCallParticipant[]) => void,
-    onCallEnd: () => void
-  ): Promise<{ success: boolean; callId?: string; error?: string }> {
+    callType: 'audio' | 'video'
+  ): Promise<ServiceResult<{ call: GroupCallSession; participants: GroupCallParticipantBrief[] }>> {
     try {
-      this.currentUserId = userId;
-      this.onParticipantChange = onParticipantChange;
-      this.onCallEnd = onCallEnd;
-
-      // Get local media stream
-      this.localStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: callType === 'video'
+      const { call, participants } = await apiFetch<{ call: WireCall; participants: WireParticipant[] }>('/group-calls', {
+        method: 'POST',
+        body: JSON.stringify({ group_id: groupId, call_type: callType }),
       });
-
-      // Create call ID
-      const callId = `${groupId}_${Date.now()}`;
-
-      // Initialize call object
-      this.currentCall = {
-        id: callId,
-        groupId,
-        type: callType,
-        hostId: userId,
-        participants: new Map(),
-        startedAt: new Date().toISOString(),
-        isActive: true
-      };
-
-      // Add self as participant
-      this.currentCall.participants.set(userId, {
-        id: userId,
-        profile: userProfile,
-        state: 'connected',
-        stream: this.localStream,
-        isMuted: false,
-        isVideoOff: false,
-        isSpeaking: false
-      });
-
-      // Setup signaling channel
-      await this.setupSignaling(callId, userId);
-
-      // Announce join
-      await this.sendSignal({
-        type: 'join',
-        from: userId,
-        payload: { profile: userProfile, callType }
-      });
-
-      // Save call to database
-      await supabase.from('group_calls').insert({
-        id: callId,
-        group_id: groupId,
-        host_id: userId,
-        call_type: callType,
-        started_at: this.currentCall.startedAt,
-        is_active: true
-      });
-
-      this.notifyParticipantChange();
-
-      return { success: true, callId };
-    } catch (error: any) {
-      console.error('Failed to initialize call:', error);
-      this.cleanup();
-      return { success: false, error: error.message };
+      return { success: true, data: { call: toSession(call), participants: toParticipants(participants) } };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to start group call' };
     }
-  }
+  },
 
-  /**
-   * Join an existing call
-   */
+  /** Explicit accept of a ringing group call, or joining one already in progress. */
   async joinCall(
-    callId: string,
-    userId: string,
-    userProfile: UserProfile,
-    onParticipantChange: (participants: GroupCallParticipant[]) => void,
-    onCallEnd: () => void
-  ): Promise<{ success: boolean; error?: string }> {
+    callId: string
+  ): Promise<ServiceResult<{ call: GroupCallSession; participants: GroupCallParticipantBrief[] }>> {
     try {
-      this.currentUserId = userId;
-      this.onParticipantChange = onParticipantChange;
-      this.onCallEnd = onCallEnd;
+      const { call, participants } = await apiFetch<{ call: WireCall; participants: WireParticipant[] }>(
+        `/group-calls/${callId}/join`,
+        { method: 'POST' }
+      );
+      return { success: true, data: { call: toSession(call), participants: toParticipants(participants) } };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to join group call' };
+    }
+  },
 
-      // Get call info
-      const { data: callData, error: callError } = await supabase
-        .from('group_calls')
-        .select('*')
-        .eq('id', callId)
-        .single();
-
-      if (callError || !callData) {
-        return { success: false, error: 'Call not found' };
-      }
-
-      if (!callData.is_active) {
-        return { success: false, error: 'Call has ended' };
-      }
-
-      // Get local media
-      this.localStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: callData.call_type === 'video'
-      });
-
-      // Initialize call object
-      this.currentCall = {
-        id: callId,
-        groupId: callData.group_id,
-        type: callData.call_type,
-        hostId: callData.host_id,
-        participants: new Map(),
-        startedAt: callData.started_at,
-        isActive: true
-      };
-
-      // Add self as participant
-      this.currentCall.participants.set(userId, {
-        id: userId,
-        profile: userProfile,
-        state: 'connected',
-        stream: this.localStream,
-        isMuted: false,
-        isVideoOff: false,
-        isSpeaking: false
-      });
-
-      // Setup signaling
-      await this.setupSignaling(callId, userId);
-
-      // Announce join to existing participants
-      await this.sendSignal({
-        type: 'join',
-        from: userId,
-        payload: { profile: userProfile, callType: callData.call_type }
-      });
-
-      this.notifyParticipantChange();
-
+  async declineCall(callId: string): Promise<ServiceResult> {
+    try {
+      await apiFetch(`/group-calls/${callId}/decline`, { method: 'POST' });
       return { success: true };
-    } catch (error: any) {
-      console.error('Failed to join call:', error);
-      this.cleanup();
-      return { success: false, error: error.message };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to decline group call' };
     }
-  }
+  },
 
-  /**
-   * Setup Supabase Realtime for signaling
-   */
-  private async setupSignaling(callId: string, _userId: string): Promise<void> {
-    this.signalingChannel = supabase.channel(`group-call:${callId}`, {
-      config: { broadcast: { self: false } }
-    });
-
-    this.signalingChannel
-      .on('broadcast', { event: 'signal' }, async ({ payload }: { payload: SignalMessage }) => {
-        await this.handleSignal(payload);
-      })
-      .subscribe();
-  }
-
-  /**
-   * Send signal to other participants
-   */
-  private async sendSignal(message: SignalMessage): Promise<void> {
-    if (!this.signalingChannel) return;
-
-    await this.signalingChannel.send({
-      type: 'broadcast',
-      event: 'signal',
-      payload: message
-    });
-  }
-
-  /**
-   * Handle incoming signals
-   */
-  private async handleSignal(message: SignalMessage): Promise<void> {
-    if (!this.currentCall) return;
-
-    // Ignore messages to specific users if not meant for us
-    if (message.to && message.to !== this.currentUserId) return;
-
-    switch (message.type) {
-      case 'join':
-        await this.handleParticipantJoin(message.from, message.payload);
-        break;
-
-      case 'leave':
-        this.handleParticipantLeave(message.from);
-        break;
-
-      case 'offer':
-        await this.handleOffer(message.from, message.payload);
-        break;
-
-      case 'answer':
-        await this.handleAnswer(message.from, message.payload);
-        break;
-
-      case 'ice-candidate':
-        await this.handleIceCandidate(message.from, message.payload);
-        break;
-
-      case 'mute':
-        this.handleMuteChange(message.from, message.payload.isMuted);
-        break;
-
-      case 'video-off':
-        this.handleVideoChange(message.from, message.payload.isVideoOff);
-        break;
+  async leaveCall(callId: string): Promise<ServiceResult> {
+    try {
+      await apiFetch(`/group-calls/${callId}/leave`, { method: 'POST' });
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to leave group call' };
     }
-  }
+  },
 
   /**
-   * Handle new participant joining
+   * Directed signal to exactly one other participant: an SDP offer/answer,
+   * an ICE candidate, or `request_offer` — a joiner sends this to every
+   * already-joined participant right after subscribing to call events, as
+   * a guaranteed fallback alongside the server's own "someone joined"
+   * notification to them (see groupCalls.ts's joinCall). That
+   * notification alone has a real race: it can arrive before the
+   * recipient's own join/start request has even round-tripped back to
+   * finish subscribing, so it gets silently missed and no offer is ever
+   * made. `request_offer` can't have that problem — whoever receives it
+   * has necessarily been subscribed since *their own* join finished,
+   * which already happened before this joiner could possibly exist.
    */
-  private async handleParticipantJoin(
-    peerId: string,
-    payload: { profile: UserProfile; callType: CallType }
-  ): Promise<void> {
-    if (!this.currentCall || this.currentCall.participants.size >= this.MAX_PARTICIPANTS) return;
-
-    // Add participant
-    this.currentCall.participants.set(peerId, {
-      id: peerId,
-      profile: payload.profile,
-      state: 'connecting',
-      isMuted: false,
-      isVideoOff: false,
-      isSpeaking: false
-    });
-
-    // Create peer connection and send offer
-    await this.createPeerConnection(peerId);
-    await this.createAndSendOffer(peerId);
-
-    this.notifyParticipantChange();
-  }
-
-  /**
-   * Handle participant leaving
-   */
-  private handleParticipantLeave(peerId: string): void {
-    if (!this.currentCall) return;
-
-    // Close peer connection
-    const pc = this.peerConnections.get(peerId);
-    if (pc) {
-      pc.close();
-      this.peerConnections.delete(peerId);
+  async sendSignal(
+    callId: string,
+    to: string,
+    signal: {
+      offer_sdp?: RTCSessionDescriptionInit;
+      answer_sdp?: RTCSessionDescriptionInit;
+      candidate?: RTCIceCandidateInit;
+      request_offer?: boolean;
     }
-
-    // Remove participant
-    this.currentCall.participants.delete(peerId);
-    this.notifyParticipantChange();
-
-    // If no participants left, end call
-    if (this.currentCall.participants.size <= 1) {
-      this.endCall();
-    }
-  }
-
-  /**
-   * Create WebRTC peer connection
-   */
-  private async createPeerConnection(peerId: string): Promise<RTCPeerConnection> {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-    // Add local tracks
-    if (this.localStream) {
-      this.localStream.getTracks().forEach(track => {
-        pc.addTrack(track, this.localStream!);
+  ): Promise<ServiceResult> {
+    try {
+      await apiFetch(`/group-calls/${callId}/signal`, {
+        method: 'POST',
+        body: JSON.stringify({ to, ...signal }),
       });
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to send signal' };
     }
+  },
 
-    // Handle remote tracks
-    pc.ontrack = (event) => {
-      const participant = this.currentCall?.participants.get(peerId);
-      if (participant) {
-        participant.stream = event.streams[0];
-        participant.state = 'connected';
-        this.notifyParticipantChange();
-      }
-    };
+  /** Subscribe to incoming group calls (ring screen), app-wide — mirrors callService.subscribeToIncomingCalls. */
+  subscribeToIncomingGroupCalls(onIncomingCall: (call: GroupCallSession) => void): () => void {
+    const subscription = realtimeClient.on('group-call:incoming', (payload) => {
+      const call = payload?.call;
+      if (!call) return;
+      onIncomingCall(toSession(call));
+    });
+    return subscription.unsubscribe;
+  },
 
-    // Handle ICE candidates
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        this.sendSignal({
-          type: 'ice-candidate',
-          from: this.currentUserId,
-          to: peerId,
-          payload: event.candidate
-        });
-      }
-    };
-
-    // Handle connection state changes
-    pc.onconnectionstatechange = () => {
-      const participant = this.currentCall?.participants.get(peerId);
-      if (participant) {
-        switch (pc.connectionState) {
-          case 'connected':
-            participant.state = 'connected';
-            break;
-          case 'disconnected':
-          case 'failed':
-            participant.state = pc.connectionState;
-            break;
+  /** Subscribe to every signaling/roster event for one specific call in progress. */
+  subscribeToGroupCallEvents(
+    callId: string,
+    callbacks: {
+      onParticipantJoined?: (userId: string) => void;
+      onSignal?: (
+        from: string,
+        signal: { offer_sdp?: RTCSessionDescriptionInit; answer_sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit; request_offer?: boolean }
+      ) => void;
+      onParticipantLeft?: (userId: string) => void;
+      onParticipantDeclined?: (userId: string) => void;
+      onCallEnded?: () => void;
+    }
+  ): { unsubscribe: () => void } {
+    const subs = [
+      realtimeClient.on('group-call:participant-joined', (payload) => {
+        if (payload?.call_id === callId && payload?.user_id) callbacks.onParticipantJoined?.(payload.user_id);
+      }),
+      realtimeClient.on('group-call:signal', (payload) => {
+        if (payload?.call_id === callId && payload?.from) {
+          callbacks.onSignal?.(payload.from, {
+            offer_sdp: payload.offer_sdp,
+            answer_sdp: payload.answer_sdp,
+            candidate: payload.candidate,
+            request_offer: payload.request_offer,
+          });
         }
-        this.notifyParticipantChange();
-      }
-    };
-
-    this.peerConnections.set(peerId, pc);
-    return pc;
-  }
-
-  /**
-   * Create and send offer
-   */
-  private async createAndSendOffer(peerId: string): Promise<void> {
-    const pc = this.peerConnections.get(peerId);
-    if (!pc) return;
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    await this.sendSignal({
-      type: 'offer',
-      from: this.currentUserId,
-      to: peerId,
-      payload: offer
-    });
-  }
-
-  /**
-   * Handle incoming offer
-   */
-  private async handleOffer(peerId: string, offer: RTCSessionDescriptionInit): Promise<void> {
-    let pc = this.peerConnections.get(peerId);
-    if (!pc) {
-      pc = await this.createPeerConnection(peerId);
-    }
-
-    await pc.setRemoteDescription(offer);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-
-    await this.sendSignal({
-      type: 'answer',
-      from: this.currentUserId,
-      to: peerId,
-      payload: answer
-    });
-  }
-
-  /**
-   * Handle incoming answer
-   */
-  private async handleAnswer(peerId: string, answer: RTCSessionDescriptionInit): Promise<void> {
-    const pc = this.peerConnections.get(peerId);
-    if (!pc) return;
-
-    await pc.setRemoteDescription(answer);
-  }
-
-  /**
-   * Handle ICE candidate
-   */
-  private async handleIceCandidate(peerId: string, candidate: RTCIceCandidateInit): Promise<void> {
-    const pc = this.peerConnections.get(peerId);
-    if (!pc) return;
-
-    await pc.addIceCandidate(candidate);
-  }
-
-  /**
-   * Handle mute status change
-   */
-  private handleMuteChange(peerId: string, isMuted: boolean): void {
-    const participant = this.currentCall?.participants.get(peerId);
-    if (participant) {
-      participant.isMuted = isMuted;
-      this.notifyParticipantChange();
-    }
-  }
-
-  /**
-   * Handle video status change
-   */
-  private handleVideoChange(peerId: string, isVideoOff: boolean): void {
-    const participant = this.currentCall?.participants.get(peerId);
-    if (participant) {
-      participant.isVideoOff = isVideoOff;
-      this.notifyParticipantChange();
-    }
-  }
-
-  /**
-   * Toggle mute
-   */
-  async toggleMute(): Promise<boolean> {
-    if (!this.localStream || !this.currentCall) return false;
-
-    const audioTracks = this.localStream.getAudioTracks();
-    const newMuteState = !audioTracks[0]?.enabled;
-
-    audioTracks.forEach(track => {
-      track.enabled = !newMuteState;
-    });
-
-    const participant = this.currentCall.participants.get(this.currentUserId);
-    if (participant) {
-      participant.isMuted = newMuteState;
-    }
-
-    await this.sendSignal({
-      type: 'mute',
-      from: this.currentUserId,
-      payload: { isMuted: newMuteState }
-    });
-
-    this.notifyParticipantChange();
-    return newMuteState;
-  }
-
-  /**
-   * Toggle video
-   */
-  async toggleVideo(): Promise<boolean> {
-    if (!this.localStream || !this.currentCall) return false;
-
-    const videoTracks = this.localStream.getVideoTracks();
-    const newVideoOffState = videoTracks[0]?.enabled ?? false;
-
-    videoTracks.forEach(track => {
-      track.enabled = !newVideoOffState;
-    });
-
-    const participant = this.currentCall.participants.get(this.currentUserId);
-    if (participant) {
-      participant.isVideoOff = newVideoOffState;
-    }
-
-    await this.sendSignal({
-      type: 'video-off',
-      from: this.currentUserId,
-      payload: { isVideoOff: newVideoOffState }
-    });
-
-    this.notifyParticipantChange();
-    return newVideoOffState;
-  }
-
-  /**
-   * Leave the call
-   */
-  async leaveCall(): Promise<void> {
-    await this.sendSignal({
-      type: 'leave',
-      from: this.currentUserId
-    });
-
-    this.cleanup();
-  }
-
-  /**
-   * End the call (host only)
-   */
-  async endCall(): Promise<void> {
-    if (!this.currentCall) return;
-
-    // Update database
-    await supabase
-      .from('group_calls')
-      .update({
-        is_active: false,
-        ended_at: new Date().toISOString()
-      })
-      .eq('id', this.currentCall.id);
-
-    await this.sendSignal({
-      type: 'leave',
-      from: this.currentUserId
-    });
-
-    this.cleanup();
-    this.onCallEnd?.();
-  }
-
-  /**
-   * Get current call
-   */
-  getCurrentCall(): GroupCall | null {
-    return this.currentCall;
-  }
-
-  /**
-   * Get local stream
-   */
-  getLocalStream(): MediaStream | null {
-    return this.localStream;
-  }
-
-  /**
-   * Cleanup resources
-   */
-  private cleanup(): void {
-    // Close all peer connections
-    this.peerConnections.forEach(pc => pc.close());
-    this.peerConnections.clear();
-
-    // Stop local stream
-    if (this.localStream) {
-      this.localStream.getTracks().forEach(track => track.stop());
-      this.localStream = null;
-    }
-
-    // Unsubscribe from signaling
-    if (this.signalingChannel) {
-      supabase.removeChannel(this.signalingChannel);
-      this.signalingChannel = null;
-    }
-
-    this.currentCall = null;
-  }
-
-  /**
-   * Notify participant change
-   */
-  private notifyParticipantChange(): void {
-    if (!this.currentCall || !this.onParticipantChange) return;
-
-    const participants = Array.from(this.currentCall.participants.values());
-    this.onParticipantChange(participants);
-  }
-}
-
-export const groupCallService = new GroupCallService();
-export default groupCallService;
+      }),
+      realtimeClient.on('group-call:participant-left', (payload) => {
+        if (payload?.call_id === callId && payload?.user_id) callbacks.onParticipantLeft?.(payload.user_id);
+      }),
+      realtimeClient.on('group-call:participant-declined', (payload) => {
+        if (payload?.call_id === callId && payload?.user_id) callbacks.onParticipantDeclined?.(payload.user_id);
+      }),
+      realtimeClient.on('group-call:ended', (payload) => {
+        if (payload?.call_id === callId) callbacks.onCallEnded?.();
+      }),
+    ];
+    return { unsubscribe: () => subs.forEach((s) => s.unsubscribe()) };
+  },
+};

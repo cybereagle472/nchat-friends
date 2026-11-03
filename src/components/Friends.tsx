@@ -71,7 +71,7 @@ export function Friends({ friends, onMessage, onCall }: FriendsProps) {
               className="flex items-center gap-3 p-3 mb-2 rounded-2xl backdrop-blur-xl bg-white/70 border border-white/70 hover:bg-white/90 hover:shadow-lg hover:shadow-purple-500/15 transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] animate-slide-up group"
             >
               <div className="relative">
-                <div className="w-14 h-14 rounded-xl bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
+                <div className="w-14 h-14 rounded-full bg-gradient-to-br from-violet-400 via-purple-400 to-fuchsia-400 flex items-center justify-center text-xl flex-shrink-0 shadow-md shadow-purple-500/20 group-hover:scale-105 transition-transform duration-300 overflow-hidden">
                   {friend.profile.avatar_url ? (
                     <img src={friend.profile.avatar_url} alt={friend.profile.full_name} className="w-full h-full object-cover" />
                   ) : (

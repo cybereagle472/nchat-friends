@@ -3,7 +3,8 @@
  * WhatsApp-style message actions for group chats: Reactions, Delete, Forward
  */
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Smile,
   Trash2,
@@ -51,6 +52,8 @@ export function GroupMessageActions({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
+  const portalRoot = typeof document !== 'undefined' ? document.body : null;
 
   // Close on click outside
   useEffect(() => {
@@ -62,6 +65,35 @@ export function GroupMessageActions({
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [onClose]);
+
+  // Position the context menu using its *real* rendered size instead of a
+  // guessed width/height — the quick-reactions row alone (6 emoji buttons
+  // plus the "more" button) is wider than a 200px guess, so a fixed
+  // estimate reliably left part of the menu rendered off-screen for
+  // messages near the screen edges (e.g. right-aligned own messages).
+  // Measuring synchronously after mount (before the browser paints) and
+  // only revealing the menu once positioned avoids any visible flash at
+  // the wrong spot.
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!el || showDeleteConfirm || showAllReactions) return;
+    const margin = 8;
+    const rect = el.getBoundingClientRect();
+    let left = position.x;
+    let top = position.y;
+
+    if (left + rect.width + margin > window.innerWidth) {
+      left = window.innerWidth - rect.width - margin;
+    }
+    if (left < margin) left = margin;
+
+    if (top + rect.height + margin > window.innerHeight) {
+      top = window.innerHeight - rect.height - margin;
+    }
+    if (top < margin) top = margin;
+
+    setMenuPos({ left, top });
+  }, [position.x, position.y, showDeleteConfirm, showAllReactions]);
 
   // Check if message can be deleted for everyone (own message, within 1 hour)
   const canDeleteForEveryone = isOwn &&
@@ -133,30 +165,11 @@ export function GroupMessageActions({
     onClose();
   };
 
-  // Calculate menu position to keep it in viewport
-  const getMenuStyle = () => {
-    const menuWidth = 200;
-    const menuHeight = 300;
-    let x = position.x;
-    let y = position.y;
-
-    if (x + menuWidth > window.innerWidth) {
-      x = window.innerWidth - menuWidth - 16;
-    }
-    if (x < 16) x = 16;
-
-    if (y + menuHeight > window.innerHeight) {
-      y = window.innerHeight - menuHeight - 16;
-    }
-    if (y < 16) y = 16;
-
-    return { left: x, top: y };
-  };
-
-  // Delete Confirmation
+  // Delete Confirmation — rendered via Portal to escape any ancestor
+  // stacking context, matching the 1:1 chat MessageActions pattern.
   if (showDeleteConfirm) {
-    return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+    return portalRoot ? createPortal(
+      <div className="fixed inset-0 flex items-center justify-center bg-black/50 p-4" style={{ zIndex: 99999 }}>
         <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl animate-scale-in">
           <div className="p-4 text-center">
             <div className="w-12 h-12 rounded-full bg-red-100 flex items-center justify-center mx-auto mb-3">
@@ -194,14 +207,16 @@ export function GroupMessageActions({
             </button>
           </div>
         </div>
-      </div>
-    );
+      </div>,
+      portalRoot
+    ) : null;
   }
 
-  // All Reactions Picker
+  // All Reactions Picker — rendered via Portal, matching the 1:1 chat
+  // MessageActions pattern.
   if (showAllReactions) {
-    return (
-      <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50" onClick={onClose}>
+    return portalRoot ? createPortal(
+      <div className="fixed inset-0 flex items-end justify-center bg-black/50" style={{ zIndex: 99999 }} onClick={onClose}>
         <div
           className="bg-white rounded-t-3xl w-full max-w-md shadow-2xl animate-slide-up"
           onClick={e => e.stopPropagation()}
@@ -230,17 +245,24 @@ export function GroupMessageActions({
             })}
           </div>
         </div>
-      </div>
-    );
+      </div>,
+      portalRoot
+    ) : null;
   }
 
-  // Main Context Menu
-  return (
-    <div className="fixed inset-0 z-50" onClick={onClose}>
+  // Main Context Menu — rendered via Portal to escape any ancestor
+  // stacking context, matching the 1:1 chat MessageActions pattern.
+  return portalRoot ? createPortal(
+    <div className="fixed inset-0" style={{ zIndex: 99999 }} onClick={onClose}>
       <div
         ref={menuRef}
         className="absolute bg-white rounded-2xl shadow-2xl overflow-hidden animate-scale-in min-w-[200px]"
-        style={getMenuStyle()}
+        style={{
+          left: menuPos?.left ?? position.x,
+          top: menuPos?.top ?? position.y,
+          visibility: menuPos ? 'visible' : 'hidden',
+          zIndex: 100000
+        }}
         onClick={e => e.stopPropagation()}
       >
         {/* Quick Reactions */}
@@ -305,8 +327,9 @@ export function GroupMessageActions({
           </button>
         </div>
       </div>
-    </div>
-  );
+    </div>,
+    portalRoot
+  ) : null;
 }
 
 // Reactions Display Component for group messages

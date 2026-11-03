@@ -1,10 +1,10 @@
-import { vlyPlugin } from "@vly-ai/integrations";
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react-swc';
+import tailwindcss from '@tailwindcss/vite';
 import path from 'path';
 
 export default defineConfig({
-  plugins: [vlyPlugin(), react()],
+  plugins: [react(), tailwindcss()],
   resolve: {
     extensions: ['.js', '.jsx', '.ts', '.tsx', '.json'],
     alias: {
@@ -18,9 +18,9 @@ export default defineConfig({
   },
   server: {
     port: 3000,
-    open: true,
-    host: '0.0.0.0',
-    hmr: false,
+    open: false,
+    host: true,
+    allowedHosts: true,
   },
   preview: {
     port: 3000,
